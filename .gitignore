@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+
+# Node / 前端
+node_modules/
+web/node_modules/
+web/dist/
+*.local
+
+# 运行时与日志
+logs/
+*.log
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# 用户配置（含敏感 API Key，绝不上传）
+~/.baize/
+.baize/
+*.key
+.env
