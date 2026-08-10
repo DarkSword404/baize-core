@@ -34,8 +34,10 @@ is_port_in_use() {
   lsof -ti :"$1" >/dev/null 2>&1
 }
 
+BACKEND_ALREADY_RUNNING=false
 if is_port_in_use "$BACKEND_PORT"; then
   log "后端端口 $BACKEND_PORT 已被占用，跳过。"
+  BACKEND_ALREADY_RUNNING=true
 else
   log "启动后端 (端口 $BACKEND_PORT)..."
   export BAIZE_API_REQUIRE_AUTH="${BAIZE_API_REQUIRE_AUTH:-1}"
@@ -67,17 +69,21 @@ echo -e "  停止: ./stop.sh"
 echo -e "${C_CYAN}============================================${C_RESET}"
 
 # 等待凭证输出
-timeout=30; deadline=$(( $(date +%s) + timeout ))
-while (( $(date +%s) < deadline )); do
-  if grep -q "登录 URL" "$BACKEND_LOG" 2>/dev/null; then
-    sed 's/\x1b\[[0-9;]*m//g' "$BACKEND_LOG" | grep -A7 "登录凭证" | head -8
-    exit 0
-  fi
-  pid="$(cat "$PID_DIR/backend.pid" 2>/dev/null || true)"
-  if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
-    err "后端进程已退出，请查看 $BACKEND_LOG"
-    exit 1
-  fi
-  sleep 0.5
-done
-log "等待凭证超时，请查看 $BACKEND_LOG"
+if $BACKEND_ALREADY_RUNNING; then
+  log "后端此前已在运行，跳过凭证等待。"
+else
+  timeout=30; deadline=$(( $(date +%s) + timeout ))
+  while (( $(date +%s) < deadline )); do
+    if grep -q "登录凭证" "$BACKEND_LOG" 2>/dev/null; then
+      sed 's/\x1b\[[0-9;]*m//g' "$BACKEND_LOG" | grep -A7 "登录凭证" | head -8
+      exit 0
+    fi
+    pid="$(cat "$PID_DIR/backend.pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && ! kill -0 "$pid" 2>/dev/null; then
+      err "后端进程已退出，请查看 $BACKEND_LOG"
+      exit 1
+    fi
+    sleep 0.5
+  done
+  log "等待凭证超时，请查看 $BACKEND_LOG"
+fi
