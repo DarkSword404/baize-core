@@ -359,48 +359,100 @@ def create_baize_api_app(
         ]
 
         async def event_source():
+            sm = app.state.session_manager
+            # 本轮累积缓冲：思考过程、工具调用/结果记录、最终文本
+            reasoning_parts: list[str] = []
+            tool_events: list[dict] = []
+            final_text = ""
+            # 是否已把本轮内容持久化（正常完成 / 中断都只保存一次）
+            saved = False
+
+            # 流式开始前先持久化 user 提问，确保提问不因中断而丢失
+            sm.append_message(session_id, "user", payload.input)
+
+            def _flush_to_session():
+                """将本轮已产生的中间产物与文本持久化到会话。"""
+                nonlocal saved
+                if saved:
+                    return
+                # 思考过程：作为 reasoning 中间产物消息
+                if reasoning_parts:
+                    sm.append_message(
+                        session_id,
+                        "assistant",
+                        "",
+                        extra={
+                            "type": "reasoning",
+                            "summary": [{"text": "".join(reasoning_parts)}],
+                        },
+                    )
+                # 工具调用 / 结果：逐条作为 function_call / function_call_output 消息
+                for ev in tool_events:
+                    sm.append_message(session_id, "assistant", "", extra=ev)
+                # 最终文本：作为 assistant 正文（若有）
+                if final_text.strip():
+                    sm.append_message(session_id, "assistant", final_text)
+                saved = True
+
             try:
                 # 流式对话（传入历史上下文）
                 async for event in agent.run_stream(
                     payload.input, prior_history=prior_history
                 ):
                     if await request.is_disconnected():
+                        # 前端断开（切换页面/刷新）：保留已产生内容
                         break
                     if event.type == "reasoning":
-                        # 模型的实时思考过程
+                        reasoning_parts.append(event.content)
                         yield (
                             f"event: reasoning_step\n"
                             f"data: {json.dumps({'type': 'reasoning', 'text': event.content})}\n\n"
                         )
                     elif event.type == "text":
+                        final_text += event.content
                         yield f"data: {json.dumps({'type': 'delta', 'content': event.content})}\n\n"
                     elif event.type == "tool_call":
+                        tool_events.append(
+                            {
+                                "type": "function_call",
+                                "name": event.tool_name,
+                                "arguments": event.tool_args,
+                            }
+                        )
                         # 前端期望 reasoning_step 命名事件展示工具调用过程
                         yield (
                             f"event: reasoning_step\n"
                             f"data: {json.dumps({'type': 'tool_call', 'tool': event.tool_name, 'arguments': event.tool_args})}\n\n"
                         )
                     elif event.type == "tool_result":
+                        tool_events.append(
+                            {
+                                "type": "function_call_output",
+                                "name": event.tool_name,
+                                "output": event.tool_result,
+                            }
+                        )
                         yield (
                             f"event: reasoning_step\n"
                             f"data: {json.dumps({'type': 'tool_output', 'tool': event.tool_name, 'output': event.tool_result})}\n\n"
                         )
                     elif event.type == "done":
-                        # 保存到会话
-                        app.state.session_manager.append_message(
-                            session_id, "user", payload.input
-                        )
-                        app.state.session_manager.append_message(
-                            session_id, "assistant", event.content
-                        )
+                        # 正常完成：保存完整内容
+                        final_text = event.content or final_text
+                        _flush_to_session()
                         yield f"data: {json.dumps({'type': 'done', 'content': event.content})}\n\n"
-                yield "data: [DONE]\n\n"
             except ModelNotConfiguredError as e:
                 yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-                yield "data: [DONE]\n\n"
             except Exception as e:  # noqa: BLE001
                 yield f"data: {json.dumps({'type': 'error', 'error': f'服务器错误: {e}'})}\n\n"
-                yield "data: [DONE]\n\n"
+            finally:
+                # 关键：无论正常完成、连接断开（GeneratorExit/CancelledError）、还是异常，
+                # 只要本轮产生了内容，就持久化，避免切换页面/刷新后对话丢失。
+                _flush_to_session()
+                try:
+                    yield "data: [DONE]\n\n"
+                except Exception:  # noqa: BLE001
+                    pass
 
         return StreamingResponse(
             event_source(),

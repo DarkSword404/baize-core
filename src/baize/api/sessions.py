@@ -144,18 +144,25 @@ class SessionManager:
                 f.unlink()
             return True
 
-    def append_message(self, session_id: str, role: str, content: str) -> Session | None:
+    def append_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        extra: Optional[dict] = None,
+    ) -> Session | None:
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 return None
-            session.messages.append(
-                {
-                    "role": role,
-                    "content": content,
-                    "timestamp": _now(),
-                }
-            )
+            msg: dict = {
+                "role": role,
+                "content": content,
+                "timestamp": _now(),
+            }
+            if extra:
+                msg.update(extra)
+            session.messages.append(msg)
             session.updated_at = _now()
             self._save(session)
             return session
