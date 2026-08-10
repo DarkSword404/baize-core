@@ -517,3 +517,42 @@ export function logout() {
   sessionStorage.removeItem(SESSION_KEY);
   _authToken = null;
 }
+
+// ===== 附件（多模态）=====
+export interface AttachmentInfo {
+  file_id: string;
+  filename: string;
+  file_type: string; // image/code/document/archive/other
+  mime?: string;
+  size?: number;
+  uploaded_at?: string;
+}
+
+/** 上传附件到会话，返回附件信息 */
+export async function uploadAttachment(sessionId: string, file: File): Promise<AttachmentInfo> {
+  const form = new FormData();
+  form.append('file', file);
+  const token = getToken();
+  const res = await fetch(`${apiBase}/sessions/${sessionId}/files`, {
+    method: 'POST',
+    headers: token ? { 'X-Baize-API-Key': token } : {},
+    body: form,
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(body ? `上传失败 [${res.status}]` : `上传失败 [${res.status}]`);
+  }
+  const data = await res.json();
+  return data.attachment;
+}
+
+/** 列出会话的全部附件 */
+export async function listAttachments(sessionId: string): Promise<AttachmentInfo[]> {
+  const data = await request<{ attachments: AttachmentInfo[] }>(`/sessions/${sessionId}/files`);
+  return data.attachments || [];
+}
+
+/** 删除会话附件 */
+export async function deleteAttachment(sessionId: string, fileId: string): Promise<void> {
+  await request(`/sessions/${sessionId}/files/${fileId}`, { method: 'DELETE' });
+}

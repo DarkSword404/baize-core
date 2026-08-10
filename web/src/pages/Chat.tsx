@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useApp } from '../context/AppContext';
-import { listSessions, getSession, deleteSession, streamMessage, cancelSession, listAgents, respondToPrompt } from '../api/client';
-import type { PromptRequest, ReasoningStep } from '../api/client';
+import { listSessions, getSession, deleteSession, streamMessage, cancelSession, listAgents, respondToPrompt, uploadAttachment, deleteAttachment } from '../api/client';
+import type { PromptRequest, ReasoningStep, AttachmentInfo } from '../api/client';
 import { ChatMessage } from '../components/ChatMessage';
 import { CreateSessionModal } from '../components/CreateSessionModal';
 import type { ChatMessage as ChatMessageType, IntermediateData } from '../types';
@@ -139,6 +139,10 @@ export function Chat(): JSX.Element {
   const autoScrollRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  // 待发送附件（用户选择后先上传到会话，随下一条消息发送）
+  const [pendingFiles, setPendingFiles] = useState<AttachmentInfo[]>([]);
+  const [uploading, setUploading] = useState(false);
 
   // Web interactive prompt
   const [pendingPrompt, setPendingPrompt] = useState<PromptRequest | null>(null);
@@ -243,10 +247,10 @@ export function Chat(): JSX.Element {
   }
 
   /** 通用：发送消息并启动 SSE 流 */
-  function startInference(content: string, assistantId: string) {
+  function startInference(content: string, assistantId: string, attachmentIds?: string[]) {
     abortRef.current = streamMessage(
       activeSessionId!,
-      { input: content },
+      { input: content, attachments: attachmentIds && attachmentIds.length ? attachmentIds : undefined },
       (text) => {
         setMessages(prev => prev.map((m: ChatMessageType) =>
           m.id === assistantId ? { ...m, content: m.content + text } : m
@@ -448,14 +452,28 @@ export function Chat(): JSX.Element {
     console.log('[Chat] handleSend:', { sessionId: activeSessionId, content: content.substring(0, 40) });
     // 新消息发送时恢复自动跟随到底部
     autoScrollRef.current = true;
+
+    // 上传待发送的附件，收集 file_id
+    const attachIds: string[] = [];
+    if (pendingFiles.length) {
+      setUploading(true);
+      for (const pf of pendingFiles) {
+        // pendingFiles 中已含上传后的 AttachmentInfo（file_id），直接用其 id
+        if (pf.file_id) attachIds.push(pf.file_id);
+      }
+      setUploading(false);
+    }
+
     const userMsg: ChatMessageType = {
       id: genId(),
       role: 'user',
       content,
       timestamp: new Date().toISOString(),
+      attachments: pendingFiles.map(f => f.filename),
     };
     setMessages(prev => [...prev, userMsg]);
     setInput('');
+    setPendingFiles([]);
 
     const assistantId = genId();
     const assistantMsg: ChatMessageType = {
@@ -468,7 +486,34 @@ export function Chat(): JSX.Element {
     setMessages(prev => [...prev, assistantMsg]);
     setIsStreaming(true);
 
-    startInference(content, assistantId);
+    startInference(content, assistantId, attachIds);
+  }
+
+  /** 选择附件文件：先上传到会话，成功后将附件信息加入待发送列表 */
+  async function handlePickFiles(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files || []);
+    e.target.value = '';
+    if (!files.length || !activeSessionId) return;
+    setUploading(true);
+    const ok: AttachmentInfo[] = [];
+    for (const f of files) {
+      try {
+        const att = await uploadAttachment(activeSessionId, f);
+        ok.push(att);
+      } catch (err: any) {
+        addToast({ type: 'error', title: `上传失败: ${f.name}`, message: err.message });
+      }
+    }
+    setPendingFiles(prev => [...prev, ...ok]);
+    setUploading(false);
+    if (ok.length) addToast({ type: 'success', title: '附件已上传', message: `已添加 ${ok.length} 个附件` });
+  }
+
+  function handleRemovePendingFile(fileId: string) {
+    setPendingFiles(prev => prev.filter(f => f.file_id !== fileId));
+    if (activeSessionId) {
+      deleteAttachment(activeSessionId, fileId).catch(() => {});
+    }
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
@@ -692,7 +737,41 @@ export function Chat(): JSX.Element {
                 </div>
               </div>
             )}
+            {/* 待发送附件列表 */}
+            {pendingFiles.length > 0 && (
+              <div className="max-w-3xl mx-auto mb-2 flex flex-wrap gap-1.5">
+                {pendingFiles.map(f => (
+                  <span key={f.file_id} className="inline-flex items-center gap-1.5 text-[11px] px-2 py-1 rounded-lg bg-blue-600/20 border border-blue-600/30 text-blue-100">
+                    <span>{['🖼️','💻','📦','📄','📎'][['image','code','archive','document','other'].indexOf(f.file_type) >= 0 ? ['image','code','archive','document','other'].indexOf(f.file_type) : 4]}</span>
+                    <span className="max-w-[160px] truncate">{f.filename}</span>
+                    <button onClick={() => handleRemovePendingFile(f.file_id)} className="ml-1 text-blue-300 hover:text-red-400" title="移除">✕</button>
+                  </span>
+                ))}
+              </div>
+            )}
             <div className="max-w-3xl mx-auto flex gap-3 items-end">
+              {/* 附件上传按钮 */}
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isStreaming || uploading}
+                className="h-12 w-12 flex items-center justify-center rounded-xl bg-gray-800 border border-gray-700 hover:border-blue-500 hover:bg-gray-700 text-gray-400 hover:text-blue-400 transition-colors flex-shrink-0 disabled:opacity-40"
+                title="上传附件（图片/代码/压缩包/文档）"
+              >
+                {uploading ? (
+                  <svg className="w-5 h-5 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6m0 0v6m0-6h6m-6 0H6" /></svg>
+                ) : (
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" />
+                  </svg>
+                )}
+              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                className="hidden"
+                onChange={handlePickFiles}
+              />
               <textarea
                 ref={inputRef}
                 value={input}

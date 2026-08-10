@@ -100,6 +100,8 @@ export interface InferenceRequest {
   context?: Record<string, unknown> | null;
   max_turns?: number | null;
   mcp_sse?: Array<{ url: string; name?: string; headers?: Record<string, string>; timeout?: number; sse_read_timeout?: number }> | null;
+  /** 本次消息附带的附件 file_id 列表 */
+  attachments?: string[];
 }
 
 export interface InferenceResponse {
@@ -174,6 +176,8 @@ export interface ChatMessage {
   metadata?: Record<string, unknown>;
   isStreaming?: boolean;
   intermediates?: IntermediateData[];
+  /** 该消息关联的附件文件名列表（多模态） */
+  attachments?: string[];
 }
 
 export interface Toast {

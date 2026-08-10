@@ -25,6 +25,9 @@ class ChatMessage:
     tool_calls: Optional[list[dict]] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    # 多模态：若设置，则 content 被忽略，使用 OpenAI 内容块数组
+    # 例: [{"type":"text","text":"..."}, {"type":"image_url","image_url":{"url":"data:..."}}]
+    content_parts: Optional[list[dict]] = None
 
 
 @dataclass
@@ -83,7 +86,10 @@ class LLMClient:
         out: list[dict] = []
         for m in history:
             item: dict[str, Any] = {"role": m.role}
-            if m.content:
+            if m.content_parts:
+                # 多模态内容块（含图片）
+                item["content"] = m.content_parts
+            elif m.content:
                 item["content"] = m.content
             if m.tool_calls:
                 item["tool_calls"] = m.tool_calls

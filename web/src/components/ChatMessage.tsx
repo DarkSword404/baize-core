@@ -74,6 +74,26 @@ export function ChatMessage({ msg }: { msg: ChatMessageType }): JSX.Element {
         ) : (
           <span className="text-gray-500 italic">(空消息)</span>
         )}
+
+        {/* 多模态附件展示 */}
+        {msg.attachments && msg.attachments.length > 0 && (
+          <div className={`mt-2 flex flex-wrap gap-1.5 ${isUser ? 'justify-end' : ''}`}>
+            {msg.attachments.map((fn, i) => (
+              <span
+                key={`${msg.id}-att-${i}`}
+                className={`inline-flex items-center gap-1 text-[10px] px-2 py-1 rounded border ${
+                  isUser
+                    ? 'bg-blue-500/20 border-blue-400/30 text-blue-50'
+                    : 'bg-gray-700/50 border-gray-600 text-gray-300'
+                }`}
+                title={fn}
+              >
+                <span>{attachmentIcon(fn)}</span>
+                <span className="max-w-[160px] truncate">{fn}</span>
+              </span>
+            ))}
+          </div>
+        )}
       </div>
 
       {isUser && (
@@ -86,6 +106,16 @@ export function ChatMessage({ msg }: { msg: ChatMessageType }): JSX.Element {
       )}
     </div>
   );
+}
+
+/** 根据文件名返回附件类型图标 */
+function attachmentIcon(filename: string): string {
+  const lower = filename.toLowerCase();
+  if (/\.(png|jpe?g|gif|webp|bmp)$/.test(lower)) return '🖼️';
+  if (/\.(py|js|ts|c|cpp|go|rs|java|php|sh|sql|html|css)$/.test(lower)) return '💻';
+  if (/\.(zip|tar|gz|tgz|7z|bz2)$/.test(lower)) return '📦';
+  if (/\.(pdf|docx?|pptx?|xlsx?)$/.test(lower)) return '📄';
+  return '📎';
 }
 
 /** 单个思考块：折叠/展开，流式时自动展开 */

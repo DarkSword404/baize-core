@@ -14,17 +14,23 @@ import os
 import sys
 from typing import Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from baize import __version__
+from baize.api.attachments import (
+    AttachmentStore,
+    attachment_tools,
+    detect_file_type,
+)
 from baize.api.auth import AuthManager
 from baize.api.custom_agents import CustomAgentStore, CustomPipelineStore
 from baize.api.sessions import SessionManager
 from baize.agents import list_agents, list_tools, get_agent
 from baize.config import ModelConfigStore, SingleModelConfig, get_server_config
+from baize.multimodal import build_user_message
 from baize.sdk.client import ModelNotConfiguredError
 
 
@@ -61,6 +67,8 @@ class CreateSessionRequest(BaseModel):
 class MessageRequest(BaseModel):
     input: str
     agent: Optional[str] = None
+    # 本次消息附带的附件 file_id 列表（已上传到会话的附件）
+    attachments: list[str] = Field(default_factory=list)
 
 
 class AuthResponse(BaseModel):
@@ -128,6 +136,7 @@ def create_baize_api_app(
     app.state.auth_manager = AuthManager()
     app.state.custom_agents = CustomAgentStore()
     app.state.custom_pipelines = CustomPipelineStore()
+    app.state.attachment_store = AttachmentStore()
     app.state.require_auth = cfg.require_auth
 
     # ------------------------------------------------------------------
@@ -329,6 +338,51 @@ def create_baize_api_app(
         return {"ok": True, "handled": False}
 
     # ------------------------------------------------------------------
+    # 附件上传 / 列表（多模态）
+    # ------------------------------------------------------------------
+    @app.post(
+        "/api/v1/sessions/{session_id}/files",
+        status_code=201,
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def upload_attachment(
+        session_id: str,
+        file: UploadFile = File(...),
+    ) -> dict:
+        session = app.state.session_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        data = await file.read()
+        try:
+            att = app.state.attachment_store.save_attachment(
+                session_id, file.filename or "unnamed", data
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"attachment": att.to_dict(), "ok": True}
+
+    @app.get(
+        "/api/v1/sessions/{session_id}/files",
+        dependencies=[Depends(_require_api_key)],
+    )
+    def list_attachments(session_id: str) -> dict:
+        session = app.state.session_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        atts = app.state.attachment_store.list_attachments(session_id)
+        return {"attachments": [a.to_dict() for a in atts]}
+
+    @app.delete(
+        "/api/v1/sessions/{session_id}/files/{file_id}",
+        dependencies=[Depends(_require_api_key)],
+    )
+    def delete_attachment(session_id: str, file_id: str) -> dict:
+        ok = app.state.attachment_store.delete_attachment(session_id, file_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="附件不存在")
+        return {"ok": True, "deleted": True}
+
+    # ------------------------------------------------------------------
     # 对话（流式 SSE）
     # ------------------------------------------------------------------
     @app.post(
@@ -358,6 +412,25 @@ def create_baize_api_app(
             for m in history_messages
         ]
 
+        # ── 多模态附件处理 ──
+        # 获取会话全部附件（会话级，长期可用）
+        attachment_store = app.state.attachment_store
+        session_attachments = attachment_store.list_attachments(session_id)
+        # 解析本次消息要引用的附件（按 file_id）
+        requested_ids = set(payload.attachments or [])
+        active_attachments = [
+            a for a in session_attachments if a.file_id in requested_ids
+        ] if requested_ids else session_attachments
+        # 附件访问工具（绑定当前会话）
+        extra_tools = attachment_tools(attachment_store, session_id)
+        # 多模态 user 消息（图片注入 content_parts，其它注入附件提示）
+        user_chat_message = build_user_message(
+            payload.input,
+            active_attachments,
+            attachment_store=attachment_store,
+            session_id=session_id,
+        )
+
         async def event_source():
             sm = app.state.session_manager
             # 本轮累积缓冲：思考过程、工具调用/结果记录、最终文本
@@ -368,7 +441,10 @@ def create_baize_api_app(
             saved = False
 
             # 流式开始前先持久化 user 提问，确保提问不因中断而丢失
-            sm.append_message(session_id, "user", payload.input)
+            user_extra = {}
+            if active_attachments:
+                user_extra["attachments"] = [a.to_dict() for a in active_attachments]
+            sm.append_message(session_id, "user", payload.input, extra=user_extra or None)
 
             def _flush_to_session():
                 """将本轮已产生的中间产物与文本持久化到会话。"""
@@ -395,9 +471,12 @@ def create_baize_api_app(
                 saved = True
 
             try:
-                # 流式对话（传入历史上下文）
+                # 流式对话（传入历史上下文 + 多模态 user 消息 + 附件工具）
                 async for event in agent.run_stream(
-                    payload.input, prior_history=prior_history
+                    payload.input,
+                    prior_history=prior_history,
+                    extra_tools=extra_tools,
+                    user_chat_message=user_chat_message,
                 ):
                     if await request.is_disconnected():
                         # 前端断开（切换页面/刷新）：保留已产生内容

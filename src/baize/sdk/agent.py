@@ -241,17 +241,32 @@ class Agent:
         user_message: str,
         context_variables: Optional[dict] = None,
         prior_history: Optional[list[ChatMessage]] = None,
+        extra_tools: Optional[list[AgentTool]] = None,
+        user_chat_message: Optional[ChatMessage] = None,
     ) -> AsyncIterator[AgentEvent]:
         """流式执行对话，逐步产出事件（支持实时思考、工具调用与上下文延续）。
 
         实现方式：使用真正的流式 ``client.stream()``，在流式过程中：
         - 将模型的 ``reasoning_content`` 实时产出为 ``reasoning`` 事件；
         - 累积流式工具调用增量，执行工具后继续请求，直到模型停止调用。
+
+        extra_tools: 附加的会话级工具（如附件读取工具），会合并进模型工具集。
+        user_chat_message: 若提供，作为当前用户消息（支持多模态图片内容块），
+            否则用 user_message 字符串构造。
         """
         client = LLMClient()
-        history = self._build_history(user_message, context_variables, prior_history)
-        tool_schemas = [t.to_schema() for t in self.tools]
-        tool_by_name = {t.name: t for t in self.tools}
+        if user_chat_message is not None:
+            history = self._build_history(user_message, context_variables, prior_history)
+            # 用多模态 user 消息替换末尾的纯文本 user 消息
+            history = history[:-1] + [user_chat_message]
+        else:
+            history = self._build_history(user_message, context_variables, prior_history)
+        # 合并附加工具
+        tools = list(self.tools)
+        if extra_tools:
+            tools.extend(extra_tools)
+        tool_schemas = [t.to_schema() for t in tools]
+        tool_by_name = {t.name: t for t in tools}
         final_text = ""
 
         for _ in range(self.max_tool_calls):

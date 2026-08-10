@@ -1,6 +1,6 @@
 [project]
 name = "baize"
-version = "1.0.1"
+version = "1.1.0"
 description = "Baize - An open AI cybersecurity framework"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,6 +24,7 @@ dependencies = [
   "pydantic>=2.5.0",
   "httpx>=0.27.0",
   "python-dotenv>=1.0.0",
+  "python-multipart>=0.0.9",
   "openai>=1.30.0",
   "mako>=1.3.0",
   "rich>=13.0.0",
