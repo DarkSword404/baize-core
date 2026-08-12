@@ -28,6 +28,14 @@ if [[ ! -x "$PYTHON_BIN" ]]; then
   exit 1
 fi
 
+# 检测 baize 包是否可导入（虚拟环境从其他路径复制/迁移后 editable 指向易失效）
+if ! "$PYTHON_BIN" -c "import baize" >/dev/null 2>&1; then
+  err "baize 包无法导入，环境可能不完整（或虚拟环境来自其他路径）。"
+  err "请先运行: ./setup.sh"
+  err "或手动修复: $SCRIPT_DIR/.venv/bin/pip install -e ."
+  exit 1
+fi
+
 mkdir -p "$LOG_DIR" "$PID_DIR"
 
 is_port_in_use() {

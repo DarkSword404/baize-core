@@ -1,0 +1,44 @@
+# 渗透测试流水线模板
+# 
+# 标准渗透测试流程：侦察 → Web 渗透 → 红队利用 → 报告
+
+id: penetration_test
+name: "渗透测试流水线"
+description: "标准渗透测试流程：侦察 → Web 渗透 → 红队利用 → 报告"
+category: 安全测试
+tags: [渗透测试, 红队, Web安全]
+
+trigger:
+  type: manual
+  description: "用户输入目标信息后手动触发"
+
+steps:
+  - id: recon
+    type: agent
+    agent: recon_agent
+    prompt: |
+      对目标执行侦察和信息收集：
+      目标：{{ context.target }}
+      范围：{{ context.scope }}
+      任务：子域名枚举、端口扫描、服务识别、技术栈指纹
+
+  - id: web_pentest
+    type: agent
+    agent: web_pentester_agent
+    prompt: |
+      对目标执行 Web 渗透测试：
+      目标：{{ context.target }}
+      侦察结果：{{ steps.recon.result }}
+      任务：SQL注入、XSS、目录枚举、认证绕过、敏感泄露
+
+  - id: redteam
+    type: agent
+    agent: redteam_agent
+    prompt: |
+      根据发现尝试无害化利用验证：
+      目标：{{ context.target }}
+      Web渗透结果：{{ steps.web_pentest.result }}
+      评估影响范围和修复建议
+
+  - id: done
+    type: end

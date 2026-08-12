@@ -3,7 +3,9 @@ import { useApp } from '../context/AppContext';
 import {
   setApiBase, getApiBase, getAuthToken, healthCheck, logout,
   getModelConfig, updateModelConfig, clearModelConfig,
+  listReceivers, createReceiver, updateReceiver, deleteReceiver,
 } from '../api/client';
+import type { ReceiverConfig as ReceiverConfigType } from '../api/client';
 import type { JSX } from 'react';
 
 export function Settings(): JSX.Element {
@@ -21,6 +23,18 @@ export function Settings(): JSX.Element {
   const [configSaving, setConfigSaving] = useState(false);
   const [configured, setConfigured] = useState(false);
 
+  // 接收器状态
+  const [receivers, setReceivers] = useState<ReceiverConfigType[]>([]);
+  const [receiverLoading, setReceiverLoading] = useState(true);
+  const [showReceiverForm, setShowReceiverForm] = useState(false);
+  const [editingReceiver, setEditingReceiver] = useState<ReceiverConfigType | null>(null);
+  const [receiverForm, setReceiverForm] = useState({
+    name: '', kind: 'webhook',
+    webhook_path: '', syslog_port: 514, syslog_host: '0.0.0.0',
+    watch_dir: '', watch_patterns: '*',
+  });
+  const [receiverSaving, setReceiverSaving] = useState(false);
+
   useEffect(() => {
     setAuthToken(getAuthToken());
     getModelConfig()
@@ -36,6 +50,16 @@ export function Settings(): JSX.Element {
       .catch(() => {})
       .finally(() => setConfigLoading(false));
   }, []);
+
+  // 加载接收器列表
+  function loadReceivers() {
+    setReceiverLoading(true);
+    listReceivers()
+      .then(r => setReceivers(r.receivers))
+      .catch(() => {})
+      .finally(() => setReceiverLoading(false));
+  }
+  useEffect(() => { loadReceivers(); }, []);
 
   async function handleSaveModelConfig() {
     if (!baseUrl.trim() || !modelName.trim()) {
@@ -93,9 +117,59 @@ export function Settings(): JSX.Element {
     }
   }
 
+  // ---- 接收器操作 ----
+  function openCreateReceiver() {
+    setEditingReceiver(null);
+    setReceiverForm({ name: '', kind: 'webhook', webhook_path: '', syslog_port: 514, syslog_host: '0.0.0.0', watch_dir: '', watch_patterns: '*' });
+    setShowReceiverForm(true);
+  }
+  function openEditReceiver(r: ReceiverConfigType) {
+    setEditingReceiver(r);
+    setReceiverForm({
+      name: r.name, kind: r.kind,
+      webhook_path: r.webhook_path, syslog_port: r.syslog_port || 514,
+      syslog_host: r.syslog_host || '0.0.0.0',
+      watch_dir: r.watch_dir, watch_patterns: r.watch_patterns || '*',
+    });
+    setShowReceiverForm(true);
+  }
+  async function saveReceiver() {
+    if (!receiverForm.name.trim()) return;
+    setReceiverSaving(true);
+    try {
+      if (editingReceiver) {
+        await updateReceiver(editingReceiver.id, receiverForm);
+      } else {
+        await createReceiver(receiverForm);
+      }
+      setShowReceiverForm(false);
+      loadReceivers();
+    } catch (e: any) {
+      addToast({ type: 'error', title: '保存失败', message: e.message });
+    } finally { setReceiverSaving(false); }
+  }
+  async function toggleReceiver(id: string, enabled: boolean) {
+    try {
+      await updateReceiver(id, { enabled });
+      loadReceivers();
+    } catch (e: any) {
+      addToast({ type: 'error', title: '操作失败', message: e.message });
+    }
+  }
+  async function removeReceiver(id: string) {
+    if (!confirm('确定删除此接收器？')) return;
+    try {
+      await deleteReceiver(id);
+      loadReceivers();
+      addToast({ type: 'success', title: '已删除' });
+    } catch (e: any) {
+      addToast({ type: 'error', title: '删除失败', message: e.message });
+    }
+  }
+
   function handleLogout() {
     logout();
-    window.location.reload();  // 强制回到登录页
+    window.location.reload();
   }
 
   const inputCls = "w-full px-4 py-2.5 bg-gray-800 border border-gray-700 rounded-xl text-sm text-gray-200 focus:border-blue-500 outline-none";
@@ -225,6 +299,128 @@ export function Settings(): JSX.Element {
                   清除配置
                 </button>
               )}
+            </div>
+          </div>
+        )}
+      </section>
+
+      {/* 数据接收器 */}
+      <section className="bg-gray-900 border border-gray-800 rounded-2xl p-6 mb-6">
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-sm font-semibold flex items-center gap-2">
+            <span className="w-2 h-2 rounded-full bg-cyan-400" />
+            数据接收器
+          </h2>
+          <button onClick={openCreateReceiver}
+            className="px-3 py-1.5 text-xs bg-cyan-600 hover:bg-cyan-500 rounded-lg transition-colors">
+            + 新建接收器
+          </button>
+        </div>
+        <p className="text-xs text-gray-500 mb-4">
+          数据接收器用于接收外部设备投递的数据（漏扫报告 PDF/HTML、Syslog 告警等），
+          配合自动化流水线使用。支持 Webhook、Syslog、文件监视三种协议。
+        </p>
+        {receiverLoading ? (
+          <p className="text-xs text-gray-500">加载中...</p>
+        ) : receivers.length === 0 ? (
+          <p className="text-xs text-gray-600 py-4 text-center">暂无接收器，点击上方按钮创建</p>
+        ) : (
+          <div className="space-y-2">
+            {receivers.map(r => (
+              <div key={r.id} className="flex items-center gap-3 p-3 rounded-xl bg-gray-800/50 border border-gray-700/50">
+                <div className={`w-2 h-2 rounded-full shrink-0 ${r.enabled ? 'bg-emerald-400' : 'bg-gray-500'}`} />
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-medium truncate">{r.name}</div>
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-700 text-gray-400 uppercase">{r.kind}</span>
+                    {r.kind === 'webhook' && <span className="text-[10px] text-gray-500 font-mono">/api/v1/hook/{r.webhook_path}</span>}
+                    {r.kind === 'syslog' && <span className="text-[10px] text-gray-500 font-mono">UDP :{r.syslog_port}</span>}
+                    {r.kind === 'file' && <span className="text-[10px] text-gray-500 truncate">{r.watch_dir}</span>}
+                  </div>
+                  <div className="text-[10px] text-gray-600 mt-0.5">
+                    已接收 {r.total_received} 条 · 队列 {r.queue_size}
+                    {r.last_received_at && <> · 最后 {new Date(r.last_received_at * 1000).toLocaleString()}</>}
+                  </div>
+                </div>
+                <button onClick={() => toggleReceiver(r.id, !r.enabled)}
+                  className={`px-2 py-1 text-[10px] rounded ${r.enabled ? 'bg-amber-600/20 text-amber-400 hover:bg-amber-600/30' : 'bg-emerald-600/20 text-emerald-400 hover:bg-emerald-600/30'}`}>
+                  {r.enabled ? '停用' : '启用'}
+                </button>
+                <button onClick={() => openEditReceiver(r)}
+                  className="px-2 py-1 text-[10px] rounded bg-gray-700 text-gray-300 hover:bg-gray-600">编辑</button>
+                <button onClick={() => removeReceiver(r.id)}
+                  className="px-2 py-1 text-[10px] rounded bg-red-600/10 text-red-400 hover:bg-red-600/20">删除</button>
+              </div>
+            ))}
+          </div>
+        )}
+        {/* 创建/编辑表单弹窗 */}
+        {showReceiverForm && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setShowReceiverForm(false)}>
+            <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-lg mx-4" onClick={e => e.stopPropagation()}>
+              <h3 className="text-sm font-semibold mb-4">{editingReceiver ? '编辑接收器' : '新建接收器'}</h3>
+              <div className="space-y-3">
+                <label className="block">
+                  <span className="text-[10px] text-gray-500">名称</span>
+                  <input type="text" value={receiverForm.name} onChange={e => setReceiverForm(f => ({ ...f, name: e.target.value }))}
+                    className={`${inputCls} mt-0.5`} placeholder="如：SOC告警接收器" />
+                </label>
+                <label className="block">
+                  <span className="text-[10px] text-gray-500">协议类型</span>
+                  <select value={receiverForm.kind} onChange={e => setReceiverForm(f => ({ ...f, kind: e.target.value }))}
+                    className={`${inputCls} mt-0.5`}>
+                    <option value="webhook">HTTP Webhook</option>
+                    <option value="syslog">Syslog (UDP)</option>
+                    <option value="file">文件监视</option>
+                  </select>
+                </label>
+                {receiverForm.kind === 'webhook' && (
+                  <label className="block">
+                    <span className="text-[10px] text-gray-500">Webhook 路径</span>
+                    <div className="flex items-center mt-0.5">
+                      <span className="text-xs text-gray-600 px-2 py-2 bg-gray-850 rounded-l-xl border border-r-0 border-gray-700">/api/v1/hook/</span>
+                      <input type="text" value={receiverForm.webhook_path} onChange={e => setReceiverForm(f => ({ ...f, webhook_path: e.target.value }))}
+                        className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-r-xl text-sm text-gray-200 outline-none focus:border-blue-500" placeholder="my-receiver" />
+                    </div>
+                  </label>
+                )}
+                {receiverForm.kind === 'syslog' && (
+                  <>
+                    <label className="block">
+                      <span className="text-[10px] text-gray-500">监听端口</span>
+                      <input type="number" value={receiverForm.syslog_port} onChange={e => setReceiverForm(f => ({ ...f, syslog_port: Number(e.target.value) }))}
+                        className={`${inputCls} mt-0.5`} placeholder="514" />
+                    </label>
+                    <label className="block">
+                      <span className="text-[10px] text-gray-500">绑定地址</span>
+                      <input type="text" value={receiverForm.syslog_host} onChange={e => setReceiverForm(f => ({ ...f, syslog_host: e.target.value }))}
+                        className={`${inputCls} mt-0.5`} placeholder="0.0.0.0" />
+                    </label>
+                  </>
+                )}
+                {receiverForm.kind === 'file' && (
+                  <>
+                    <label className="block">
+                      <span className="text-[10px] text-gray-500">监视目录</span>
+                      <input type="text" value={receiverForm.watch_dir} onChange={e => setReceiverForm(f => ({ ...f, watch_dir: e.target.value }))}
+                        className={`${inputCls} mt-0.5`} placeholder="/var/reports/" />
+                    </label>
+                    <label className="block">
+                      <span className="text-[10px] text-gray-500">文件匹配模式（逗号分隔）</span>
+                      <input type="text" value={receiverForm.watch_patterns} onChange={e => setReceiverForm(f => ({ ...f, watch_patterns: e.target.value }))}
+                        className={`${inputCls} mt-0.5`} placeholder="*.pdf,*.html,*.json" />
+                    </label>
+                  </>
+                )}
+              </div>
+              <div className="flex gap-3 mt-5">
+                <button onClick={saveReceiver} disabled={receiverSaving}
+                  className="flex-1 px-4 py-2.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 rounded-xl text-sm font-medium transition-all">
+                  {receiverSaving ? '保存中...' : (editingReceiver ? '更新' : '创建')}
+                </button>
+                <button onClick={() => setShowReceiverForm(false)}
+                  className="px-4 py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm transition-all">取消</button>
+              </div>
             </div>
           </div>
         )}

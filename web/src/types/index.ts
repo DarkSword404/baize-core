@@ -18,6 +18,8 @@ export interface AgentMetadata {
   pattern_type: string | null;
   tools: AgentTool[];
   is_custom?: boolean;
+  source?: 'builtin' | 'custom';
+  instructions?: string;
 }
 
 export interface AgentsResponse {

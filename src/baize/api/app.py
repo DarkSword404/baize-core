@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
+from importlib.metadata import entry_points
 from typing import Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
@@ -20,17 +22,22 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from baize import __version__
+
+logger = logging.getLogger(__name__)
 from baize.api.attachments import (
     AttachmentStore,
     attachment_tools,
     detect_file_type,
 )
 from baize.api.auth import AuthManager
-from baize.api.custom_agents import CustomAgentStore, CustomPipelineStore
+from baize.api.custom_agents import CustomAgentStore, CustomPipelineStore, get_deleted_store
+from baize.api.receivers import router as receivers_router
 from baize.api.sessions import SessionManager
 from baize.agents import list_agents, list_tools, get_agent
 from baize.config import ModelConfigStore, SingleModelConfig, get_server_config
 from baize.multimodal import build_user_message
+from baize.receivers.manager import ReceiverManager
+from baize.receivers.webhook import handle_webhook
 from baize.sdk.client import ModelNotConfiguredError
 
 
@@ -138,6 +145,7 @@ def create_baize_api_app(
     app.state.custom_pipelines = CustomPipelineStore()
     app.state.attachment_store = AttachmentStore()
     app.state.require_auth = cfg.require_auth
+    app.state.loaded_modules: dict[str, dict] = {}  # 已加载模块注册表
 
     # ------------------------------------------------------------------
     # 启动凭证输出
@@ -145,11 +153,47 @@ def create_baize_api_app(
     _print_credentials(app, cfg)
 
     # ------------------------------------------------------------------
+    # 模块发现：加载所有 baize.modules entry points
+    # ------------------------------------------------------------------
+    _discover_and_load_modules(app)
+
+    # ------------------------------------------------------------------
+    # 接收器管理 API + Webhook 路由
+    # ------------------------------------------------------------------
+    app.include_router(receivers_router, prefix="/api/v1")
+
+    @app.on_event("startup")
+    async def _start_receiver_manager():
+        """应用启动时初始化 ReceiverManager 并启动所有已启用的接收器。"""
+        mgr = ReceiverManager.get()
+        await mgr.start()
+        logger.info("ReceiverManager 已启动")
+
+    @app.on_event("shutdown")
+    async def _stop_receiver_manager():
+        """应用关闭时停止所有接收器。"""
+        mgr = ReceiverManager.get()
+        await mgr.stop()
+
+    # Webhook 捕获所有路由
+    @app.api_route("/api/v1/hook/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+    async def webhook_catchall(request: Request, path: str):
+        return await handle_webhook(request, path)
+
+    # ------------------------------------------------------------------
     # 健康检查
     # ------------------------------------------------------------------
     @app.get("/api/v1/health", response_model=HealthResponse)
     def health() -> HealthResponse:
         return HealthResponse(status="ok", version=__version__)
+
+    # ------------------------------------------------------------------
+    # 已安装模块列表
+    # ------------------------------------------------------------------
+    @app.get("/api/v1/modules")
+    def modules_list() -> dict:
+        """返回已安装并可用的模块列表。前端据此动态显示/隐藏功能。"""
+        return {"modules": app.state.loaded_modules}
 
     # ------------------------------------------------------------------
     # 模型配置（单模型）
@@ -213,13 +257,163 @@ def create_baize_api_app(
     # ------------------------------------------------------------------
     # 智能体 / 工具
     # ------------------------------------------------------------------
+
+    def _build_custom_agent(custom_agents: CustomAgentStore, name: str):
+        """从自定义智能体存储构造可执行的 Agent 实例（内置注册表查不到时使用）。
+
+        将自定义智能体的指令/模型/工具映射为运行时 Agent。
+        """
+        from baize.sdk.agent import Agent
+        from baize.tools import extended_tools
+
+        custom = custom_agents.find_by_name(name)
+        if custom is None:
+            return None
+        tool_map = {t.name: t for t in extended_tools()}
+        tools = [tool_map[t] for t in (custom.get("tools") or []) if t in tool_map]
+        return Agent(
+            name=custom.get("name", name),
+            description=custom.get("description", ""),
+            instructions=custom.get("instructions", ""),
+            model=custom.get("model") or None,
+            tools=tools,
+        )
+
     @app.get(
         "/api/v1/agents",
         response_model=AgentsResponse,
         dependencies=[Depends(_require_api_key)],
     )
     def agents_list() -> AgentsResponse:
-        return AgentsResponse(agents=list_agents())
+        # 统一返回内置（过滤已删除）+ 自定义智能体，保证列表数据源唯一
+        deleted = get_deleted_store()
+        builtin = [
+            {**a, "is_custom": False}
+            for a in list_agents()
+            if not deleted.is_agent_deleted(a["name"])
+        ]
+        custom = []
+        for a in app.state.custom_agents.list():
+            custom.append(
+                {
+                    "id": a.get("id", a.get("name", "")),
+                    "name": a.get("name", ""),
+                    "description": a.get("description", ""),
+                    "instructions": a.get("instructions", ""),
+                    "model": a.get("model", ""),
+                    "type": "agent",
+                    "pattern_type": None,
+                    "source": "custom",
+                    "is_custom": True,
+                    "tools": [
+                        {"name": t, "description": ""} for t in (a.get("tools") or [])
+                    ],
+                }
+            )
+        return AgentsResponse(agents=[*builtin, *custom])
+
+    # ------------------------------------------------------------------
+    # 自定义智能体 CRUD — 必须注册在 /api/v1/agents/{agent_name} 之前，
+    # 否则 "custom" 会被 {agent_name} 动态路由抢先匹配而返回 404
+    # ------------------------------------------------------------------
+    @app.get(
+        "/api/v1/agents/custom",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def custom_agents_list() -> dict:
+        return {"agents": app.state.custom_agents.list()}
+
+    @app.post(
+        "/api/v1/agents/custom",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def custom_agents_create(payload: dict) -> dict:
+        return app.state.custom_agents.create(dict(payload))
+
+    @app.put(
+        "/api/v1/agents/custom/{agent_id}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def custom_agents_update(agent_id: str, payload: dict) -> dict:
+        agent = app.state.custom_agents.update(agent_id, dict(payload))
+        if agent is None:
+            raise HTTPException(status_code=404, detail="自定义智能体不存在")
+        return agent
+
+    @app.delete(
+        "/api/v1/agents/custom/{agent_id}",
+        dependencies=[Depends(_require_api_key)],
+    )
+    def custom_agents_delete(agent_id: str) -> dict:
+        ok = app.state.custom_agents.delete(agent_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="自定义智能体不存在")
+        return {"success": True}
+
+    @app.get(
+        "/api/v1/agents/{agent_name}",
+        dependencies=[Depends(_require_api_key)],
+    )
+    def agent_detail(agent_name: str) -> dict:
+        """获取智能体详情，包含 instructions 等完整信息。"""
+        agent = get_agent(agent_name)
+        if agent is not None:
+            return {
+                "name": agent.name,
+                "id": agent.name,
+                "description": getattr(agent, "description", ""),
+                "instructions": getattr(agent, "instructions", ""),
+                "source": "builtin",
+                "type": "agent",
+                "is_custom": False,
+                "tools": [{"name": t.name, "description": t.description} for t in agent.tools],
+            }
+        # 自定义智能体
+        custom = app.state.custom_agents.find_by_name(agent_name)
+        if custom is None:
+            raise HTTPException(status_code=404, detail=f"智能体 '{agent_name}' 未找到")
+        return {
+            "name": custom.get("name", agent_name),
+            "id": custom.get("id", agent_name),
+            "description": custom.get("description", ""),
+            "instructions": custom.get("instructions", ""),
+            "model": custom.get("model", ""),
+            "source": "custom",
+            "type": "agent",
+            "pattern_type": None,
+            "is_custom": True,
+            "tools": [
+                {"name": t, "description": ""} for t in (custom.get("tools") or [])
+            ],
+        }
+
+    @app.delete(
+        "/api/v1/agents/{agent_name}",
+        dependencies=[Depends(_require_api_key)],
+    )
+    def delete_agent(agent_name: str) -> dict:
+        """删除内置智能体（软删除，可恢复）。"""
+        deleted = get_deleted_store()
+        # 确认智能体存在
+        from baize.agents import list_agents as _raw_agents
+        all_agents = [a["name"] for a in _raw_agents()]
+        if agent_name not in all_agents and deleted.is_agent_deleted(agent_name):
+            return {"error": f"智能体 '{agent_name}' 未找到", "ok": False}
+        deleted.delete_agent(agent_name)
+        return {"ok": True, "agent_name": agent_name, "message": "智能体已删除"}
+
+    @app.post(
+        "/api/v1/agents/reset",
+        dependencies=[Depends(_require_api_key)],
+    )
+    def reset_agents() -> dict:
+        """恢复所有已删除的内置智能体。"""
+        deleted = get_deleted_store()
+        count = deleted.reset_agents()
+        return {"ok": True, "restored": count, "message": f"已恢复 {count} 个智能体"}
 
     @app.get(
         "/api/v1/tools",
@@ -401,6 +595,9 @@ def create_baize_api_app(
         agent_name = payload.agent or session.agent
         agent = get_agent(agent_name)
         if agent is None:
+            # 内置注册表查不到时，尝试自定义智能体
+            agent = _build_custom_agent(app.state.custom_agents, agent_name)
+        if agent is None:
             agent = get_agent(None)  # 回退默认
 
         # 拼接历史（stateful 会话）：将会话已有消息作为上下文传给 Agent
@@ -410,6 +607,7 @@ def create_baize_api_app(
         prior_history = [
             ChatMessage(role=m["role"], content=m.get("content", ""))
             for m in history_messages
+            if m.get("role") in ("user", "assistant") and not m.get("type")
         ]
 
         # ── 多模态附件处理 ──
@@ -451,11 +649,11 @@ def create_baize_api_app(
                 nonlocal saved
                 if saved:
                     return
-                # 思考过程：作为 reasoning 中间产物消息
+                # 思考过程：作为 reasoning 中间产物消息（独立 role，避免与正常回复混淆）
                 if reasoning_parts:
                     sm.append_message(
                         session_id,
-                        "assistant",
+                        "intermediate",
                         "",
                         extra={
                             "type": "reasoning",
@@ -464,7 +662,7 @@ def create_baize_api_app(
                     )
                 # 工具调用 / 结果：逐条作为 function_call / function_call_output 消息
                 for ev in tool_events:
-                    sm.append_message(session_id, "assistant", "", extra=ev)
+                    sm.append_message(session_id, "intermediate", "", extra=ev)
                 # 最终文本：作为 assistant 正文（若有）
                 if final_text.strip():
                     sm.append_message(session_id, "assistant", final_text)
@@ -560,46 +758,6 @@ def create_baize_api_app(
                 }
             )
         return {"models": models}
-
-    # ------------------------------------------------------------------
-    # 自定义智能体 CRUD
-    # ------------------------------------------------------------------
-    @app.get(
-        "/api/v1/agents/custom",
-        response_model=dict,
-        dependencies=[Depends(_require_api_key)],
-    )
-    def custom_agents_list() -> dict:
-        return {"agents": app.state.custom_agents.list()}
-
-    @app.post(
-        "/api/v1/agents/custom",
-        response_model=dict,
-        dependencies=[Depends(_require_api_key)],
-    )
-    def custom_agents_create(payload: dict) -> dict:
-        return app.state.custom_agents.create(dict(payload))
-
-    @app.put(
-        "/api/v1/agents/custom/{agent_id}",
-        response_model=dict,
-        dependencies=[Depends(_require_api_key)],
-    )
-    def custom_agents_update(agent_id: str, payload: dict) -> dict:
-        agent = app.state.custom_agents.update(agent_id, dict(payload))
-        if agent is None:
-            raise HTTPException(status_code=404, detail="自定义智能体不存在")
-        return agent
-
-    @app.delete(
-        "/api/v1/agents/custom/{agent_id}",
-        dependencies=[Depends(_require_api_key)],
-    )
-    def custom_agents_delete(agent_id: str) -> dict:
-        ok = app.state.custom_agents.delete(agent_id)
-        if not ok:
-            raise HTTPException(status_code=404, detail="自定义智能体不存在")
-        return {"success": True}
 
     # ------------------------------------------------------------------
     # 编排管道
@@ -727,3 +885,33 @@ def _print_credentials(app: FastAPI, cfg) -> None:
     ]
     sys.stdout.write("\n".join(lines))
     sys.stdout.flush()
+
+
+def _discover_and_load_modules(app: FastAPI) -> None:
+    """扫描 baize.modules entry point，加载所有已安装的扩展模块。
+
+    每个 entry point 指向一个可调用对象 register(app: FastAPI) -> None，
+    模块通过该函数向核心 app 注册额外路由和功能。
+    """
+    try:
+        eps = entry_points(group="baize.modules")
+    except TypeError:
+        # Python 3.10/3.11 兼容
+        eps = entry_points().get("baize.modules", [])
+
+    for ep in eps:
+        try:
+            mod = ep.load()
+            if callable(mod):
+                mod(app)
+                app.state.loaded_modules[ep.name] = {
+                    "installed": True,
+                    "version": getattr(ep, "dist", None) and ep.dist.version or "unknown",
+                }
+                logger.info("已加载模块: %s", ep.name)
+            else:
+                logger.warning("模块 entry point %s 不是可调用对象，跳过", ep.name)
+        except ModuleNotFoundError:
+            logger.debug("模块 %s 未安装或缺少依赖，跳过", ep.name)
+        except Exception:
+            logger.exception("加载模块 %s 失败", ep.name)

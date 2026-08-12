@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
-import { createSession, listAgents, listPipelines, getModelConfig } from '../api/client';
-import type { PipelineInfo } from '../api/client';
+import { createSession, listAgents, listManualPipelines, getModelConfig } from '../api/client';
+import type { ManualPipelineBrief } from '../api/client';
 import type { JSX } from 'react';
 
 interface Props {
@@ -10,12 +10,12 @@ interface Props {
   onCreated: (sessionId: string) => void;
 }
 
-type OrchestrationMode = 'single' | 'sequential' | 'swarm';
+type OrchestrationMode = 'single' | 'pipeline' | 'swarm';
 
 const MODE_LABELS: Record<OrchestrationMode, { label: string; desc: string; icon: string }> = {
-  single:     { label: '单智能体',  desc: '选择一个智能体独立执行任务',     icon: '🤖' },
-  sequential: { label: '顺序流水线', desc: '多个智能体依次执行，前序输出作为后续输入', icon: '🔗' },
-  swarm:      { label: 'Swarm 协作', desc: '红队集群协作，智能体间动态 Handoff',  icon: '🪄' },
+  single:   { label: '单智能体',   desc: '选择一个智能体独立执行任务',           icon: '🤖' },
+  pipeline: { label: '人工流水线', desc: '选择一条人工流水线，带确认节点的安全编排', icon: '🔶' },
+  swarm:    { label: 'Swarm 协作', desc: '红队集群协作，智能体间动态 Handoff',       icon: '🪄' },
 };
 
 export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Element | null {
@@ -27,9 +27,9 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
 
   // Pattern / pipeline selection
   const [mode, setMode] = useState<OrchestrationMode>('single');
-  const [selectedPipeline, setSelectedPipeline] = useState('');
-  const [pipelines, setPipelines] = useState<PipelineInfo[]>([]);
+  const [pipelines, setPipelines] = useState<ManualPipelineBrief[]>([]);
   const [loadingPipelines, setLoadingPipelines] = useState(false);
+  const [selectedPipeline, setSelectedPipeline] = useState('');
 
   // Separate agents vs patterns for display
   const plainAgents = agents.filter(a => !a.pattern_type && a.name !== 'x-ray');
@@ -45,10 +45,10 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
           .finally(() => setLoadingAgents(false));
       }
       if (!selectedAgent && agents.length > 0) setSelectedAgent(agents[0].name);
-      // Fetch pipelines
+      // Fetch manual pipelines for chat selection
       if (pipelines.length === 0) {
         setLoadingPipelines(true);
-        listPipelines()
+        listManualPipelines()
           .then(r => setPipelines(r.pipelines))
           .catch(() => {})
           .finally(() => setLoadingPipelines(false));
@@ -63,9 +63,9 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
   }, [open]);
 
   useEffect(() => {
-    // Auto-select first pipeline when switching to sequential
-    if (mode === 'sequential' && pipelines.length > 0 && !selectedPipeline) {
-      setSelectedPipeline(pipelines[0].name);
+    // Auto-select first manual pipeline when switching to pipeline mode
+    if (mode === 'pipeline' && pipelines.length > 0 && !selectedPipeline) {
+      setSelectedPipeline(pipelines[0].id);
     }
   }, [mode, pipelines]);
 
@@ -76,10 +76,10 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
         agent: mode === 'single' ? (selectedAgent || null) : null,
         model: configuredModel || null,
         stateful: true,
-        pattern: mode !== 'single' ? selectedPipeline || mode : null,
+        pattern: mode === 'pipeline' ? (selectedPipeline || null) : mode === 'swarm' ? (selectedPipeline || 'swarm') : null,
       });
       addSession(session);
-      const patternLabel = mode !== 'single' ? ` · ${MODE_LABELS[mode].label}` : '';
+      const patternLabel = mode === 'pipeline' ? ` · 人工流水线` : mode === 'swarm' ? ` · Swarm 协作` : '';
       addToast({ type: 'success', title: '会话已创建', message: `智能体: ${session.agent}${patternLabel}` });
       onCreated(session.id);
       onClose();
@@ -148,7 +148,7 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
                     >
                       <div className="font-medium text-xs">{a.name}</div>
                       {a.description && <div className="text-[11px] text-gray-500 mt-0.5 line-clamp-2">{a.description}</div>}
-                      {a.tools.length > 0 && (
+                      {a.tools && a.tools.length > 0 && (
                         <div className="flex gap-1 mt-1 flex-wrap">
                           {a.tools.slice(0, 4).map(t => (
                             <span key={t.name} className="text-[9px] px-1.5 py-0.5 rounded bg-gray-700/50 text-gray-400">{t.name}</span>
@@ -162,34 +162,40 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
               </div>
             )}
 
-            {/* ── 顺序流水线选择 ── */}
-            {mode === 'sequential' && (
+            {/* ── 人工流水线选择 ── */}
+            {mode === 'pipeline' && (
               <div>
-                <label className="block text-xs font-medium text-gray-400 mb-1.5">可用流水线</label>
+                <label className="block text-xs font-medium text-gray-400 mb-1.5">可用人工流水线</label>
+                <p className="text-[10px] text-gray-600 mb-2">人工流水线带有人工确认节点，适合需要审批的安全编排场景</p>
                 {loadingPipelines ? (
                   <div className="text-xs text-gray-600 py-4 text-center">加载流水线中...</div>
                 ) : pipelines.length === 0 ? (
-                  <div className="text-xs text-gray-600 py-4 text-center">暂无可用流水线</div>
+                  <div className="text-xs text-gray-600 py-4 text-center">暂无可用人工流水线</div>
                 ) : (
                   <div className="space-y-2">
                     {pipelines.map(p => (
                       <button
-                        key={p.name}
-                        onClick={() => setSelectedPipeline(p.name)}
+                        key={p.id}
+                        onClick={() => setSelectedPipeline(p.id)}
                         className={`w-full text-left px-3 py-3 rounded-lg text-sm transition-all border ${
-                          selectedPipeline === p.name
-                            ? 'border-purple-500/40 bg-purple-600/10 text-purple-300'
+                          selectedPipeline === p.id
+                            ? 'border-amber-500/40 bg-amber-600/10 text-amber-300'
                             : 'border-transparent bg-gray-800/50 text-gray-300 hover:bg-gray-800 hover:border-gray-700'
                         }`}
                       >
-                        <div className="font-medium text-xs mb-1">{p.description}</div>
-                        {/* Flow visualization */}
+                        <div className="font-medium text-xs mb-1">{p.name}</div>
+                        <div className="text-[11px] text-gray-500 mb-2 line-clamp-2">{p.description}</div>
+                        {/* Node visualization */}
                         <div className="flex items-center gap-1 flex-wrap">
-                          {p.steps.map((step, idx) => (
+                          {p.node_types.map((nt, idx) => (
                             <span key={idx} className="flex items-center gap-1">
                               {idx > 0 && <span className="text-gray-600 text-[10px]">→</span>}
-                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-700/60 text-gray-300">
-                                {step.display}
+                              <span className={`text-[10px] px-1.5 py-0.5 rounded ${
+                                nt === 'confirm' ? 'bg-amber-600/20 text-amber-400' :
+                                nt === 'decision' ? 'bg-blue-600/20 text-blue-400' :
+                                'bg-gray-700/60 text-gray-300'
+                              }`}>
+                                {nt === 'agent' ? 'Agent' : nt === 'confirm' ? '确认' : nt === 'decision' ? '决策' : nt === 'parallel' ? '并行' : nt}
                               </span>
                             </span>
                           ))}
@@ -249,7 +255,7 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
                 creating ||
                 agents.length === 0 ||
                 (mode === 'single' && !selectedAgent) ||
-                (mode === 'sequential' && !selectedPipeline) ||
+                (mode === 'pipeline' && !selectedPipeline) ||
                 (mode === 'swarm' && !selectedAgent)
               }
               className="w-full py-2.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-xl text-sm font-semibold transition-all active:scale-[0.98] cursor-pointer disabled:cursor-not-allowed"

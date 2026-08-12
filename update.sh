@@ -31,7 +31,7 @@ fi
 # 2. 检查远程是否配置
 if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
   echo "❌ 未配置远程仓库 '$REMOTE'。"
-  echo "   请执行: git remote add $REMOTE https://github.com/DarkSword404/baize.git"
+  echo "   请执行: git remote add $REMOTE https://github.com/DarkSword404/baize-core.git"
   exit 1
 fi
 

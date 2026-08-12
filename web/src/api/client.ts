@@ -556,3 +556,331 @@ export async function listAttachments(sessionId: string): Promise<AttachmentInfo
 export async function deleteAttachment(sessionId: string, fileId: string): Promise<void> {
   await request(`/sessions/${sessionId}/files/${fileId}`, { method: 'DELETE' });
 }
+
+// ===== 模块发现 =====
+export interface ModuleInfo {
+  installed: boolean;
+  version: string;
+}
+
+export interface ModulesResponse {
+  modules: Record<string, ModuleInfo>;
+}
+
+/** 获取已安装的模块列表，前端据此动态显示/隐藏功能。 */
+export async function fetchModules(): Promise<ModulesResponse> {
+  return request('/modules');
+}
+
+// ===== Pipeline 执行（后台 Runner 模型） =====
+
+export interface PipelineTemplate {
+  id: string;
+  name: string;
+  type: string;               // "auto" | "manual"
+  description: string;
+  category: string;
+  tags?: string[];
+  triggers?: string[];
+  nodes?: Array<{              // 新格式
+    id: string;
+    type: string;
+    display_name: string;
+    description: string;
+    agent?: string;
+    prompt_template?: string;
+    branches?: Array<{ when: string; goto: string; label: string; default?: boolean }>;
+    parallel_branches?: Array<{ node_id: string }>;
+    confirm_prompt?: string;
+    confirm_options?: string[];
+  }>;
+  steps?: Array<{              // 兼容旧格式
+    id: string;
+    type: string;
+    agent: string;
+    display_name?: string;
+    description?: string;
+    prompt_template?: string;
+    branches?: Array<{ when: string; goto: string; label?: string; default?: boolean }>;
+  }>;
+}
+
+export interface PipelineTemplatesResponse {
+  templates: PipelineTemplate[];
+}
+
+/** 获取预置流水线模板列表 */
+export async function listPipelineTemplates(): Promise<PipelineTemplatesResponse> {
+  return request('/pipelines/templates');
+}
+
+/** 删除内置流水线模板 */
+export async function deleteBuiltinTemplate(templateId: string): Promise<{ ok: boolean; template_id: string; message: string }> {
+  return request(`/pipelines/templates/${templateId}`, { method: 'DELETE' });
+}
+
+/** 恢复所有已删除的内置流水线模板 */
+export async function resetBuiltinTemplates(): Promise<{ ok: boolean; restored: number; message: string }> {
+  return request('/pipelines/templates/reset', { method: 'POST' });
+}
+
+/** 删除内置智能体 */
+export async function deleteBuiltinAgent(agentName: string): Promise<{ ok: boolean; agent_name: string; message: string }> {
+  return request(`/agents/${agentName}`, { method: 'DELETE' });
+}
+
+/** 获取智能体详情（含完整 instructions） */
+export async function getAgentDetail(name: string): Promise<{ name: string; id: string; description: string; instructions: string; source: string; type: string; tools: Array<{ name: string; description: string }> }> {
+  return request(`/agents/${name}`);
+}
+
+/** 恢复所有已删除的内置智能体 */
+export async function resetBuiltinAgents(): Promise<{ ok: boolean; restored: number; message: string }> {
+  return request('/agents/reset', { method: 'POST' });
+}
+
+// ---- 后台执行 Runs API ----
+
+export interface RunCreateRequest {
+  pipeline_id: string;
+  context: Record<string, unknown>;
+  webhook?: string;
+}
+
+export interface RunCreateResponse {
+  ok: boolean;
+  run_id: string;
+  pipeline_id: string;
+  status: string;
+}
+
+export interface RunBrief {
+  run_id: string;
+  pipeline_id: string;
+  pipe_type: string;
+  status: string;
+  created_at: number;
+  error: string;
+}
+
+export interface RunListResponse {
+  runs: RunBrief[];
+  total: number;
+}
+
+export interface NodeRecord {
+  node_id: string;
+  node_type: string;
+  status: string;
+  input?: unknown;
+  output?: string;
+  data?: Record<string, unknown>;
+  error?: string;
+  started_at?: number;
+  ended_at?: number;
+}
+
+export interface RunEvent {
+  event_id: string;
+  type: string;
+  run_id: string;
+  timestamp: number;
+  data: {
+    node_id?: string;
+    node_type?: string;
+    [key: string]: unknown;
+  };
+}
+
+export interface RunDetail {
+  run_id: string;
+  pipeline_id: string;
+  pipe_type: string;
+  status: string;
+  context: Record<string, unknown>;
+  created_at: number;
+  started_at: number | null;
+  ended_at: number | null;
+  error: string;
+  nodes: Record<string, NodeRecord>;
+  events: RunEvent[];
+  events_count: number;
+  report: string;
+}
+
+/** 提交一次后台执行（立即返回 run_id） */
+export async function submitRun(data: RunCreateRequest): Promise<RunCreateResponse> {
+  return request('/runs', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+/** 列出运行记录 */
+export async function listRuns(params?: {
+  pipeline_id?: string;
+  status?: string;
+  limit?: number;
+}): Promise<RunListResponse> {
+  const qs = new URLSearchParams();
+  if (params?.pipeline_id) qs.set('pipeline_id', params.pipeline_id);
+  if (params?.status) qs.set('status', params.status);
+  if (params?.limit) qs.set('limit', String(params.limit));
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return request(`/runs${query}`);
+}
+
+/** 查询单次执行详情 */
+export async function getRun(runId: string): Promise<{ ok: boolean; run: RunDetail }> {
+  return request(`/runs/${runId}`);
+}
+
+/** SSE 实时事件流（支持重连补齐） */
+export function streamRunEvents(
+  runId: string,
+  lastEventId: string,
+  onEvent: (event: RunEvent) => void,
+  onDone: () => void,
+  onError: (err: Error) => void,
+): AbortController {
+  const controller = new AbortController();
+  const params = lastEventId ? `?last_event_id=${encodeURIComponent(lastEventId)}` : '';
+
+  fetch(`${apiBase}/runs/${runId}/stream${params}`, {
+    method: 'GET',
+    headers: { ...authHeaders(), Accept: 'text/event-stream' },
+    signal: controller.signal,
+  })
+    .then(async (res) => {
+      if (!res.ok) throw new Error(`[${res.status}] ${res.statusText}`);
+      const reader = res.body?.getReader();
+      if (!reader) throw new Error('无响应数据流');
+      const decoder = new TextDecoder();
+      let buffer = '';
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const dataMatch = line.match(/^data:\s*(.+)/);
+          if (dataMatch) {
+            const raw = dataMatch[1].trim();
+            if (raw === '[DONE]') { onDone(); return; }
+            try {
+              onEvent(JSON.parse(raw) as RunEvent);
+            } catch { /* skip malformed */ }
+          }
+        }
+      }
+      onDone();
+    })
+    .catch((err) => {
+      if (err.name !== 'AbortError') onError(err);
+    });
+  return controller;
+}
+
+/** 人工确认恢复执行 */
+export async function confirmRun(runId: string, action: string): Promise<{ ok: boolean; status: string; message: string }> {
+  return request(`/runs/${runId}/confirm`, {
+    method: 'POST',
+    body: JSON.stringify({ action }),
+  });
+}
+
+// ---- 自动化流水线激活控制 ----
+
+export interface PipelineActivationStatus {
+  pipeline_id: string;
+  active: boolean;
+}
+
+/** 开启自动化流水线 */
+export async function activatePipeline(pipelineId: string): Promise<{ ok: boolean; pipeline_id: string; active: boolean }> {
+  return request(`/pipelines/${pipelineId}/activate`, { method: 'POST' });
+}
+
+/** 关闭自动化流水线 */
+export async function deactivatePipeline(pipelineId: string): Promise<{ ok: boolean; pipeline_id: string; active: boolean }> {
+  return request(`/pipelines/${pipelineId}/deactivate`, { method: 'POST' });
+}
+
+/** 获取自动化流水线激活状态 */
+export async function getPipelineStatus(pipelineId: string): Promise<PipelineActivationStatus> {
+  return request(`/pipelines/${pipelineId}/status`);
+}
+
+// ---- 人工介入流水线（供对话选择） ----
+
+export interface ManualPipelineBrief {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  tags?: string[];
+  nodes_count: number;
+  node_types: string[];
+}
+
+export interface ManualPipelinesResponse {
+  pipelines: ManualPipelineBrief[];
+  total: number;
+}
+
+/** 列出人工介入流水线，供对话中选择 */
+export async function listManualPipelines(): Promise<ManualPipelinesResponse> {
+  return request('/pipelines/manual');
+}
+
+// ===== Receivers 数据接收器 =====
+export interface ReceiverConfig {
+  id: string;
+  name: string;
+  kind: string;
+  enabled: boolean;
+  pipeline_id: string;
+  webhook_path: string;
+  syslog_port: number;
+  syslog_host: string;
+  syslog_protocol: string;
+  watch_dir: string;
+  watch_patterns: string;
+  watch_recursive: boolean;
+  total_received: number;
+  last_received_at: number | null;
+  queue_size: number;
+  created_at: number;
+  updated_at: number;
+}
+export interface ReceiversResponse { receivers: ReceiverConfig[]; }
+export interface ReceiverResponse { receiver: ReceiverConfig; }
+
+export async function listReceivers(): Promise<ReceiversResponse> {
+  return request('/receivers');
+}
+export async function getReceiver(id: string): Promise<ReceiverResponse> {
+  return request(`/receivers/${id}`);
+}
+export async function createReceiver(data: {
+  name: string;
+  kind: string;
+  pipeline_id?: string;
+  webhook_path?: string;
+  syslog_port?: number;
+  syslog_host?: string;
+  syslog_protocol?: string;
+  watch_dir?: string;
+  watch_patterns?: string;
+  watch_recursive?: boolean;
+}): Promise<ReceiverResponse> {
+  return request('/receivers', { method: 'POST', body: JSON.stringify(data) });
+}
+export async function updateReceiver(id: string, data: Record<string, any>): Promise<ReceiverResponse> {
+  return request(`/receivers/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+export async function deleteReceiver(id: string): Promise<{ status: string }> {
+  return request(`/receivers/${id}`, { method: 'DELETE' });
+}

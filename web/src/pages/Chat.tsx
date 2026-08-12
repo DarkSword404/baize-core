@@ -43,18 +43,8 @@ function formatArguments(args: unknown): string {
 /** 将 history 中的任意条目转换为 ChatMessage，中间产物标记为 intermediate */
 function buildChatMessage(h: any, fallbackTimestamp: string): ChatMessageType | null {
   const ts = h.timestamp || fallbackTimestamp;
-
-  // 正常对话消息
-  if (h.role === 'user' || h.role === 'assistant') {
-    return {
-      id: genId(),
-      role: h.role,
-      content: extractContentText(h.content),
-      timestamp: ts,
-    };
-  }
-
-  // ── 以下为中间产物 ──
+  // 中间产物由后端以 type 字段标识（role 为 "intermediate" 或历史遗留的 "assistant"），
+  // 必须先于 role 判断，否则会被当成 content 为空的普通消息渲染。
   const itemType = h.type || '';
 
   // 工具调用
@@ -108,19 +98,42 @@ function buildChatMessage(h: any, fallbackTimestamp: string): ChatMessageType | 
     };
   }
 
-  // handoff / 其他类型
-  const detail = extractContentText(h.content) || JSON.stringify(h, null, 2);
-  return {
-    id: genId(),
-    role: 'tool',
-    content: '',
-    timestamp: ts,
-    intermediates: [{
-      itemType: 'handoff',
-      label: itemType ? `步骤 (${itemType})` : '步骤',
-      detail,
-    }],
-  };
+  // 其他带 type 的中间产物（handoff 等）
+  if (itemType) {
+    const detail = extractContentText(h.content) || JSON.stringify(h, null, 2);
+    return {
+      id: genId(),
+      role: 'tool',
+      content: '',
+      timestamp: ts,
+      intermediates: [{
+        itemType: 'handoff',
+        label: `步骤 (${itemType})`,
+        detail,
+      }],
+    };
+  }
+
+  // ── 正常对话消息（无 type 字段：用户提问 / 助手最终回复） ──
+  if (h.role === 'user' || h.role === 'assistant') {
+    return {
+      id: genId(),
+      role: h.role,
+      content: extractContentText(h.content),
+      timestamp: ts,
+    };
+  }
+
+  // 其它未知角色（system 等）：按普通消息兜底展示
+  if (h.role) {
+    return {
+      id: genId(),
+      role: h.role,
+      content: extractContentText(h.content),
+      timestamp: ts,
+    };
+  }
+  return null;
 }
 
 export function Chat(): JSX.Element {
@@ -179,7 +192,10 @@ export function Chat(): JSX.Element {
           }).catch(() => {});
         }
       }).catch(() => {}),
-      listAgents().then(r => setAgents(r.agents)).catch(() => {}),
+      // 后端 /api/v1/agents 已统一返回内置 + 自定义智能体
+      listAgents().then(r => {
+        setAgents(r.agents);
+      }).catch(() => {}),
     ]);
   }, []);
 

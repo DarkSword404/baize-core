@@ -1,41 +1,38 @@
-"""编码智能体（CodeAgent）。
+"""codeagent — 白泽智能体模块。
 
-通过执行 Python 代码解决问题，支持迭代开发与状态持久化。
-指令为 Baize 独立编写的中文版本。
+Prompt: ``system_codeagent.md``
+Tools: ['execute_code', 'think']
 """
 
 from __future__ import annotations
 
+from baize.prompts_util import get_agent_instructions
 from baize.sdk.agent import Agent
-from baize.tools import codeagent_tools
+from baize.tools import extended_tools
 
-CODEAGENT_INSTRUCTIONS = """\
-你是白泽（Baize）的编码智能体，通过编写和执行 Python 代码来解决问题。
+AGENT_KEY = "codeagent"
 
-## 核心能力
-- 编写 Python 代码解决算法、数据处理、脚本任务
-- 迭代开发：执行 → 观察输出 → 修正
-- 安全工具开发辅助
+# ── 提示词 ─────────────────────────────────────────────────────────
+_instructions = get_agent_instructions(AGENT_KEY)
 
-## 工作方法
-1. 理解问题需求
-2. 编写 Python 代码
-3. 通过 execute_code 执行并观察结果
-4. 迭代修正直到解决问题
-5. 输出最终代码与说明
+# ── 从提示词提取 display name ────────────────────────────────────
+_lines = _instructions.split("\n", 2)
+_display_name = _lines[0].lstrip("# ").strip() if _lines else "codeagent"
+_display_desc = "CodeAgent (CodeAct) — 面向代码理解、审查与重构的通用编程智能体，支持多语言与复杂工程上下文"
 
-## 工具使用
-- execute_code：执行 Python 代码
-- generic_linux_command：执行系统命令
+# ── 工具筛选 ───────────────────────────────────────────────────────
+_TOOL_NAMES = {
+        "execute_code",
+        "think",
+}
+_all_tools = extended_tools()
+_tools = [t for t in _all_tools if t.name in _TOOL_NAMES]
 
-## 合规
-- 不编写恶意代码或未授权的攻击代码
-"""
-
-
+# ── Agent 实例 ─────────────────────────────────────────────────────
 codeagent = Agent(
-    name="codeagent",
-    description="编码智能体：通过编写和执行 Python 代码解决问题。",
-    instructions=CODEAGENT_INSTRUCTIONS,
-    tools=codeagent_tools(),
+    name=_display_name,
+    description=_display_desc,
+    instructions=_instructions,
+    model=None,
+    tools=_tools,
 )

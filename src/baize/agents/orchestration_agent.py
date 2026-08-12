@@ -1,43 +1,50 @@
-"""编排智能体。
+"""orchestration_agent — 白泽路由/元智能体模块。
 
-默认编排器：广度优先的多智能体委派（并行侦察、窄化后续专家）。
-指令为 Baize 独立编写的中文版本。
+Prompt: ``system_orchestration_agent.md``
+Tools: ['run_specialist', 'run_dual_approach_contest', 'run_parallel_specialists', 'check_available_agents', 'analyze_task_requirements']
 """
 
 from __future__ import annotations
 
-from baize.sdk.agent import Agent
-from baize.tools import orchestration_tools
+from baize.prompts_util import get_agent_instructions
+from baize.sdk.agent import Agent, AgentTool
+from baize.agents.approach_contest import APPROACH_CONTEST_TOOLS
+from baize.agents.agent_discovery import AGENT_DISCOVERY_TOOLS
 
-ORCHESTRATION_INSTRUCTIONS = """\
-你是白泽（Baize）的编排智能体，负责将网络安全任务委派给最合适的专家智能体。
+AGENT_KEY = "orchestration_agent"
 
-## 核心能力
-- 广度优先委派：并行调用多个侦察/专家智能体
-- 任务需求分析
-- 智能体选择与调度
-- 结果整合
+# ── 提示词 ─────────────────────────────────────────────────────────
+_instructions = get_agent_instructions(AGENT_KEY)
 
-## 工作方法
-1. 分析任务需求（analyze_task_requirements）
-2. 选择合适智能体（check_available_agents）
-3. 并行委派任务
-4. 整合结果输出
+# ── 从提示词提取 display name ────────────────────────────────────
+_lines = _instructions.split("\n", 2)
+_display_name = _lines[0].lstrip("# ").strip() if _lines else "orchestration_agent"
+_display_desc = "编排智能体 — 默认入口智能体，负责解析用户意图并协调下游子智能体进行任务分发与结果汇总"
 
-## 工具使用
-- analyze_task_requirements：分析任务类型
-- check_available_agents：查看可用智能体
-- 委派结果汇总
+# ── 工具构建 ───────────────────────────────────────────────────────
+def _build_tools() -> list[AgentTool]:
+    import inspect
+    tools: list[AgentTool] = []
 
-## 准则
-- 复杂任务先侦察后深入
-- 整合多智能体结果，避免重复
-"""
+    for item in APPROACH_CONTEST_TOOLS + AGENT_DISCOVERY_TOOLS:
+        name = item.get("name", "")
+        description = item.get("description", "")
+        handler = item.get("func", item.get("handler"))
+        params = item.get("parameters", {})
+        tools.append(AgentTool(
+            name=name, description=description,
+            parameters=params, handler=handler,
+        ))
 
+    return tools
 
+_tools = _build_tools()
+
+# ── Agent 实例 ─────────────────────────────────────────────────────
 orchestration_agent = Agent(
-    name="orchestration_agent",
-    description="编排智能体：多智能体委派、任务调度、结果整合。",
-    instructions=ORCHESTRATION_INSTRUCTIONS,
-    tools=orchestration_tools(),
+    name=_display_name,
+    description=_display_desc,
+    instructions=_instructions,
+    model=None,
+    tools=_tools,
 )

@@ -103,7 +103,9 @@ class Agent:
         ctx = context_variables or {}
         try:
             return self.instructions.format(**ctx)
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, IndexError):
+            # 提示词中可能含有字面 { }（如 flag{...}、JSON/代码示例），
+            # format 会抛 KeyError/ValueError/IndexError，此时原样返回。
             return self.instructions
 
     def _apply_context_window(

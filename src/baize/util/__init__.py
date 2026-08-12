@@ -13,7 +13,8 @@ def create_system_prompt_renderer(instructions: str):
         ctx = context_variables or {}
         try:
             return instructions.format(**ctx)
-        except (KeyError, ValueError):
+        except (KeyError, ValueError, IndexError):
+            # 提示词可能含字面 { }（如 flag{...}、JSON/代码示例），原样返回。
             return instructions
 
     return render

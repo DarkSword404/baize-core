@@ -1,45 +1,38 @@
-"""逆向工程智能体。
+"""reverse_engineering_agent — 白泽智能体模块。
 
-专注二进制分析与逆向：固件分析、反汇编、反编译、漏洞发现。
-指令为 Baize 独立编写的中文版本。
+Prompt: ``system_reverse_engineering_agent.md``
+Tools: ['generic_linux_command', 'execute_code', 'think']
 """
 
 from __future__ import annotations
 
+from baize.prompts_util import get_agent_instructions
 from baize.sdk.agent import Agent
-from baize.tools import reverse_engineering_tools
+from baize.tools import extended_tools
 
-REVERSE_ENGINEERING_INSTRUCTIONS = """\
-你是白泽（Baize）的逆向工程专家，专注二进制分析与固件安全。
+AGENT_KEY = "reverse_engineering_agent"
 
-## 核心能力
-- 固件分析与提取（Binwalk、firmware-mod-kit）
-- 二进制反汇编与反编译（Ghidra、Radare2、objdump）
-- 漏洞发现（缓冲区溢出、格式化字符串、整数溢出）
-- 加密算法逆向与密钥提取
-- 恶意软件逆向分析
+# ── 提示词 ─────────────────────────────────────────────────────────
+_instructions = get_agent_instructions(AGENT_KEY)
 
-## 工作方法
-1. 识别文件类型与架构
-2. 静态分析（字符串、导入表、交叉引用）
-3. 反汇编/反编译关键函数
-4. 动态分析（如果需要）
-5. 漏洞定位与 PoC
+# ── 从提示词提取 display name ────────────────────────────────────
+_display_name = "Reverse Engineering Agent"
+_display_desc = "逆向工程 — 二进制/固件/协议逆向，使用 Ghidra、IDA、Radare2 等工具进行静态与动态分析"
 
-## 常用工具
-- binwalk：固件分析
-- ghidra/radare2：反汇编反编译
-- strings/objdump/readelf：静态分析
-- gdb：动态调试
+# ── 工具筛选 ───────────────────────────────────────────────────────
+_TOOL_NAMES = {
+        "generic_linux_command",
+        "execute_code",
+        "think",
+}
+_all_tools = extended_tools()
+_tools = [t for t in _all_tools if t.name in _TOOL_NAMES]
 
-## 合规
-- 仅分析用户授权或有合法权利分析的二进制文件
-"""
-
-
+# ── Agent 实例 ─────────────────────────────────────────────────────
 reverse_engineering_agent = Agent(
-    name="reverse_engineering_agent",
-    description="逆向工程专家：固件分析、反汇编、反编译、漏洞发现。",
-    instructions=REVERSE_ENGINEERING_INSTRUCTIONS,
-    tools=reverse_engineering_tools(),
+    name=_display_name,
+    description=_display_desc,
+    instructions=_instructions,
+    model=None,
+    tools=_tools,
 )

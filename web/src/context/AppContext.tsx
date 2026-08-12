@@ -1,6 +1,7 @@
 import { createContext, useContext, useState, useEffect, useCallback, useRef, type ReactNode } from 'react';
 import type { ViewPage, Toast, ToolPermission, AgentMetadata, ChatMessage } from '../types';
-import type { SessionInfo } from '../api/client';
+import type { SessionInfo, ModuleInfo } from '../api/client';
+import { fetchModules } from '../api/client';
 
 // ============================================
 // 本地持久化工具
@@ -65,6 +66,9 @@ interface AppState {
   // API Key
   apiKey: string;
   setApiKey: (k: string) => void;
+
+  // 已安装模块（由 GET /api/v1/modules 返回）
+  installedModules: Record<string, ModuleInfo>;
 }
 
 const AppContext = createContext<AppState | null>(null);
@@ -161,6 +165,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
   useEffect(() => { persistState('baize-api-key', apiKey); }, [apiKey]);
   const setApiKey = useCallback((k: string) => { setApiKeyState(k); }, []);
 
+  // ─ 已安装模块 ─────────────────────────────────
+  const [installedModules, setInstalledModules] = useState<Record<string, ModuleInfo>>({});
+
+  useEffect(() => {
+    fetchModules()
+      .then(r => setInstalledModules(r.modules))
+      .catch(() => { /* 服务器未就绪时静默 */ });
+  }, []);
+
   return (
     <AppContext.Provider
       value={{
@@ -176,6 +189,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         updateSession,
         toolPermissions, setToolPermission, setToolPermissions,
         apiKey, setApiKey,
+        installedModules,
       }}
     >
       {children}

@@ -170,7 +170,7 @@ export function Dashboard(): JSX.Element {
                 <div key={a.name} className="px-3 py-2.5 rounded-xl bg-gray-800/50 border border-gray-800 hover:border-gray-700 transition-all">
                   <div className="text-sm font-medium truncate">{a.name}</div>
                   <div className="text-[11px] text-gray-600 mt-0.5 line-clamp-2">{a.description || '无描述'}</div>
-                  {a.tools.length > 0 && (
+                  {a.tools && a.tools.length > 0 && (
                     <div className="text-[10px] text-gray-500 mt-1.5">{a.tools.slice(0, 3).map(t => t.name).join(', ')}{a.tools.length > 3 ? ` +${a.tools.length - 3}` : ''}</div>
                   )}
                 </div>

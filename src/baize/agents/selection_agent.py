@@ -1,46 +1,50 @@
-"""选择智能体。
+"""selection_agent — 白泽路由/元智能体模块。
 
-默认入口：根据用户请求路由到最合适的专家智能体。
-指令为 Baize 独立编写的中文版本。
+Prompt: ``system_selection_agent.md``
+Tools: ['check_available_agents', 'analyze_task_requirements', 'list_available_specialists', 'transfer_to_specialist']
 """
 
 from __future__ import annotations
 
-from baize.sdk.agent import Agent
-from baize.tools import selection_tools
+from baize.prompts_util import get_agent_instructions
+from baize.sdk.agent import Agent, AgentTool
+from baize.agents.agent_discovery import AGENT_DISCOVERY_TOOLS
+from baize.agents.operational_handoffs import OPERATIONAL_HANDOFF_TOOLS
 
-SELECTION_INSTRUCTIONS = """\
-你是白泽（Baize）的选择智能体，负责将用户请求路由到最合适的专家智能体。
+AGENT_KEY = "selection_agent"
 
-## 可用智能体
-- ctf_agent：CTF 解题
-- web_pentester_agent：Web 渗透
-- redteam_agent：红队攻击
-- blueteam_agent：蓝队防御
-- dfir_agent：数字取证
-- recon_agent：侦察
-- network_analysis_agent：网络分析
-- reverse_engineering_agent：逆向
-- wifi_security_agent：Wi-Fi 安全
-- compliance_agent：合规
-- reporting_agent：报告
-- retester_agent：复测
+# ── 提示词 ─────────────────────────────────────────────────────────
+_instructions = get_agent_instructions(AGENT_KEY)
 
-## 工作方法
-1. 分析用户请求意图
-2. 匹配最合适的专家智能体
-3. 说明选择理由
-4. 引导用户使用正确智能体
+# ── 从提示词提取 display name ────────────────────────────────────
+_lines = _instructions.split("\n", 2)
+_display_name = _lines[0].lstrip("# ").strip() if _lines else "selection_agent"
+_display_desc = "路由选择智能体 — 默认编排器，根据用户输入特征自动选择最适合的下游智能体"
 
-## 准则
-- 不要猜测，明确推荐
-- 多领域请求建议编排智能体
-"""
+# ── 工具构建 ───────────────────────────────────────────────────────
+def _build_tools() -> list[AgentTool]:
+    import inspect
+    tools: list[AgentTool] = []
 
+    for item in OPERATIONAL_HANDOFF_TOOLS + AGENT_DISCOVERY_TOOLS:
+        name = item.get("name", "")
+        description = item.get("description", "")
+        handler = item.get("func", item.get("handler"))
+        params = item.get("parameters", {})
+        tools.append(AgentTool(
+            name=name, description=description,
+            parameters=params, handler=handler,
+        ))
 
+    return tools
+
+_tools = _build_tools()
+
+# ── Agent 实例 ─────────────────────────────────────────────────────
 selection_agent = Agent(
-    name="selection_agent",
-    description="选择智能体：将请求路由到最合适的专家智能体。",
-    instructions=SELECTION_INSTRUCTIONS,
-    tools=selection_tools(),
+    name=_display_name,
+    description=_display_desc,
+    instructions=_instructions,
+    model=None,
+    tools=_tools,
 )

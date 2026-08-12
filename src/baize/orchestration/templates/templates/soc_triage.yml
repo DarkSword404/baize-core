@@ -1,0 +1,66 @@
+# SOC 告警研判 & 自动封禁流水线
+# 
+# 适用场景：SOC 系统推送告警 → AI 研判威胁等级 → 自动/人工封禁
+#
+# 自动化模式：SOC 直接 POST 到 webhook，全程无人参与
+# 手动模式：用户在 Web UI 中手动触发，每步可见可干预
+
+id: soc_triage
+name: "SOC 告警研判 & 自动封禁"
+description: "接收 SOC 告警，AI 研判威胁等级后自动封禁或通知人工确认"
+category: 安全运营
+tags: [SOC, 告警, 封禁, SIEM]
+
+trigger:
+  type: webhook
+  path: /api/v1/pipelines/soc_triage/run
+
+steps:
+  - id: triage
+    type: agent
+    agent: triage
+    prompt: |
+      你是一名安全运营中心分析师。分析以下告警：
+
+      告警信息：
+      - 告警 ID：{{ context.alert_id }}
+      - 来源 IP：{{ context.src_ip }}
+      - 目标资产：{{ context.target }}
+      - 告警类型：{{ context.alert_type }}
+      - 严重级别：{{ context.severity }}
+
+      返回 JSON：{"threat_score": 0.0-1.0, "reasoning": "判断依据"}
+
+  - id: decision
+    type: condition
+    branches:
+      - when: "{{ steps.triage.data.threat_score > 0.8 }}"
+        goto: auto_block
+      - when: "{{ steps.triage.data.threat_score > 0.4 }}"
+        goto: human_confirm
+      - default: true
+        goto: done
+
+  - id: auto_block
+    type: agent
+    agent: response
+    prompt: |
+      高危告警自动处置：
+      - 封禁 IP：{{ context.src_ip }}
+      - 原因：{{ steps.triage.data.reasoning }}
+      请执行封禁操作并返回结果。
+
+  - id: human_confirm
+    type: human
+    prompt: |
+      ⚠️ 威胁评分 {{ steps.triage.data.threat_score }}。
+      来源 IP：{{ context.src_ip }}
+      原因：{{ steps.triage.data.reasoning }}
+      请选择：确认封禁 (approve) 或 忽略 (reject)
+    choices: [approve, reject]
+    branches:
+      approve: auto_block
+      reject: done
+
+  - id: done
+    type: end

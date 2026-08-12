@@ -2,6 +2,8 @@
 
 用户可在 Web 界面创建自定义智能体（自定义指令/工具）和自定义
 编排管道（多智能体流程）。数据持久化到 ``~/.baize/custom/``。
+
+同时还维护内置资源的黑名单，支持用户删除内置智能体和模板。
 """
 
 from __future__ import annotations
@@ -33,6 +35,7 @@ class CustomAgentStore:
         self._load()
 
     def _load(self) -> None:
+        self._agents = {}
         for f in self._dir.glob("*.json"):
             try:
                 data = json.loads(f.read_text(encoding="utf-8"))
@@ -47,7 +50,9 @@ class CustomAgentStore:
         tmp.replace(f)
 
     def list(self) -> list[dict[str, Any]]:
-        return sorted(self._agents.values(), key=lambda a: a["created_at"])
+        with self._lock:
+            self._load()
+            return sorted(self._agents.values(), key=lambda a: a["created_at"])
 
     def create(self, data: dict[str, Any]) -> dict[str, Any]:
         now = _now()
@@ -90,6 +95,15 @@ class CustomAgentStore:
                 f.unlink()
             return True
 
+    def find_by_name(self, name: str) -> dict[str, Any] | None:
+        """按名称查找自定义智能体（用于会话中解析智能体）。"""
+        with self._lock:
+            self._load()
+            for a in self._agents.values():
+                if a.get("name") == name:
+                    return a
+        return None
+
 
 class CustomPipelineStore:
     """自定义管道存储。"""
@@ -120,11 +134,14 @@ class CustomPipelineStore:
 
     def create(self, data: dict[str, Any]) -> dict[str, Any]:
         now = _now()
+        # 支持 nodes/edges (图结构) 也保留 steps 向后兼容
         pipeline = {
             "id": secrets.token_hex(10),
             "name": data.get("name", ""),
             "description": data.get("description", ""),
-            "steps": data.get("steps", []),
+            "steps": data.get("steps", data.get("nodes", [])),
+            "nodes": data.get("nodes", data.get("steps", [])),
+            "edges": data.get("edges", []),
             "created_at": now,
             "updated_at": now,
             "is_custom": True,
@@ -139,9 +156,14 @@ class CustomPipelineStore:
             pipeline = self._pipelines.get(pipeline_id)
             if pipeline is None:
                 return None
-            for key in ("name", "description", "steps"):
+            for key in ("name", "description", "steps", "nodes", "edges"):
                 if key in data:
                     pipeline[key] = data[key]
+            # 同步 nodes ← steps 或 steps ← nodes
+            if "nodes" in data and "steps" not in data:
+                pipeline["steps"] = data["nodes"]
+            if "steps" in data and "nodes" not in data:
+                pipeline["nodes"] = data["steps"]
             pipeline["updated_at"] = _now()
             self._save(pipeline)
             return pipeline
@@ -155,3 +177,94 @@ class CustomPipelineStore:
             if f.exists():
                 f.unlink()
             return True
+
+
+# ---------------------------------------------------------------------------
+# 内置资源黑名单 — 支持用户删除内置智能体和模板
+# ---------------------------------------------------------------------------
+
+class DeletedResourcesStore:
+    """管理内置资源的"软删除"黑名单，数据持久化到 ~/.baize/custom/。
+
+    内置智能体和模板代码不可物理删除，但用户可通过 API 将其标记为已删除，
+    此后它们在 API 返回列表中不可见，也可以通过重置接口恢复所有。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._agents_file = CUSTOM_DIR / "deleted_agents.json"
+        self._templates_file = CUSTOM_DIR / "deleted_templates.json"
+        self._deleted_agents: set[str] = self._load(self._agents_file)
+        self._deleted_templates: set[str] = self._load(self._templates_file)
+
+    @staticmethod
+    def _load(filepath: Path) -> set[str]:
+        try:
+            if filepath.exists():
+                data = json.loads(filepath.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    return set(data)
+        except (json.JSONDecodeError, OSError):
+            pass
+        return set()
+
+    def _save(self, filepath: Path, data: set[str]) -> None:
+        CUSTOM_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = filepath.with_suffix(".tmp")
+        tmp.write_text(json.dumps(sorted(data), indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(filepath)
+
+    # ---- agents ----
+
+    def is_agent_deleted(self, name: str) -> bool:
+        with self._lock:
+            return name in self._deleted_agents
+
+    def delete_agent(self, name: str) -> bool:
+        with self._lock:
+            if name in self._deleted_agents:
+                return True  # 已删除，幂等
+            self._deleted_agents.add(name)
+            self._save(self._agents_file, self._deleted_agents)
+            return True
+
+    def reset_agents(self) -> int:
+        with self._lock:
+            count = len(self._deleted_agents)
+            self._deleted_agents.clear()
+            if self._agents_file.exists():
+                self._agents_file.unlink()
+            return count
+
+    # ---- templates ----
+
+    def is_template_deleted(self, tid: str) -> bool:
+        with self._lock:
+            return tid in self._deleted_templates
+
+    def delete_template(self, tid: str) -> bool:
+        with self._lock:
+            if tid in self._deleted_templates:
+                return True
+            self._deleted_templates.add(tid)
+            self._save(self._templates_file, self._deleted_templates)
+            return True
+
+    def reset_templates(self) -> int:
+        with self._lock:
+            count = len(self._deleted_templates)
+            self._deleted_templates.clear()
+            if self._templates_file.exists():
+                self._templates_file.unlink()
+            return count
+
+
+# 全局单例
+_deleted_store: DeletedResourcesStore | None = None
+
+
+def get_deleted_store() -> DeletedResourcesStore:
+    global _deleted_store
+    if _deleted_store is None:
+        _deleted_store = DeletedResourcesStore()
+    return _deleted_store
