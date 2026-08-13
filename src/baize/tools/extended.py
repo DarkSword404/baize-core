@@ -51,6 +51,103 @@ def _execute_code(code: str, timeout: int = 60) -> str:
         return f"(错误: {e})"
 
 
+def _resolve_host_ips(hostname: str) -> list[str]:
+    """将主机名解析为 IP 列表；对十进制/十六进制/八进制变体 IPv4 归一化。"""
+    import ipaddress
+    import re
+    import socket
+
+    host = (hostname or "").strip().strip("[]")
+    if not host:
+        return []
+    # 1) 本身就是合法 IP（含 IPv6）
+    try:
+        ipaddress.ip_address(host)
+        return [host]
+    except ValueError:
+        pass
+    # 2) 变体 IPv4：纯数字（十进制 / 十六进制，如 2130706433、0x7f000001）
+    if re.fullmatch(r"(?:0[xX][0-9a-fA-F]+|\d+)", host):
+        try:
+            val = int(host, 0)
+            if 0 <= val <= 0xFFFFFFFF:
+                return [str(ipaddress.IPv4Address(val))]
+        except ValueError:
+            pass
+    # 3) 点分变体（如 0177.0.0.1、0x7f.0.0.1、0x7f.1）
+    parts = host.split(".")
+    if 1 < len(parts) <= 4:
+        try:
+            numeric = []
+            for part in parts:
+                if part.startswith(("0x", "0X")):
+                    numeric.append(int(part, 16))
+                elif len(part) > 1 and part.startswith("0"):
+                    numeric.append(int(part, 8))
+                else:
+                    numeric.append(int(part, 10))
+            if all(0 <= n <= 255 for n in numeric):
+                rebuilt = ".".join(str(n) for n in numeric)
+                try:
+                    ipaddress.IPv4Address(rebuilt)
+                    return [rebuilt]
+                except ValueError:
+                    pass
+        except ValueError:
+            pass
+    # 4) 域名：DNS 解析全部 A/AAAA 记录
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return []
+    seen: list[str] = []
+    for info in infos:
+        ip = info[4][0]
+        if ip not in seen:
+            seen.append(ip)
+    return seen
+
+
+def _is_blocked_ip(ip: str) -> bool:
+    """IP 是否属于应阻止访问的内部/保留地址。"""
+    import ipaddress
+
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+    )
+
+
+def _check_url_allowed(url: str, allow_internal: bool) -> None:
+    """校验 URL 目标是否允许访问；不允许时抛出 ValueError。
+
+    注意：域名解析后再校验，可阻止常规 SSRF；DNS rebinding 需
+    自定义 transport 做连接时校验，属后续增强项。
+    """
+    from urllib.parse import urlparse
+
+    if allow_internal:
+        return
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("无效 URL（缺少主机名）")
+    ips = _resolve_host_ips(host)
+    if not ips:
+        raise ValueError("无法解析主机名")
+    for ip in ips:
+        if _is_blocked_ip(ip):
+            raise ValueError("出于安全考虑，禁止访问内部/保留地址")
+
+
 def _http_request(
     url: str,
     method: str = "GET",
@@ -58,19 +155,26 @@ def _http_request(
     body: str | None = None,
     timeout: int = 30,
 ) -> str:
-    """发起 HTTP 请求（带 SSRF 防护）。"""
+    """发起 HTTP 请求（带 SSRF 防护：目标 IP 校验 + 手动重定向校验）。"""
     try:
         allow_internal = os.getenv("BAIZE_FETCH_ALLOW_INTERNAL", "").lower() in ("1", "true")
-        if not allow_internal:
-            from urllib.parse import urlparse
-
-            host = urlparse(url).hostname or ""
-            if host in ("localhost", "127.0.0.1", "::1") or host.startswith("127.") or host.startswith("10.") or host.startswith("192.168.") or host.startswith("169.254."):
-                return "(已阻止：出于安全考虑，禁止访问内部/保留地址)"
-        resp = httpx.request(
-            method.upper(), url, headers=headers or {}, content=body,
-            timeout=timeout, follow_redirects=True,
-        )
+        method_u = method.upper()
+        with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+            current = url
+            resp = None
+            for _ in range(6):
+                _check_url_allowed(current, allow_internal)
+                resp = client.request(method_u, current, headers=headers or {}, content=body)
+                # 手动跟随重定向：每次跳转都重新校验目标，防止重定向到内网
+                if resp.status_code in (301, 302, 303, 307, 308):
+                    location = resp.headers.get("location")
+                    if not location:
+                        break
+                    current = str(httpx.URL(current).join(location))
+                    continue
+                break
+            else:
+                return "(重定向次数过多，已中止)"
         return f"HTTP {resp.status_code}\n{resp.text[:5000]}"
     except Exception as e:  # noqa: BLE001
         return f"(请求失败: {e})"

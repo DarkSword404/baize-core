@@ -1,8 +1,8 @@
 [project]
 name = "baize-core"
-version = "1.2.0"
+version = "1.3.0"
 description = "Baize (白泽) core — single-agent AI cybersecurity chat framework"
-readme = "README.md"
+readme = { file = "README.md", content-type = "text/markdown" }
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
@@ -45,24 +45,14 @@ packages = [
   "src/baize",
   "src/baize.agents",
   "src/baize.api",
+  "src/baize.experiences",
+  "src/baize.receivers",
   "src/baize.sdk",
   "src/baize.tools",
   "src/baize.util",
-  "src/baize.orchestration",
-  "src/baize.orchestration.nodes",
-  "src/baize.orchestration.templates",
-  "src/baize.receivers",
-  "src/baize.prompts",
-  "src/baize.prompts.core",
-  "src/baize.prompts.micro",
 ]
 
 [tool.hatch.build.targets.sdist]
 include = [
   "src/baize",
-  "web",
-  "docs",
-  "*.md",
-  "*.sh",
-  "LICENSE",
 ]

@@ -18,6 +18,12 @@ import type {
   InterruptResponse,
   AuthLoginRequest,
   AuthLoginResponse,
+  ExperiencesResponse,
+  ExperienceItem,
+  RefineResponse,
+  EmbeddingConfigData,
+  GuardrailConfig,
+  GuardrailTestResult,
 } from '../types';
 
 export type SessionInfo = SessionSummary;
@@ -35,38 +41,22 @@ export function getApiBase(): string {
   return apiBase;
 }
 
-// ===== Auth via URL parameter (OpenClaw-style) =====
-// Access the app like: http://localhost:5173/?token=<your-api-key>
+// ===== Auth =====
+// 登录凭证只允许保存在本地（localStorage），不再支持 URL 参数传递，
+// 避免 token 泄露到浏览器历史 / 代理日志 / Referer。
 let _authToken: string | null = null;
-const SESSION_KEY = 'baize_url_token';
+const SESSION_KEY = 'baize_session_token';
 
-/** Extract token from URL query param and persist it in sessionStorage.
- *  SessionStorage survives Vite HMR reloads & page refreshes within the same tab. */
-export function initAuthFromUrl(): void {
-  const params = new URLSearchParams(window.location.search);
-  const tokenFromUrl = params.get('token') || params.get('api_key') || null;
-  if (tokenFromUrl) {
-    _authToken = tokenFromUrl;
-    sessionStorage.setItem(SESSION_KEY, tokenFromUrl);
-    // Clean the URL visually without a full page reload
-    const url = new URL(window.location.href);
-    url.searchParams.delete('token');
-    url.searchParams.delete('api_key');
-    window.history.replaceState({}, '', url.toString());
-  } else {
-    // Recover token that survived an HMR module reload (sessionStorage persists)
-    const saved = sessionStorage.getItem(SESSION_KEY);
-    if (saved) {
-      _authToken = saved;
-    }
-  }
+/** 全局 401 事件：token 失效/过期时通知 UI 回到登录页 */
+export const UNAUTHORIZED_EVENT = 'baize:unauthorized';
+
+function notifyUnauthorized(): void {
+  window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT));
 }
 
-/** Return the current auth token (URL param → sessionStorage → login session). */
+/** Return the current auth token. */
 export function getAuthToken(): string | null {
-  return _authToken
-    || sessionStorage.getItem(SESSION_KEY)
-    || localStorage.getItem('baize_session_token');
+  return _authToken || localStorage.getItem(SESSION_KEY);
 }
 
 function getToken(): string | null {
@@ -92,9 +82,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     try { detail = JSON.parse(body).detail || detail; } catch {}
     // 401：token 无效或过期，清除本地 token，触发重新登录
     if (res.status === 401) {
-      sessionStorage.removeItem(SESSION_KEY);
-      localStorage.removeItem('baize_session_token');
+      localStorage.removeItem(SESSION_KEY);
       _authToken = null;
+      notifyUnauthorized();
     }
     throw new Error(`[${res.status}] ${detail}`);
   }
@@ -243,6 +233,10 @@ export interface SingleModelConfig {
   api_key: string;
   model: string;
   context_max_turns?: number;
+  context_window?: number | null;
+  max_context_tokens?: number | null;
+  max_message_chars?: number | null;
+  enable_context_summary?: boolean;
   configured: boolean;
 }
 
@@ -255,6 +249,10 @@ export async function updateModelConfig(data: {
   api_key: string;
   model: string;
   context_max_turns?: number;
+  context_window?: number | null;
+  max_context_tokens?: number | null;
+  max_message_chars?: number | null;
+  enable_context_summary?: boolean;
 }): Promise<SingleModelConfig> {
   return request('/model-config', { method: 'PUT', body: JSON.stringify(data) });
 }
@@ -300,6 +298,13 @@ export async function sendMessage(id: string, data: InferenceRequest): Promise<I
   return request(`/sessions/${id}/messages`, { method: 'POST', body: JSON.stringify(data) });
 }
 
+export interface ExperienceSignal {
+  type: 'experience_signal';
+  reasons: string[];
+  session_id: string;
+  agent: string;
+}
+
 export function streamMessage(
   id: string,
   data: InferenceRequest,
@@ -308,6 +313,7 @@ export function streamMessage(
   onError: (err: Error) => void,
   onPrompt?: (prompt: PromptRequest) => void,
   onStep?: (step: ReasoningStep) => void,
+  onExperienceSignal?: (signal: ExperienceSignal) => void,
 ): AbortController {
   const controller = new AbortController();
 
@@ -369,6 +375,12 @@ export function streamMessage(
               // data.type is the step kind: tool_call | tool_output | handoff | agent_switched | message
               if (currentEvent === 'reasoning_step' && onStep) {
                 onStep(parsed as ReasoningStep);
+                currentEvent = '';
+                continue;
+              }
+              // 长期记忆：检测到可提炼经验信号
+              if (currentEvent === 'experience_signal' && onExperienceSignal) {
+                onExperienceSignal(parsed as ExperienceSignal);
                 currentEvent = '';
                 continue;
               }
@@ -513,8 +525,7 @@ export async function login(data: AuthLoginRequest): Promise<AuthLoginResponse> 
 }
 
 export function logout() {
-  localStorage.removeItem('baize_session_token');
-  sessionStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(SESSION_KEY);
   _authToken = null;
 }
 
@@ -883,4 +894,93 @@ export async function updateReceiver(id: string, data: Record<string, any>): Pro
 }
 export async function deleteReceiver(id: string): Promise<{ status: string }> {
   return request(`/receivers/${id}`, { method: 'DELETE' });
+}
+
+// ===== 安全护栏管理 =====
+/** 获取护栏配置（总开关 + 规则列表），改动即时生效 */
+export async function getGuardrails(): Promise<GuardrailConfig> {
+  return request('/guardrails');
+}
+
+/** 保存护栏配置（后端会校验正则合法性，错误返回 400 + detail） */
+export async function updateGuardrails(config: GuardrailConfig): Promise<GuardrailConfig> {
+  return request('/guardrails', { method: 'PUT', body: JSON.stringify(config) });
+}
+
+/** 测试一段文本命中哪些护栏规则 */
+export async function testGuardrail(text: string, kind: 'input' | 'output'): Promise<GuardrailTestResult> {
+  return request('/guardrails/test', { method: 'POST', body: JSON.stringify({ text, kind }) });
+}
+
+/** 恢复护栏默认配置 */
+export async function resetGuardrails(): Promise<GuardrailConfig> {
+  return request('/guardrails/reset', { method: 'POST' });
+}
+
+// ===== 长期记忆：经验库 =====
+export interface ExperienceInput {
+  title: string;
+  content: string;
+  scope: string;
+  tags?: string[];
+  source_session_id?: string;
+  source_agent?: string;
+  enabled?: boolean;
+  importance?: number;
+}
+
+export async function listExperiences(params?: {
+  scope?: string;
+  agent?: string;
+  include_disabled?: boolean;
+}): Promise<ExperiencesResponse> {
+  const qs = new URLSearchParams();
+  if (params?.scope) qs.set('scope', params.scope);
+  if (params?.agent) qs.set('agent', params.agent);
+  if (params?.include_disabled !== undefined) qs.set('include_disabled', String(params.include_disabled));
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return request(`/experiences${query}`);
+}
+
+export async function getExperience(id: string): Promise<{ experience: ExperienceItem }> {
+  return request(`/experiences/${id}`);
+}
+
+export async function createExperience(data: ExperienceInput): Promise<{ experience: ExperienceItem }> {
+  return request('/experiences', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function updateExperience(id: string, data: Partial<ExperienceInput>): Promise<{ experience: ExperienceItem }> {
+  return request(`/experiences/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+export async function deleteExperience(id: string): Promise<{ ok: boolean }> {
+  return request(`/experiences/${id}`, { method: 'DELETE' });
+}
+
+/** 对会话做 LLM 复盘提炼，返回候选条目（不入库，用户确认后调用 createExperience） */
+export async function refineSessionExperience(sessionId: string, data: {
+  session_id: string;
+  agent: string;
+  scope?: string;
+}): Promise<RefineResponse> {
+  return request(`/sessions/${sessionId}/experience/refine`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+/** 获取 embedding 配置 */
+export async function getEmbeddingConfig(): Promise<{ config: EmbeddingConfigData }> {
+  return request('/experiences/embedding-config');
+}
+
+/** 保存 embedding 配置 */
+export async function saveEmbeddingConfig(data: EmbeddingConfigData): Promise<{ ok: boolean; config: EmbeddingConfigData }> {
+  return request('/experiences/embedding-config', { method: 'PUT', body: JSON.stringify(data) });
+}
+
+/** 为经验条目批量补齐向量索引 */
+export async function reindexExperiences(): Promise<{ ok: boolean; indexed: number; total: number }> {
+  return request('/experiences/reindex', { method: 'POST' });
 }

@@ -13,6 +13,7 @@ import io
 import json
 import re
 import secrets
+import shutil
 import tarfile
 import zipfile
 from dataclasses import dataclass, field
@@ -159,12 +160,20 @@ class AttachmentStore:
         if not is_allowed(filename):
             raise ValueError(f"不支持的文件类型: {filename}")
 
+        # 路径穿越防护：仅保留文件名（basename），拒绝目录成分
+        safe_name = Path(filename.replace("\\", "/")).name.strip()
+        if not safe_name or safe_name in (".", ".."):
+            raise ValueError(f"非法文件名: {filename}")
+
         file_id = secrets.token_hex(8)
         fdir = self._file_dir(session_id, file_id)
         fdir.mkdir(parents=True, exist_ok=True)
 
-        # 原始文件
-        orig = fdir / "original" / filename
+        # 原始文件（_safe_join 双重保险，确保写入路径在沙箱目录内）
+        orig_dir = fdir / "original"
+        orig = _safe_join(orig_dir, safe_name)
+        if orig is None:
+            raise ValueError(f"非法文件名: {filename}")
         orig.parent.mkdir(parents=True, exist_ok=True)
         orig.write_bytes(data)
 
@@ -311,7 +320,7 @@ class AttachmentStore:
                             continue
                         safe_path.parent.mkdir(parents=True, exist_ok=True)
                         with zf.open(info) as src, open(safe_path, "wb") as dst:
-                            dst.write(src.read())
+                            shutil.copyfileobj(src, dst, 1 << 16)
                         entries.append({"name": info.filename, "size": info.file_size})
             elif name.endswith((".tar.gz", ".tar.bz2", ".tgz", ".tar")):
                 mode = "r:gz" if name.endswith((".tar.gz", ".tgz")) else (
@@ -332,7 +341,7 @@ class AttachmentStore:
                             continue
                         safe_path.parent.mkdir(parents=True, exist_ok=True)
                         with tf.extractfile(member) as src, open(safe_path, "wb") as dst:
-                            dst.write(src.read())
+                            shutil.copyfileobj(src, dst, 1 << 16)
                         entries.append({"name": member.name, "size": member.size})
             else:
                 return {"ok": False, "error": "不支持的压缩格式", "entries": []}

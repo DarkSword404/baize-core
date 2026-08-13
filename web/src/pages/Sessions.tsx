@@ -26,6 +26,9 @@ export function Sessions(): JSX.Element {
   }
 
   async function handleDelete(id: string) {
+    if (!window.confirm('确定删除该会话？\n将同时删除该会话的附件、解压文件与附件索引。\n（若本次对话产生的经验已沉淀到经验库则不受影响）')) {
+      return;
+    }
     try {
       await deleteSession(id);
       removeSession(id);

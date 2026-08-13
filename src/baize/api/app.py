@@ -34,11 +34,30 @@ from baize.api.custom_agents import CustomAgentStore, CustomPipelineStore, get_d
 from baize.api.receivers import router as receivers_router
 from baize.api.sessions import SessionManager
 from baize.agents import list_agents, list_tools, get_agent
+from baize.agents.guardrails import (
+    GuardrailConfig,
+    GuardrailRule,
+    GuardrailSettings,
+    GuardrailStore,
+    check_input_guardrail,
+    test_guardrail,
+    validate_guardrail_config,
+)
 from baize.config import ModelConfigStore, SingleModelConfig, get_server_config
 from baize.multimodal import build_user_message
 from baize.receivers.manager import ReceiverManager
 from baize.receivers.webhook import handle_webhook
-from baize.sdk.client import ModelNotConfiguredError
+from baize.sdk.client import LLMClient, ModelNotConfiguredError
+from baize.experiences import (
+    GLOBAL_SCOPE,
+    EmbeddingConfig,
+    EmbeddingConfigStore,
+    ExperienceRetriever,
+    ExperienceStore,
+    detect_turn_signals,
+    refine_experience,
+    resolve_embedding,
+)
 
 
 # ----------------------------------------------------------------------
@@ -54,6 +73,10 @@ class ModelConfigRequest(BaseModel):
     api_key: str = ""
     model: str
     context_max_turns: int = 0
+    context_window: Optional[int] = None
+    max_context_tokens: Optional[int] = None
+    max_message_chars: Optional[int] = None
+    enable_context_summary: bool = False
 
 
 class ModelConfigResponse(BaseModel):
@@ -61,6 +84,10 @@ class ModelConfigResponse(BaseModel):
     api_key: str
     model: str
     context_max_turns: int = 0
+    context_window: Optional[int] = None
+    max_context_tokens: Optional[int] = None
+    max_message_chars: Optional[int] = None
+    enable_context_summary: bool = False
     configured: bool
 
 
@@ -76,6 +103,40 @@ class MessageRequest(BaseModel):
     agent: Optional[str] = None
     # 本次消息附带的附件 file_id 列表（已上传到会话的附件）
     attachments: list[str] = Field(default_factory=list)
+
+
+class ExperienceRequest(BaseModel):
+    title: str
+    content: str
+    scope: str = GLOBAL_SCOPE  # "global" | "agent:{agent_key}"
+    tags: list[str] = Field(default_factory=list)
+    source_session_id: str = ""
+    source_agent: str = ""
+    enabled: bool = True
+    importance: int = 0
+
+
+class ExperienceUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    content: Optional[str] = None
+    scope: Optional[str] = None
+    tags: Optional[list[str]] = None
+    enabled: Optional[bool] = None
+    importance: Optional[int] = None
+
+
+class RefineRequest(BaseModel):
+    session_id: str
+    agent: str
+    scope: str = "auto"  # "global" | "agent:{key}" | "auto"
+
+
+class EmbeddingConfigRequest(BaseModel):
+    provider: str = "none"  # none | openai | local
+    base_url: str = ""
+    api_key: str = ""
+    model: str = ""
+    dimensions: int = 0
 
 
 class AuthResponse(BaseModel):
@@ -100,6 +161,33 @@ class ToolsResponse(BaseModel):
     tools: list[dict]
 
 
+class GuardrailSettingsRequest(BaseModel):
+    input_enabled: bool = True
+    output_enabled: bool = False
+    max_input_length: int = 16384
+
+
+class GuardrailRuleRequest(BaseModel):
+    id: str
+    name: str
+    category: str = "input_injection"
+    description: str = ""
+    severity: str = "medium"
+    kind: str = "regex"
+    pattern: str = ""
+    enabled: bool = True
+
+
+class GuardrailConfigRequest(BaseModel):
+    settings: GuardrailSettingsRequest = Field(default_factory=GuardrailSettingsRequest)
+    rules: list[GuardrailRuleRequest] = Field(default_factory=list)
+
+
+class GuardrailTestRequest(BaseModel):
+    text: str
+    kind: str = "input"
+
+
 # ----------------------------------------------------------------------
 # 认证依赖
 # ----------------------------------------------------------------------
@@ -107,10 +195,8 @@ def _require_api_key(request: Request) -> None:
     auth_manager: AuthManager = request.app.state.auth_manager
     if not request.app.state.require_auth:
         return
+    # 仅接受请求头携带的 Token；不支持 URL 参数（避免泄露到浏览器历史/日志）
     key = request.headers.get("X-Baize-API-Key") or request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not key:
-        # 支持 URL 参数 token
-        key = request.query_params.get("token", "")
     if not auth_manager.validate_token(key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -129,10 +215,12 @@ def create_baize_api_app(
     app = FastAPI(title="Baize API", version=__version__)
 
     # CORS（允许前端开发服务器）
+    # 注意：前端使用 X-Baize-API-Key 请求头认证（非 Cookie），
+    # 因此 allow_credentials 必须为 False —— "*" + credentials=True 在浏览器规范下无效。
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
@@ -146,6 +234,13 @@ def create_baize_api_app(
     app.state.attachment_store = AttachmentStore()
     app.state.require_auth = cfg.require_auth
     app.state.loaded_modules: dict[str, dict] = {}  # 已加载模块注册表
+    # 长期记忆：经验库 + 可插拔 embedding Provider + 检索器
+    app.state.experience_store = ExperienceStore()
+    app.state.embedding_config_store = EmbeddingConfigStore()
+    app.state.embedding = resolve_embedding()
+    app.state.experience_retriever = ExperienceRetriever(
+        app.state.experience_store, app.state.embedding
+    )
 
     # ------------------------------------------------------------------
     # 启动凭证输出
@@ -214,6 +309,10 @@ def create_baize_api_app(
             api_key=m.api_key,
             model=m.model,
             context_max_turns=int(m.context_max_turns or 0),
+            context_window=m.context_window,
+            max_context_tokens=m.max_context_tokens,
+            max_message_chars=m.max_message_chars,
+            enable_context_summary=bool(m.enable_context_summary),
             configured=True,
         )
 
@@ -230,12 +329,24 @@ def create_baize_api_app(
         context_max_turns = int(payload.context_max_turns or 0)
         if context_max_turns < 0:
             raise HTTPException(status_code=400, detail="context_max_turns 不能为负数")
+        # 负数值一律按未配置（None）处理；0 表示"不限制"
+        for name, value in (
+            ("context_window", payload.context_window),
+            ("max_context_tokens", payload.max_context_tokens),
+            ("max_message_chars", payload.max_message_chars),
+        ):
+            if value is not None and value < 0:
+                raise HTTPException(status_code=400, detail=f"{name} 不能为负数")
         m = app.state.model_config.save(
             SingleModelConfig(
                 base_url=base_url,
                 api_key=payload.api_key.strip(),
                 model=model,
                 context_max_turns=context_max_turns,
+                context_window=payload.context_window,
+                max_context_tokens=payload.max_context_tokens,
+                max_message_chars=payload.max_message_chars,
+                enable_context_summary=bool(payload.enable_context_summary),
             )
         )
         return ModelConfigResponse(
@@ -243,6 +354,10 @@ def create_baize_api_app(
             api_key=m.api_key,
             model=m.model,
             context_max_turns=int(m.context_max_turns or 0),
+            context_window=m.context_window,
+            max_context_tokens=m.max_context_tokens,
+            max_message_chars=m.max_message_chars,
+            enable_context_summary=bool(m.enable_context_summary),
             configured=True,
         )
 
@@ -469,7 +584,11 @@ def create_baize_api_app(
         ok = app.state.session_manager.delete_session(session_id)
         if not ok:
             raise HTTPException(status_code=404, detail="会话不存在")
-        return {"ok": True}
+        # 修复：删除会话时同步清理该会话的附件、解压文件与索引
+        app.state.attachment_store.delete_session(session_id)
+        # 统计该会话衍生的经验条目数（经验是长期资产，不随会话删除，仅供前端提示）
+        derived = app.state.experience_store.get_by_source_session(session_id)
+        return {"ok": True, "derived_experiences": len(derived)}
 
     @app.post(
         "/api/v1/sessions/{session_id}/reset",
@@ -629,6 +748,20 @@ def create_baize_api_app(
             session_id=session_id,
         )
 
+        # ── 长期记忆：检索相关历史经验并注入 agent 上下文 ──
+        experience_block = ""
+        exp_agent_key = getattr(agent, "name", None) or agent_name or "default"
+        try:
+            retrieved = await app.state.experience_retriever.search(
+                payload.input, exp_agent_key, top_k=3
+            )
+            if retrieved:
+                experience_block = app.state.experience_retriever.build_block(retrieved)
+                for item in retrieved:
+                    app.state.experience_store.increment_hit(item.id)
+        except Exception:  # noqa: BLE001
+            logger.warning("经验检索失败", exc_info=True)
+
         async def event_source():
             sm = app.state.session_manager
             # 本轮累积缓冲：思考过程、工具调用/结果记录、最终文本
@@ -637,6 +770,13 @@ def create_baize_api_app(
             final_text = ""
             # 是否已把本轮内容持久化（正常完成 / 中断都只保存一次）
             saved = False
+
+            # ── 输入安全护栏（运行时规则即时生效） ──
+            ok, guard_message = check_input_guardrail(payload.input)
+            if not ok:
+                logger.warning("输入被安全护栏拦截: %s", guard_message)
+                yield f"data: {json.dumps({'type': 'error', 'error': f'安全护栏拦截: {guard_message}'})}\n\n"
+                return
 
             # 流式开始前先持久化 user 提问，确保提问不因中断而丢失
             user_extra = {}
@@ -669,12 +809,13 @@ def create_baize_api_app(
                 saved = True
 
             try:
-                # 流式对话（传入历史上下文 + 多模态 user 消息 + 附件工具）
+                # 流式对话（传入历史上下文 + 多模态 user 消息 + 附件工具 + 历史经验）
                 async for event in agent.run_stream(
                     payload.input,
                     prior_history=prior_history,
                     extra_tools=extra_tools,
                     user_chat_message=user_chat_message,
+                    experience_block=experience_block,
                 ):
                     if await request.is_disconnected():
                         # 前端断开（切换页面/刷新）：保留已产生内容
@@ -717,11 +858,29 @@ def create_baize_api_app(
                         # 正常完成：保存完整内容
                         final_text = event.content or final_text
                         _flush_to_session()
+                        # 长期记忆：纯规则信号检测（不调 LLM），命中则提示前端可提炼经验
+                        try:
+                            prior_turns_text = " ".join(
+                                f"{m.get('role')}: {m.get('content', '')}"
+                                for m in history_messages
+                            )
+                            signals = detect_turn_signals(
+                                tool_events, final_text, prior_turns_text, payload.input
+                            )
+                            if signals["should_refine"]:
+                                yield (
+                                    "event: experience_signal\n"
+                                    f"data: {json.dumps({'type': 'experience_signal', 'reasons': signals['reasons'], 'session_id': session_id, 'agent': exp_agent_key})}\n\n"
+                                )
+                        except Exception:  # noqa: BLE001
+                            logger.warning("经验信号检测失败", exc_info=True)
                         yield f"data: {json.dumps({'type': 'done', 'content': event.content})}\n\n"
             except ModelNotConfiguredError as e:
                 yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
             except Exception as e:  # noqa: BLE001
-                yield f"data: {json.dumps({'type': 'error', 'error': f'服务器错误: {e}'})}\n\n"
+                # 不向客户端回显内部异常细节，仅记录到服务端日志
+                logger.exception("对话请求处理失败: %s", e)
+                yield f"data: {json.dumps({'type': 'error', 'error': '服务器内部错误，请查看服务端日志'})}\n\n"
             finally:
                 # 关键：无论正常完成、连接断开（GeneratorExit/CancelledError）、还是异常，
                 # 只要本轮产生了内容，就持久化，避免切换页面/刷新后对话丢失。
@@ -736,6 +895,269 @@ def create_baize_api_app(
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
+
+    # ------------------------------------------------------------------
+    # 安全护栏管理（运行时规则，JSON 持久化，改动即时生效）
+    # ------------------------------------------------------------------
+    @app.get(
+        "/api/v1/guardrails",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def get_guardrails() -> dict:
+        store = GuardrailStore.get()
+        return store.load().to_dict()
+
+    @app.put(
+        "/api/v1/guardrails",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def update_guardrails(payload: GuardrailConfigRequest) -> dict:
+        cfg = GuardrailConfig(
+            settings=GuardrailSettings(
+                input_enabled=payload.settings.input_enabled,
+                output_enabled=payload.settings.output_enabled,
+                max_input_length=payload.settings.max_input_length,
+            ),
+            rules=[GuardrailRule(**r.model_dump()) for r in payload.rules],
+        )
+        errors = validate_guardrail_config(cfg)
+        if errors:
+            raise HTTPException(status_code=400, detail="；".join(errors))
+        saved = GuardrailStore.get().save(cfg)
+        return saved.to_dict()
+
+    @app.post(
+        "/api/v1/guardrails/test",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def test_guardrail_endpoint(payload: GuardrailTestRequest) -> dict:
+        text = payload.text or ""
+        kind = payload.kind if payload.kind in ("input", "output") else "input"
+        blocked, message, rule_id = test_guardrail(text, kind)
+        return {"blocked": blocked, "message": message, "rule_id": rule_id}
+
+    @app.post(
+        "/api/v1/guardrails/reset",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def reset_guardrails() -> dict:
+        store = GuardrailStore.get()
+        return store.reset().to_dict()
+
+    # ------------------------------------------------------------------
+    # 长期记忆：经验库管理（CRUD + 提炼 + embedding 配置）
+    # ------------------------------------------------------------------
+    @app.get(
+        "/api/v1/experiences",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def experiences_list(
+        scope: Optional[str] = None,
+        agent: Optional[str] = None,
+        include_disabled: bool = True,
+    ) -> dict:
+        items = app.state.experience_store.list_items(
+            scope=scope, agent_key=agent, include_disabled=include_disabled
+        )
+        return {"experiences": [i.to_dict() for i in items]}
+
+    @app.get(
+        "/api/v1/experiences/embedding-config",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def embedding_config_get() -> dict:
+        cfg = app.state.embedding_config_store.load()
+        data = {
+            "provider": cfg.provider,
+            "base_url": cfg.base_url,
+            "api_key": cfg.api_key or "",
+            "model": cfg.model,
+            "dimensions": cfg.dimensions,
+        }
+        return {"config": data}
+
+    @app.put(
+        "/api/v1/experiences/embedding-config",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def embedding_config_put(payload: EmbeddingConfigRequest) -> dict:
+        cfg = EmbeddingConfig(
+            provider=payload.provider,
+            base_url=payload.base_url.strip(),
+            api_key=payload.api_key.strip(),
+            model=payload.model.strip(),
+            dimensions=payload.dimensions,
+        )
+        if cfg.provider not in ("none", "openai", "local"):
+            raise HTTPException(status_code=400, detail="provider 必须是 none/openai/local")
+        app.state.embedding_config_store.save(cfg)
+        # 重建 Provider 与检索器，下次检索立即生效
+        app.state.embedding = resolve_embedding(cfg)
+        app.state.experience_retriever = ExperienceRetriever(
+            app.state.experience_store, app.state.embedding
+        )
+        return {"ok": True, "config": {
+            "provider": cfg.provider,
+            "base_url": cfg.base_url,
+            "api_key": cfg.api_key or "",
+            "model": cfg.model,
+            "dimensions": cfg.dimensions,
+        }}
+
+    @app.post(
+        "/api/v1/experiences/reindex",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def experiences_reindex() -> dict:
+        """为缺失/过期向量的经验条目批量补齐 embedding（配置向量 Provider 后调用）。"""
+        embedding = app.state.embedding
+        if not embedding.is_available():
+            raise HTTPException(
+                status_code=400,
+                detail="未配置可用的向量 Provider，请先在设置中配置 embedding（openai/local）",
+            )
+        model = embedding.model_name
+        store = app.state.experience_store
+        missing = store.items_missing_embedding(model)
+        if not missing:
+            return {"ok": True, "indexed": 0, "total": 0}
+        texts = [f"{i.title}\n{i.content}\n{' '.join(i.tags)}" for i in missing]
+        try:
+            vectors = await embedding.embed(texts)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400,
+                detail=f"向量生成失败：{type(exc).__name__}: {exc}",
+            ) from exc
+        for item, vec in zip(missing, vectors):
+            if vec:
+                store.set_embedding(item.id, vec, model)
+        return {"ok": True, "indexed": len(missing), "total": len(missing)}
+
+    @app.get(
+        "/api/v1/experiences/{experience_id}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def experiences_get(experience_id: str) -> dict:
+        item = app.state.experience_store.get_item(experience_id)
+        if item is None:
+            raise HTTPException(status_code=404, detail="经验不存在")
+        return {"experience": item.to_dict()}
+
+    @app.post(
+        "/api/v1/experiences",
+        response_model=dict,
+        status_code=201,
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def experiences_create(payload: ExperienceRequest) -> dict:
+        item = app.state.experience_store.create(payload.model_dump())
+        # 配置了向量 Provider 时自动生成 embedding，避免依赖手动 reindex
+        embedding = app.state.embedding
+        if embedding.is_available():
+            try:
+                text = f"{item.title}\n{item.content}\n{' '.join(item.tags)}"
+                vecs = await embedding.embed([text])
+                if vecs and vecs[0]:
+                    app.state.experience_store.set_embedding(
+                        item.id, vecs[0], embedding.model_name
+                    )
+                    refreshed = app.state.experience_store.get_item(item.id)
+                    if refreshed is not None:
+                        item = refreshed
+            except Exception:  # noqa: BLE001
+                logger.warning("经验向量自动生成失败", exc_info=True)
+        return {"experience": item.to_dict()}
+
+    @app.put(
+        "/api/v1/experiences/{experience_id}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def experiences_update(experience_id: str, payload: ExperienceUpdateRequest) -> dict:
+        item = app.state.experience_store.update(
+            experience_id, payload.model_dump(exclude_none=True)
+        )
+        if item is None:
+            raise HTTPException(status_code=404, detail="经验不存在")
+        return {"experience": item.to_dict()}
+
+    @app.delete(
+        "/api/v1/experiences/{experience_id}",
+        dependencies=[Depends(_require_api_key)],
+    )
+    def experiences_delete(experience_id: str) -> dict:
+        ok = app.state.experience_store.delete(experience_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="经验不存在")
+        return {"ok": True}
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/experience/refine",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def session_experience_refine(
+        session_id: str, payload: RefineRequest
+    ) -> dict:
+        """对整段会话（或最近几轮）做 LLM 复盘提炼，返回候选条目（不入库）。"""
+        session = app.state.session_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        messages = app.state.session_manager.get_messages(session_id)
+        agent_key = payload.agent or getattr(session, "agent", "") or "default"
+
+        # 收集最近几轮：user / assistant 正文 + 工具调用/结果
+        user_msgs = [m for m in messages if m.get("role") == "user" and not m.get("type")]
+        if not user_msgs:
+            raise HTTPException(status_code=400, detail="会话没有可提炼的对话")
+        last_user = user_msgs[-1]
+        last_user_text = str(last_user.get("content", ""))
+        tool_events: list[dict] = []
+        final_text = ""
+        # 最近一轮的 assistant 结论与工具轨迹
+        for m in messages[-40:]:
+            extra = m.get("extra") or {}
+            if m.get("role") == "intermediate" and extra.get("type") == "function_call":
+                tool_events.append(
+                    {
+                        "type": "function_call",
+                        "name": extra.get("name", ""),
+                        "arguments": extra.get("arguments", ""),
+                    }
+                )
+            elif m.get("role") == "intermediate" and extra.get("type") == "function_call_output":
+                tool_events.append(
+                    {
+                        "type": "function_call_output",
+                        "name": extra.get("name", ""),
+                        "output": extra.get("output", ""),
+                    }
+                )
+            elif m.get("role") == "assistant" and m.get("content"):
+                final_text = str(m.get("content", ""))
+
+        client = LLMClient()
+        candidate = await refine_experience(
+            client,
+            agent_key=agent_key,
+            session_id=session_id,
+            user_message=last_user_text,
+            final_text=final_text,
+            tool_events=tool_events,
+            prior_history=messages,
+            scope=payload.scope,
+        )
+        return {"candidate": candidate, "session_id": session_id, "agent": agent_key}
 
     # ------------------------------------------------------------------
     # 模型列表（单模型模式：返回当前配置的模型）
@@ -864,25 +1286,42 @@ def create_baize_api_app(
 
 
 def _print_credentials(app: FastAPI, cfg) -> None:
-    """在启动时向终端输出登录凭证。"""
+    """在启动时向终端输出登录凭证。
+
+    - 仅在生成了新凭证（首次启动或 BAIZE_AUTH_RESET_ON_BOOT=1）时打印；
+    - 不再生成带 token 的登录 URL（token 不应进入 URL）；
+    - 可通过 BAIZE_PRINT_CREDENTIALS=0 关闭输出。
+    """
     if not app.state.require_auth:
+        return
+    if os.getenv("BAIZE_PRINT_CREDENTIALS", "1").lower() in ("0", "false", "no"):
         return
     auth: AuthManager = app.state.auth_manager
     username = auth.default_username
-    password = auth.default_password or ""
-    token = auth.default_token or ""
-    login_url = f"{cfg.frontend_url}/?token={token}"
     separator = "=" * 44
-    lines = [
-        f"\n{separator}",
-        "  白泽 (Baize) 登录凭证（本次启动自动生成）",
-        f"  用户名:   {username}",
-        f"  密码:     {password}",
-        f"  Token:    {token}",
-        f"  登录 URL: {login_url}",
-        "  (密码与 Token 每次重启自动重新生成)",
-        f"{separator}\n",
-    ]
+    if auth.default_password and auth.default_token:
+        lines = [
+            f"\n{separator}",
+            "  白泽 (Baize) 登录凭证（首次启动自动生成，请妥善保存）",
+            f"  用户名:   {username}",
+            f"  密码:     {auth.default_password}",
+            f"  Token:    {auth.default_token}",
+            f"  前端地址: {cfg.frontend_url or 'http://<host>:<port>/'}",
+            "  使用方式: 登录页输入用户名/密码，或请求头携带 X-Baize-API-Key",
+            "  (Token 请勿放入 URL，避免泄露到浏览器历史/日志)",
+            f"{separator}\n",
+        ]
+    else:
+        from baize.config import AUTH_DB_FILE
+
+        lines = [
+            f"\n{separator}",
+            "  白泽 (Baize) 登录凭证沿用首次启动时生成的密码/Token。",
+            f"  用户名:   {username}",
+            f"  如需重置，删除认证文件 {AUTH_DB_FILE} 后重启，",
+            "  或设置环境变量 BAIZE_AUTH_RESET_ON_BOOT=1。",
+            f"{separator}\n",
+        ]
     sys.stdout.write("\n".join(lines))
     sys.stdout.flush()
 

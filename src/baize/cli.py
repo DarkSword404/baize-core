@@ -12,13 +12,14 @@ def main() -> None:
     """启动 Baize 后端服务。"""
     import uvicorn
 
-    host = "0.0.0.0"
-    port = 8001
+    from baize.config import get_server_config
+
+    cfg = get_server_config()
     uvicorn.run(
         "baize.api.app:create_baize_api_app",
         factory=True,
-        host=host,
-        port=port,
+        host=cfg.host,
+        port=cfg.port,
     )
 
 

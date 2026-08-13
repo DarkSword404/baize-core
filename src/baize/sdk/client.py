@@ -6,12 +6,26 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Optional
 
 from openai import AsyncOpenAI
 
 from baize.config import ModelConfigStore, SingleModelConfig
+
+
+def estimate_tokens(text: str) -> int:
+    """粗略估算文本 token 数（用于预算裁剪，无需精确）。
+
+    中文按 1 字符 ≈ 1 token，其他字符按 4 字符 ≈ 1 token。
+    估算结果偏保守（偏大），保证不会低估上下文。
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
+    other = len(text) - cjk
+    return cjk + math.ceil(other / 4)
 
 
 class ModelNotConfiguredError(RuntimeError):

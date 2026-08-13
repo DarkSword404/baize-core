@@ -173,11 +173,13 @@ function ThinkingBlock({ item, timestamp, isLast }: { item: IntermediateData; ti
 }
 
 function renderMarkdown(text: string): string {
-  // Escape HTML
+  // Escape HTML（含引号，防止属性逃逸注入 XSS）
   let html = text
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;');
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 
   // Code blocks: ```...```
   html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) => {
@@ -191,8 +193,14 @@ function renderMarkdown(text: string): string {
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
   html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
 
-  // Links
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+  // Links（协议白名单：仅 http/https/mailto；javascript:/data:/相对路径一律降级为纯文本）
+  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label, url) => {
+    const target = url.trim();
+    if (/^(https?:|mailto:)/i.test(target)) {
+      return `<a href="${target}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    }
+    return label;
+  });
 
   // Line breaks
   html = html.replace(/\n/g, '<br/>');

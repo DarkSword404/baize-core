@@ -16,6 +16,17 @@ from typing import Optional
 DEFAULT_BAIZE_DIR = Path.home() / ".baize"
 MODEL_CONFIG_FILE = DEFAULT_BAIZE_DIR / "model.json"
 AUTH_DB_FILE = DEFAULT_BAIZE_DIR / "api_auth.json"
+GUARDRAILS_FILE = DEFAULT_BAIZE_DIR / "guardrails.json"
+
+
+def _opt_int(value) -> int | None:
+    """将可空整数配置归一化：None/空串 -> None，其余转 int。"""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -24,12 +35,30 @@ class SingleModelConfig:
 
     ``context_max_turns``: 上下文滑动窗口轮数（0 表示不限制、保留全部历史）。
     每"一轮"指一条 user + assistant 的完整问答。
+
+    ``context_window``: 模型上下文窗口总大小（token）。配置后用于自动推导
+    token 预算（窗口 × 90%，预留输出空间），无需手动填写 ``max_context_tokens``。
+
+    ``max_context_tokens``: 上下文 token 预算上限（None 使用内置默认
+    256000 或按 ``context_window`` 推导，0 表示不限制）。超出预算时按
+    摘要压缩 → 骨架压缩 → 最旧轮次丢弃的顺序处理，防止上下文超限报错
+    （如 429 token-limit / insufficient_quota）。
+
+    ``max_message_chars``: 单条消息最大字符数（None 使用内置默认 80000，
+    0 表示不限制）。超长内容（如工具输出）自动截断保留头尾。
+
+    ``enable_context_summary``: 超预算时是否用 LLM 把最旧的一批轮次
+    压缩为语义摘要（比机械截断更保信息，但会多消耗一次模型调用）。
     """
 
     base_url: str = ""
     api_key: str = ""
     model: str = ""
     context_max_turns: int = 0
+    context_window: int | None = None
+    max_context_tokens: int | None = None
+    max_message_chars: int | None = None
+    enable_context_summary: bool = False
 
     @property
     def is_configured(self) -> bool:
@@ -52,6 +81,10 @@ class ModelConfigStore:
                 api_key=str(data.get("api_key", "")),
                 model=str(data.get("model", "")),
                 context_max_turns=int(data.get("context_max_turns", 0) or 0),
+                context_window=_opt_int(data.get("context_window")),
+                max_context_tokens=_opt_int(data.get("max_context_tokens")),
+                max_message_chars=_opt_int(data.get("max_message_chars")),
+                enable_context_summary=bool(data.get("enable_context_summary", False)),
             )
             return cfg if cfg.is_configured else None
         except (json.JSONDecodeError, OSError):

@@ -12,7 +12,7 @@ export function Login({ onLogin }: Props) {
   const [loading, setLoading] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
 
-  // 检查是否已经登录（例如有 URL token 或之前登录过）
+  // 检查是否已经登录（本地已保存会话 token）
   const alreadyAuth = !!getAuthToken();
 
   async function handleSubmit(e: FormEvent) {

@@ -2,14 +2,41 @@
 Webhook Receiver — 基于 FastAPI 的 HTTP 数据接收端点
 """
 
+import hmac
 import logging
-import time
+import os
 from typing import Optional
-from fastapi import Request, Response
+from fastapi import HTTPException, Request, Response
 from .manager import ReceiverManager
 from .store import ReceiverStore
 
 logger = logging.getLogger("baize.receivers.webhook")
+
+# 允许进入 metadata 的非敏感请求头（避免 Authorization/Cookie 等泄露）
+_SAFE_HEADERS = {
+    "content-type",
+    "content-length",
+    "user-agent",
+    "host",
+    "x-forwarded-for",
+    "x-real-ip",
+    "x-baize-webhook-key",
+}
+
+
+def _validate_webhook_key(request: Request) -> None:
+    """若配置了 BAIZE_WEBHOOK_API_KEY，则要求请求携带匹配密钥。
+
+    未配置时保持匿名访问，向后兼容外部系统（SIEM 等）推送。
+    """
+    expected = os.getenv("BAIZE_WEBHOOK_API_KEY", "")
+    if not expected:
+        return
+    supplied = request.headers.get("X-Baize-Webhook-Key") or request.query_params.get(
+        "key", ""
+    )
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(status_code=401, detail="无效的 Webhook 密钥")
 
 
 async def handle_webhook(request: Request, path: str) -> Response:
@@ -17,6 +44,7 @@ async def handle_webhook(request: Request, path: str) -> Response:
     通用 Webhook 处理器
     路由 /api/v1/hook/{path} → 查找匹配 path 的 webhook 接收器
     """
+    _validate_webhook_key(request)
     store = ReceiverStore.get_instance()
     manager = ReceiverManager.get()
 
@@ -40,11 +68,13 @@ async def handle_webhook(request: Request, path: str) -> Response:
     content_type = request.headers.get("content-type", "application/octet-stream")
     raw = await request.body()
 
-    # 元数据
+    # 元数据（仅保留白名单请求头，避免敏感头进入下游）
     source = request.client.host if request.client else "unknown"
     metadata = {
         "method": request.method,
-        "headers": dict(request.headers),
+        "headers": {
+            k: v for k, v in request.headers.items() if k.lower() in _SAFE_HEADERS
+        },
         "query_params": dict(request.query_params),
         "path": path,
     }

@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useApp } from '../context/AppContext';
-import { listSessions, getSession, deleteSession, streamMessage, cancelSession, listAgents, respondToPrompt, uploadAttachment, deleteAttachment } from '../api/client';
-import type { PromptRequest, ReasoningStep, AttachmentInfo } from '../api/client';
+import { listSessions, getSession, deleteSession, streamMessage, cancelSession, listAgents, respondToPrompt, uploadAttachment, deleteAttachment, refineSessionExperience, createExperience } from '../api/client';
+import type { PromptRequest, ReasoningStep, AttachmentInfo, ExperienceSignal } from '../api/client';
 import { ChatMessage } from '../components/ChatMessage';
 import { CreateSessionModal } from '../components/CreateSessionModal';
 import type { ChatMessage as ChatMessageType, IntermediateData } from '../types';
@@ -162,6 +162,12 @@ export function Chat(): JSX.Element {
   const [promptValue, setPromptValue] = useState('');
   const promptInputRef = useRef<HTMLInputElement>(null);
 
+  // 长期记忆：经验提炼
+  const [experienceSignal, setExperienceSignal] = useState<ExperienceSignal | null>(null);
+  const [refining, setRefining] = useState(false);
+  const [refineError, setRefineError] = useState('');
+  const [refineDraft, setRefineDraft] = useState<{ sessionId: string; title: string; content: string; tags: string; scope: string } | null>(null);
+
   // Reasoning timeline panel
   const [reasoningPanelOpen, setReasoningPanelOpen] = useState(false);
 
@@ -246,12 +252,63 @@ export function Chat(): JSX.Element {
 
   async function handleDeleteSession(id: string, e: React.MouseEvent) {
     e.stopPropagation();
+    const confirmed = window.confirm(
+      '删除会话将同时清理该会话上传的附件与解压文件（不可恢复），且不保留该会话提炼的经验。确定删除？'
+    );
+    if (!confirmed) return;
     try {
       await deleteSession(id);
       removeSession(id);
       addToast({ type: 'info', title: '会话已删除' });
     } catch (err: any) {
       addToast({ type: 'error', title: '删除失败', message: err.message });
+    }
+  }
+
+  /** 长期记忆：用户手动提炼经验（或确认 SSE 信号卡片） */
+  async function handleRefineExperience(scope: string = 'auto') {
+    if (!activeSessionId) return;
+    // 后端 SSE 流不产生 agent_switched/handoff 事件，currentAgent 恒为 null，
+    // 需用会话自身的 agent 兜底，否则按钮点击会静默失效。
+    const agent = currentAgent || activeSession?.agent || 'default';
+    setRefining(true);
+    setRefineError('');
+    try {
+      const r = await refineSessionExperience(activeSessionId, {
+        session_id: activeSessionId,
+        agent,
+        scope,
+      });
+      setRefineDraft({
+        sessionId: activeSessionId,
+        title: r.candidate.title,
+        content: r.candidate.content,
+        tags: (r.candidate.tags || []).join(', '),
+        scope: r.candidate.scope || 'auto',
+      });
+    } catch (err: any) {
+      setRefineError(err.message || '提炼失败，请检查模型配置');
+    } finally {
+      setRefining(false);
+    }
+  }
+
+  /** 确认提炼结果并入库 */
+  async function handleSaveRefined() {
+    if (!refineDraft) return;
+    try {
+      await createExperience({
+        title: refineDraft.title,
+        content: refineDraft.content,
+        scope: refineDraft.scope,
+        tags: refineDraft.tags.split(',').map(t => t.trim()).filter(Boolean),
+        source_session_id: refineDraft.sessionId,
+      });
+      setRefineDraft(null);
+      setExperienceSignal(null);
+      addToast({ type: 'success', title: '经验已入库', message: '可在「经验库」页面管理与查看' });
+    } catch (err: any) {
+      addToast({ type: 'error', title: '保存失败', message: err.message });
     }
   }
 
@@ -394,6 +451,10 @@ export function Chat(): JSX.Element {
             } : m
           ));
         }
+      },
+      (signal: ExperienceSignal) => {
+        setExperienceSignal(signal);
+        addToast({ type: 'info', title: '检测到可提炼经验', message: signal.reasons.join('；') });
       }
     );
   }
@@ -554,7 +615,8 @@ export function Chat(): JSX.Element {
     console.log('[Chat] Submitting prompt:', pendingPrompt.prompt_id, 'value:', response);
     setPendingPrompt(null);
     setPromptValue('');
-    const rejected = pendingPrompt.options.includes('Cancel') && !response;
+    // 用户留空提交视为拒绝（不再依赖选项里是否含 Cancel）
+    const rejected = !response;
     try {
       await respondToPrompt(activeSessionId, pendingPrompt.prompt_id, response, rejected);
     } catch (err: any) {
@@ -765,6 +827,44 @@ export function Chat(): JSX.Element {
                 ))}
               </div>
             )}
+            {/* 长期记忆：手动提炼入口 */}
+            {!isStreaming && activeSession && (
+              <button
+                onClick={() => handleRefineExperience('auto')}
+                disabled={refining}
+                className="max-w-3xl mx-auto w-full mb-3 px-4 py-2.5 text-xs bg-gray-900/60 border border-dashed border-gray-700 hover:border-blue-600/40 hover:bg-blue-600/5 text-gray-500 hover:text-blue-400 rounded-xl transition-colors disabled:opacity-50"
+              >
+                {refining ? '⏳ 正在提炼本次会话经验...' : '✨ 提炼本会话经验（沉淀为可复用经验）'}
+              </button>
+            )}
+            {/* 长期记忆：自动检测到可提炼经验 */}
+            {experienceSignal && !refineDraft && !refining && (
+              <div className="max-w-3xl mx-auto mb-3 rounded-xl border border-blue-600/30 bg-blue-600/5 p-4">
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-blue-400">🧠</span>
+                  <span className="text-sm font-medium text-blue-300">检测到可沉淀的经验</span>
+                </div>
+                <ul className="text-xs text-gray-400 space-y-1 mb-3">
+                  {experienceSignal.reasons.map((r, i) => (
+                    <li key={i}>· {r}</li>
+                  ))}
+                </ul>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => handleRefineExperience('auto')}
+                    className="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors"
+                  >
+                    提炼为经验
+                  </button>
+                  <button
+                    onClick={() => setExperienceSignal(null)}
+                    className="px-3 py-1.5 text-xs text-gray-400 hover:text-gray-200 rounded-lg transition-colors"
+                  >
+                    忽略
+                  </button>
+                </div>
+              </div>
+            )}
             <div className="max-w-3xl mx-auto flex gap-3 items-end">
               {/* 附件上传按钮 */}
               <button
@@ -957,6 +1057,79 @@ export function Chat(): JSX.Element {
                 })()}
               </div>
             )}
+          </div>
+        </div>
+      )}
+
+      {/* 长期记忆：经验候选确认浮层 */}
+      {refineDraft && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center">
+          <div className="bg-gray-900 border border-gray-800 rounded-2xl w-full max-w-2xl mx-4 shadow-2xl shadow-black/40 overflow-hidden max-h-[85vh] flex flex-col">
+            <div className="px-6 py-4 border-b border-gray-800 flex items-center justify-between">
+              <h3 className="text-sm font-semibold text-gray-200">📝 经验候选（可编辑后保存）</h3>
+              <button onClick={() => setRefineDraft(null)} className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-400">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" d="M6 6l12 12M18 6L6 18" />
+                </svg>
+              </button>
+            </div>
+            <div className="px-6 py-4 overflow-y-auto space-y-4">
+              <div>
+                <label className="block text-xs text-gray-500 mb-1.5">标题</label>
+                <input
+                  type="text"
+                  value={refineDraft.title}
+                  onChange={e => setRefineDraft({ ...refineDraft, title: e.target.value })}
+                  className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 outline-none focus:border-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1.5">复盘内容</label>
+                <textarea
+                  value={refineDraft.content}
+                  onChange={e => setRefineDraft({ ...refineDraft, content: e.target.value })}
+                  rows={8}
+                  className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 outline-none focus:border-blue-500 resize-y"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1.5">标签（逗号分隔）</label>
+                <input
+                  type="text"
+                  value={refineDraft.tags}
+                  onChange={e => setRefineDraft({ ...refineDraft, tags: e.target.value })}
+                  className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 outline-none focus:border-blue-500"
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-gray-500 mb-1.5">作用域</label>
+                <select
+                  value={refineDraft.scope}
+                  onChange={e => setRefineDraft({ ...refineDraft, scope: e.target.value })}
+                  className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 outline-none focus:border-blue-500"
+                >
+                  <option value="global">全局经验（所有智能体可用）</option>
+                  <option value={`agent:${activeSession?.agent || currentAgent || 'default'}`}>
+                    智能体专属: {activeSession?.agent || currentAgent || 'default'}
+                  </option>
+                </select>
+              </div>
+              {refineError && <p className="text-xs text-red-400">{refineError}</p>}
+            </div>
+            <div className="px-6 py-3 border-t border-gray-800 flex justify-end gap-2">
+              <button
+                onClick={() => setRefineDraft(null)}
+                className="px-4 py-2 text-xs text-gray-400 hover:text-gray-200 rounded-lg"
+              >
+                放弃
+              </button>
+              <button
+                onClick={handleSaveRefined}
+                className="px-4 py-2 text-xs bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition-colors"
+              >
+                保存到经验库
+              </button>
+            </div>
           </div>
         </div>
       )}

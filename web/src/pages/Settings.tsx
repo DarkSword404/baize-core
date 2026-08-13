@@ -8,6 +8,13 @@ import {
 import type { ReceiverConfig as ReceiverConfigType } from '../api/client';
 import type { JSX } from 'react';
 
+/** 解析可空整数输入：空字符串 → null（使用内置默认），无效输入 → null */
+function parseNullableInt(v: string): number | null {
+  if (v === '' || v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 export function Settings(): JSX.Element {
   const { serverConnected, setServerConnected, serverVersion, setServerVersion, addToast } = useApp();
   const [apiUrl, setApiUrl] = useState(getApiBase());
@@ -19,6 +26,10 @@ export function Settings(): JSX.Element {
   const [apiKey, setApiKey] = useState('');
   const [modelName, setModelName] = useState('');
   const [contextMaxTurns, setContextMaxTurns] = useState<number>(0);
+  const [contextWindow, setContextWindow] = useState<string>('');
+  const [maxContextTokens, setMaxContextTokens] = useState<string>('');
+  const [maxMessageChars, setMaxMessageChars] = useState<string>('');
+  const [enableContextSummary, setEnableContextSummary] = useState(false);
   const [configLoading, setConfigLoading] = useState(true);
   const [configSaving, setConfigSaving] = useState(false);
   const [configured, setConfigured] = useState(false);
@@ -44,6 +55,10 @@ export function Settings(): JSX.Element {
           setApiKey(cfg.api_key);
           setModelName(cfg.model);
           setContextMaxTurns(cfg.context_max_turns ?? 0);
+          setContextWindow(cfg.context_window != null ? String(cfg.context_window) : '');
+          setMaxContextTokens(cfg.max_context_tokens != null ? String(cfg.max_context_tokens) : '');
+          setMaxMessageChars(cfg.max_message_chars != null ? String(cfg.max_message_chars) : '');
+          setEnableContextSummary(cfg.enable_context_summary ?? false);
           setConfigured(true);
         }
       })
@@ -73,9 +88,17 @@ export function Settings(): JSX.Element {
         api_key: apiKey,
         model: modelName,
         context_max_turns: contextMaxTurns,
+        context_window: parseNullableInt(contextWindow),
+        max_context_tokens: parseNullableInt(maxContextTokens),
+        max_message_chars: parseNullableInt(maxMessageChars),
+        enable_context_summary: enableContextSummary,
       });
       setConfigured(cfg.configured);
       setContextMaxTurns(cfg.context_max_turns ?? 0);
+      setContextWindow(cfg.context_window != null ? String(cfg.context_window) : '');
+      setMaxContextTokens(cfg.max_context_tokens != null ? String(cfg.max_context_tokens) : '');
+      setMaxMessageChars(cfg.max_message_chars != null ? String(cfg.max_message_chars) : '');
+      setEnableContextSummary(cfg.enable_context_summary ?? false);
       addToast({ type: 'success', title: '已保存', message: `模型已配置为 ${cfg.model}` });
     } catch (err: any) {
       addToast({ type: 'error', title: '保存失败', message: err.message });
@@ -93,6 +116,10 @@ export function Settings(): JSX.Element {
       setApiKey('');
       setModelName('');
       setContextMaxTurns(0);
+      setContextWindow('');
+      setMaxContextTokens('');
+      setMaxMessageChars('');
+      setEnableContextSummary(false);
       addToast({ type: 'info', title: '已清除', message: '模型配置已重置' });
     } catch (err: any) {
       addToast({ type: 'error', title: '清除失败', message: err.message });
@@ -276,6 +303,75 @@ export function Settings(): JSX.Element {
                 保留最近 N 轮 user/assistant 对话作为上下文，超出部分被裁剪以节省 token。
                 填 0 表示不限制、保留全部历史（每轮含工具调用消息）。为节省 token 建议设为 8–20。
               </p>
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">
+                模型上下文窗口（token，可选）
+              </label>
+              <input
+                type="number"
+                min={0}
+                value={contextWindow}
+                onChange={e => setContextWindow(e.target.value)}
+                placeholder="留空则按内置默认 256000"
+                className={`${inputCls} font-mono`}
+              />
+              <p className="text-[10px] text-gray-600 mt-1">
+                如 131072（DeepSeek 128K）、262144（豆包 256K）、1048576（Qwen-long 1M）。
+                填写后 token 预算自动 = 窗口 × 90%（预留输出空间），无需再手动填预算。
+              </p>
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">
+                上下文 Token 预算上限（可选）
+              </label>
+              <input
+                type="number"
+                min={0}
+                value={maxContextTokens}
+                onChange={e => setMaxContextTokens(e.target.value)}
+                placeholder="256000（内置默认）"
+                className={`${inputCls} font-mono`}
+              />
+              <p className="text-[10px] text-gray-600 mt-1">
+                超出预算时依次：语义摘要（若开启）→ 压缩旧轮次 → 丢弃最旧轮次，防止 429 token-limit。
+                适用于大型分析（如单个流量包 20 万+ token）。填 0 表示不限制。
+              </p>
+            </div>
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">
+                单条消息最大字符数（可选）
+              </label>
+              <input
+                type="number"
+                min={0}
+                value={maxMessageChars}
+                onChange={e => setMaxMessageChars(e.target.value)}
+                placeholder="80000（内置默认）"
+                className={`${inputCls} font-mono`}
+              />
+              <p className="text-[10px] text-gray-600 mt-1">
+                超长内容（如大流量包解析结果）自动截断保留头尾。填 0 表示不限制。
+              </p>
+            </div>
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">
+                  超限时用 LLM 语义摘要压缩旧轮次
+                </label>
+                <p className="text-[10px] text-gray-600">
+                  比机械截断更保信息，但会额外消耗一次模型调用。默认关闭。
+                </p>
+              </div>
+              <button
+                onClick={() => setEnableContextSummary(v => !v)}
+                className={`shrink-0 w-11 h-6 rounded-full transition-colors ${enableContextSummary ? 'bg-blue-600' : 'bg-gray-700'}`}
+                title={enableContextSummary ? '已开启' : '已关闭'}
+              >
+                <span
+                  className={`block w-4 h-4 rounded-full bg-white transition-transform ${enableContextSummary ? 'translate-x-6' : 'translate-x-1'}`}
+                />
+              </button>
             </div>
 
             {configured && (

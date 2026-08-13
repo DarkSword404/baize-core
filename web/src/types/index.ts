@@ -189,4 +189,77 @@ export interface Toast {
   message?: string;
 }
 
-export type ViewPage = 'dashboard' | 'chat' | 'agents' | 'sessions' | 'settings' | 'orchestration';
+export type ViewPage = 'dashboard' | 'chat' | 'agents' | 'sessions' | 'guardrails' | 'settings' | 'orchestration' | 'experiences';
+
+// ===== 长期记忆：经验条目 =====
+export interface ExperienceItem {
+  id: string;
+  scope: string;          // "global" | "agent:{agent_key}"
+  title: string;
+  content: string;        // 复盘总结文本
+  tags: string[];
+  source_session_id: string;
+  source_agent: string;
+  created_at: string;
+  updated_at: string;
+  enabled: boolean;
+  importance: number;     // 0-5
+  hit_count: number;
+  embedding?: number[] | null;
+  embedding_model?: string;
+}
+
+export interface ExperiencesResponse {
+  experiences: ExperienceItem[];
+}
+
+export interface RefineCandidate {
+  title: string;
+  content: string;
+  tags: string[];
+  scope: string;
+  _raw?: string;
+}
+
+export interface RefineResponse {
+  candidate: RefineCandidate;
+  session_id: string;
+  agent: string;
+}
+
+export interface EmbeddingConfigData {
+  provider: 'none' | 'openai' | 'local';
+  base_url: string;
+  api_key: string;
+  model: string;
+  dimensions: number;
+}
+
+// ===== 安全护栏 =====
+export interface GuardrailSettings {
+  input_enabled: boolean;
+  output_enabled: boolean;
+  max_input_length: number;
+}
+
+export interface GuardrailRule {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  severity: string; // low | medium | high
+  kind: string;     // regex
+  pattern: string;
+  enabled: boolean;
+}
+
+export interface GuardrailConfig {
+  settings: GuardrailSettings;
+  rules: GuardrailRule[];
+}
+
+export interface GuardrailTestResult {
+  blocked: boolean;
+  message: string;
+  rule_id: string | null;
+}
