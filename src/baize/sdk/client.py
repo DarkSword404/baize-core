@@ -181,11 +181,14 @@ class LLMClient:
             reasoning = getattr(delta, "reasoning_content", None) or ""
             tool_calls = delta.tool_calls if delta else None
             usage = getattr(chunk, "usage", None)
+            # 注意：content / reasoning / tool_calls 可能出现在同一个 chunk 中
+            # （推理模型常见），必须用独立 if 逐个处理，否则工具调用增量会被
+            # content 分支吞掉，导致模型想继续调用工具时增量丢失、智能体提前结束。
             if content:
                 yield CompletionResult(content=content)
-            elif reasoning:
+            if reasoning:
                 # 实时思考增量：透传给前端展示，不作为最终回复
                 yield CompletionResult(content="", reasoning=reasoning)
-            elif tool_calls:
+            if tool_calls:
                 # 流式工具调用增量
                 yield CompletionResult(content="", tool_calls_delta=tool_calls)

@@ -75,7 +75,7 @@ export function Dashboard(): JSX.Element {
       {/* Header */}
       <div className="flex items-center justify-between mb-8">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">白泽控制台</h1>
+          <h1 className="text-2xl font-bold tracking-tight">白泽·智脑控制台</h1>
           <p className="text-sm text-gray-500 mt-1">AI 驱动的安全渗透测试平台</p>
         </div>
         <button

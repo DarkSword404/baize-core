@@ -1,4 +1,4 @@
-"""red_team_agent — 白泽智能体模块。
+"""red_team_agent — 白泽·智脑智能体模块。
 
 Prompt: ``system_red_team_agent.md``
 Tools: ['generic_linux_command', 'execute_code', 'port_scan', 'shodan_search', 'make_web_search_with_explanation', 'think']

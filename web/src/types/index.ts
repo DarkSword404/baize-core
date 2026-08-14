@@ -1,4 +1,4 @@
-/*/* ===== 白泽(Baize) API TypeScript Types ===== */
+/*/* ===== 白泽·智脑(Baize) API TypeScript Types ===== */
 
 export interface HealthResponse {
   status: string;

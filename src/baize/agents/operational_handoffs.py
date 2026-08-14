@@ -1,5 +1,5 @@
 """
-白泽操作路由系统 — 供 Selection Agent 智能体间调度使用
+白泽·智脑操作路由系统 — 供 Selection Agent 智能体间调度使用
 
 提供 ``build_operational_handoffs`` 函数，为每个专项智能体生成专用路由，
 通过 ``/agent <number>`` 命令实现智能体间的控制转移。

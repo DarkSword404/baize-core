@@ -1,4 +1,4 @@
-"""use_cases — 白泽智能体模块。
+"""use_cases — 白泽·智脑智能体模块。
 
 Prompt: ``system_use_cases.md``
 Tools: ['think']

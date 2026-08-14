@@ -98,7 +98,22 @@ class ExperienceStore:
     def _scope_path(self, scope: str) -> Path:
         return self._base_dir / scope_file_name(scope)
 
+    @staticmethod
+    def _canonical_scope(scope: str) -> str:
+        """将 scope 规范化为唯一形式：agent:xxx 的 xxx 部分按文件名规范（下划线）。
+
+        同一 agent 可能以不同写法传入（如 'agent:Web Application Pentester' 与
+        'agent:Web_Application_Pentester'），若直接作为缓存 key 会导致同一文件
+        被两份缓存维护：写入后列表读到旧缓存，出现"创建成功但库中不增加"。
+        """
+        if scope == GLOBAL_SCOPE:
+            return GLOBAL_SCOPE
+        if scope.startswith(AGENT_PREFIX):
+            return f"{AGENT_PREFIX}{_sanitize(scope[len(AGENT_PREFIX):])}"
+        return scope
+
     def _load_scope(self, scope: str) -> list[ExperienceItem]:
+        scope = self._canonical_scope(scope)
         path = self._scope_path(scope)
         if scope not in self._loaded:
             items: list[ExperienceItem] = []
@@ -114,6 +129,7 @@ class ExperienceStore:
         return self._cache.get(scope, [])
 
     def _save_scope(self, scope: str) -> None:
+        scope = self._canonical_scope(scope)
         path = self._scope_path(scope)
         payload = [i.to_dict() for i in self._cache.get(scope, [])]
         tmp = path.with_suffix(".json.tmp")

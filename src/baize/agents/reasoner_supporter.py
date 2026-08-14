@@ -1,4 +1,4 @@
-"""reasoner_supporter — 白泽智能体模块。
+"""reasoner_supporter — 白泽·智脑智能体模块。
 
 Prompt: ``system_reasoner_supporter.md``
 Tools: ['think']

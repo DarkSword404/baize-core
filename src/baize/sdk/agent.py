@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import inspect
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Optional, Protocol
 
@@ -76,9 +77,18 @@ class AgentTool:
             args = json.loads(arguments) if arguments else {}
         except json.JSONDecodeError:
             args = {}
-        result = self.handler(**args)
-        if asyncio.iscoroutine(result):
-            result = await result
+        # 区分同步/异步 handler：
+        # - 异步 handler（如编排智能体的 run_specialist 等）：直接在事件循环中
+        #   await 执行（其内部应为纯异步实现，如 async LLM 调用，不会阻塞事件循环）。
+        # - 同步 handler（如内部使用 subprocess.run 的 shell/代码执行工具）放到
+        #   线程池执行：避免阻塞事件循环，保证 SSE 心跳与其它并发请求不被卡死。
+        # 注意：不能对异步 handler 使用 asyncio.to_thread——它只会在线程池中创建
+        # 协程对象（函数体不执行），随后仍在事件循环中运行，防阻塞机制形同虚设。
+        handler = self.handler
+        if inspect.iscoroutinefunction(handler):
+            result = await handler(**args)
+        else:
+            result = await asyncio.to_thread(handler, **args)
         return str(result)
 
 
@@ -100,6 +110,7 @@ class AgentEvent:
     tool_name: Optional[str] = None
     tool_args: Optional[dict] = None
     tool_result: Optional[str] = None
+    tool_call_id: Optional[str] = None  # 工具调用 ID：用于会话持久化时配对 call/output
 
 
 @dataclass
@@ -553,6 +564,9 @@ class Agent:
         await self._trim_history_async(history, tool_schemas, client)
         last_trim_msgs = len(history)
         final_text = ""
+        tool_call_seq: dict = {}  # 工具调用 ID 序号（模型未给 id 时兜底生成）
+        tool_calls_executed = 0  # 本轮已执行的工具调用数（用于空回复兜底判断）
+        forced_conclusion = False  # 是否已强制要求模型继续任务（避免无限追加）
 
         for _ in range(self.max_tool_calls):
             tool_calls: list[dict] = []
@@ -564,10 +578,12 @@ class Agent:
                 if result.reasoning:
                     # 实时思考过程
                     yield AgentEvent(type="reasoning", content=result.reasoning)
-                elif result.content:
+                # 注意：content / reasoning / tool_calls 可能来自同一 chunk 的多个事件，
+                # 必须独立判断，避免工具调用增量被 content 分支吞掉。
+                if result.content:
                     text_parts.append(result.content)
                     # 暂时不实时产出 text，等确认是否有工具调用后再决定
-                elif result.tool_calls_delta:
+                if result.tool_calls_delta:
                     # 累积流式工具调用增量（按 index 对齐 id/name/arguments 分片）
                     for tc in result.tool_calls_delta:
                         idx = tc.index
@@ -602,6 +618,7 @@ class Agent:
 
             if tool_calls:
                 # 模型请求调用工具
+                tool_calls_executed += len(tool_calls)
                 history.append(
                     ChatMessage(
                         role="assistant",
@@ -612,15 +629,27 @@ class Agent:
                 for tc in tool_calls:
                     fn = tc.get("function", {})
                     name = fn.get("name", "")
+                    # 生成稳定的工具调用 ID（模型未返回 id 时用序号兜底），
+                    # 供会话持久化配对 function_call / function_call_output，
+                    # 这样"继续"时历史可以无损重建，避免任务从头重跑。
+                    if not tool_call_seq:
+                        tool_call_seq = {}
+                    tc_id = tc.get("id") or f"call_{len(tool_call_seq)}"
+                    tool_call_seq.setdefault(tc_id, True)
                     tool = tool_by_name.get(name)
                     output = (
                         f"(工具 {name} 不存在)" if tool is None
                         else await tool.execute(fn.get("arguments", "{}"))
                     )
-                    yield AgentEvent(type="tool_call", tool_name=name, tool_args=fn.get("arguments", "{}"))
-                    yield AgentEvent(type="tool_result", tool_name=name, tool_result=output)
+                    yield AgentEvent(
+                        type="tool_call",
+                        tool_name=name,
+                        tool_args=fn.get("arguments", "{}"),
+                        tool_call_id=tc_id,
+                    )
+                    yield AgentEvent(type="tool_result", tool_name=name, tool_result=output, tool_call_id=tc_id)
                     history.append(
-                        ChatMessage(role="tool", content=output, tool_call_id=tc.get("id", ""), name=name)
+                        ChatMessage(role="tool", content=output, tool_call_id=tc_id, name=name)
                     )
                 # 防抖裁剪（自上次裁剪后新增消息不足阈值不重复裁剪）
                 if len(history) - last_trim_msgs >= _TRIM_DEBOUNCE_MSGS:
@@ -632,6 +661,26 @@ class Agent:
             final_text = "".join(text_parts)
             if final_text:
                 yield AgentEvent(type="text", content=final_text)
+                break
+
+            # 兜底：模型没有产出任何文本（工具调用后返回空回复，或直接空回复），
+            # 主动要求其**继续完成任务**，而不是静默结束或只给半截结论。
+            # 最多兜底一次，避免无限循环。
+            if not forced_conclusion:
+                forced_conclusion = True
+                if tool_calls_executed > 0:
+                    history.append(
+                        ChatMessage(
+                            role="user",
+                            content="（注意：上一轮工具调用已经执行完成。请基于已获得的工具结果继续完成任务，给出明确结论与下一步动作；不要重复执行已经做过的步骤，也不要留空回复。）",
+                        )
+                    )
+                else:
+                    history.append(
+                        ChatMessage(role="user", content="请继续回答我的问题，不要留空回复。")
+                    )
+                continue
+
             break
 
         yield AgentEvent(type="done", content=final_text)

@@ -1,4 +1,4 @@
-"""selection_agent — 白泽路由/元智能体模块。
+"""selection_agent — 白泽·智脑路由/元智能体模块。
 
 Prompt: ``system_selection_agent.md``
 Tools: ['check_available_agents', 'analyze_task_requirements', 'list_available_specialists', 'transfer_to_specialist']

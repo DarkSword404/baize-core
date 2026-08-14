@@ -1,4 +1,4 @@
-"""orchestration_agent — 白泽路由/元智能体模块。
+"""orchestration_agent — 白泽·智脑路由/元智能体模块。
 
 Prompt: ``system_orchestration_agent.md``
 Tools: ['run_specialist', 'run_dual_approach_contest', 'run_parallel_specialists', 'check_available_agents', 'analyze_task_requirements']

@@ -1,4 +1,4 @@
-"""reporting_agent — 白泽智能体模块。
+"""reporting_agent — 白泽·智脑智能体模块。
 
 Prompt: ``system_reporting_agent.md``
 Tools: ['think']

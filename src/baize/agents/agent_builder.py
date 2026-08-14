@@ -1,6 +1,6 @@
-"""白泽元智能体 (Agent Builder) — 根据用户需求自动生成新的安全智能体。
+"""白泽·智脑元智能体 (Agent Builder) — 根据用户需求自动生成新的安全智能体。
 
-Agent Builder 是白泽的元智能体，可:
+Agent Builder 是白泽·智脑的元智能体，可:
 1. 分析用户需求，生成完整的智能体配置
 2. 自动保存为自定义智能体 (~/.baize/custom/agents/*.json)
 3. 保存后立即可用，无需重启，也不涉及任何动态代码加载
@@ -29,9 +29,9 @@ from baize.sdk.agent import Agent, AgentTool
 # ===========================================================================
 
 class AgentBuilder:
-    """根据配置生成完整的白泽智能体 Python 模块文件。"""
+    """根据配置生成完整的白泽·智脑智能体 Python 模块文件。"""
 
-    # 白泽可用工具 → 导入语句映射
+    # 白泽·智脑可用工具 → 导入语句映射
     TOOL_IMPORTS: dict[str, str] = {
         "generic_linux_command": "from baize.tools.extended import _run_shell as generic_linux_command",
         "execute_code": "from baize.tools.extended import _execute_code as execute_code",
@@ -112,7 +112,7 @@ class AgentBuilder:
         """
         agent_name = cls.sanitize_name(config["name"])
         display_name = config["name"]
-        description = config.get("description", f"白泽自动生成的 {display_name} 智能体")
+        description = config.get("description", f"白泽·智脑自动生成的 {display_name} 智能体")
         system_prompt = config["system_prompt"]
         tools = config.get("tools", [])
 
@@ -120,7 +120,7 @@ class AgentBuilder:
         lines = [
             f'"""{cls._escape_embedded(display_name)} Agent',
             "",
-            f"由白泽智能体工厂 (Agent Builder) 自动生成。",
+            f"由白泽·智脑智能体工厂 (Agent Builder) 自动生成。",
             f"",
             f"{cls._escape_embedded(description)}",
             '"""',
@@ -190,7 +190,7 @@ class AgentBuilder:
         prompts = {
             "security": f"""# {specialization} 安全智能体
 
-你是白泽安全智能平台的高级安全专家，专精于 {specialization.lower()}。
+你是白泽·智脑安全智能平台的高级安全专家，专精于 {specialization.lower()}。
 
 ## 核心能力
 - **技术深度**: 精通安全工具、技术与流程
@@ -217,7 +217,7 @@ class AgentBuilder:
 
             "development": f"""# {specialization} 开发智能体
 
-你是白泽安全智能平台的高级开发专家，专注于 {specialization.lower()}。
+你是白泽·智脑安全智能平台的高级开发专家，专注于 {specialization.lower()}。
 
 ## 核心能力
 - **架构设计**: 构建可扩展、可维护的系统架构
@@ -233,7 +233,7 @@ class AgentBuilder:
 
             "research": f"""# {specialization} 研究智能体
 
-你是白泽安全智能平台的专业研究分析师，专注于 {specialization.lower()}。
+你是白泽·智脑安全智能平台的专业研究分析师，专注于 {specialization.lower()}。
 
 ## 研究能力
 - **数据收集**: 从多个来源收集信息
@@ -305,7 +305,7 @@ def _save_custom_agent_json(config: dict[str, Any], agent_name: str) -> str:
 # ===========================================================================
 
 def _tool_list_available_tools() -> str:
-    """列出白泽平台可用的全部工具及其用途。"""
+    """列出白泽·智脑平台可用的全部工具及其用途。"""
     tools_info = {}
     for tool_id, tool_data in AgentBuilder.AVAILABLE_TOOLS_INFO.items():
         tools_info[tool_id] = {
@@ -375,7 +375,7 @@ def _tool_generate_system_prompt(agent_type: str, specialization: str) -> str:
 _AGENT_BUILDER_TOOLS: list[dict[str, Any]] = [
     {
         "name": "list_available_tools",
-        "description": "列出白泽平台可用的全部工具及其描述，供选择新智能体的工具集。",
+        "description": "列出白泽·智脑平台可用的全部工具及其描述，供选择新智能体的工具集。",
         "func": _tool_list_available_tools,
     },
     {
@@ -458,7 +458,7 @@ AGENT_KEY = "agent_builder"
 _instructions = get_agent_instructions(AGENT_KEY)
 _lines = _instructions.split("\n", 2)
 _display_name = _lines[0].lstrip("# ").strip() if _lines else "Agent Builder"
-_display_desc = "白泽元智能体 — 根据用户需求自动分析与生成新的安全智能体模块，支持完整代码产出与热加载"
+_display_desc = "白泽·智脑元智能体 — 根据用户需求自动分析与生成新的安全智能体模块，支持完整代码产出与热加载"
 
 agent_builder = Agent(
     name=_display_name or "Agent Builder",

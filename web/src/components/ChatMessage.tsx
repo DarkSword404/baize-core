@@ -12,7 +12,7 @@ function formatTime(ts: string): string {
 
 const roleConfig: Record<string, { label: string; bg: string; text: string; border: string }> = {
   user: { label: '你', bg: 'bg-blue-600/10', text: 'text-blue-400', border: 'border-blue-600/20' },
-  assistant: { label: '白泽', bg: 'bg-emerald-600/10', text: 'text-emerald-400', border: 'border-emerald-600/20' },
+  assistant: { label: '智脑', bg: 'bg-emerald-600/10', text: 'text-emerald-400', border: 'border-emerald-600/20' },
   system: { label: '系统', bg: 'bg-amber-600/10', text: 'text-amber-400', border: 'border-amber-600/20' },
   tool: { label: '工具', bg: 'bg-gray-600/10', text: 'text-gray-400', border: 'border-gray-600/20' },
 };

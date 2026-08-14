@@ -1,5 +1,5 @@
 """
-白泽智能体发现工具 — 供 Selection Agent 和 Orchestration Agent 使用
+白泽·智脑智能体发现工具 — 供 Selection Agent 和 Orchestration Agent 使用
 
 提供三个核心能力:
 1. ``check_available_agents`` — 扫描已注册智能体，返回完整目录
@@ -22,7 +22,7 @@ from typing import Any
 @lru_cache(maxsize=1)
 def _check_available_agents() -> dict[str, Any]:
     """
-    扫描所有已注册的白泽智能体，返回完整信息目录。
+    扫描所有已注册的白泽·智脑智能体，返回完整信息目录。
 
     缓存行为: ``lru_cache(maxsize=1)`` — 智能体目录在会话期内不变，
     避免每次 LLM 工具调用都重新遍历模块（orchestrator 路由等高频场景）。
@@ -420,7 +420,7 @@ AGENT_DISCOVERY_TOOLS = [
     {
         "name": "check_available_agents",
         "description": (
-            "列出所有已注册的白泽智能体及其能力、专长、可用工具。"
+            "列出所有已注册的白泽·智脑智能体及其能力、专长、可用工具。"
             "在以下场景使用: 用户询问有哪些智能体、需要选择合适的智能体、"
             "需要了解智能体的具体能力范围。"
         ),

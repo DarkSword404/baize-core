@@ -1,4 +1,4 @@
-"""bug_bounter — 白泽智能体模块。
+"""bug_bounter — 白泽·智脑智能体模块。
 
 Prompt: ``system_bug_bounter.md``
 Tools: ['generic_linux_command', 'http_request', 'execute_code', 'port_scan', 'shodan_search', 'make_web_search_with_explanation', 'think']

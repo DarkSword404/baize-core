@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -47,7 +48,7 @@ from baize.config import ModelConfigStore, SingleModelConfig, get_server_config
 from baize.multimodal import build_user_message
 from baize.receivers.manager import ReceiverManager
 from baize.receivers.webhook import handle_webhook
-from baize.sdk.client import LLMClient, ModelNotConfiguredError
+from baize.sdk.client import LLMClient, ModelNotConfiguredError, ChatMessage
 from baize.experiences import (
     GLOBAL_SCOPE,
     EmbeddingConfig,
@@ -202,6 +203,128 @@ def _require_api_key(request: Request) -> None:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="无效或缺失 API Token",
         )
+
+
+# ----------------------------------------------------------------------
+# SSE 心跳包装
+# ----------------------------------------------------------------------
+def _is_continue_intent(text: str) -> bool:
+    """判断用户输入是否为"继续/接续"类指令（用于中断后基于已有上下文续跑）。"""
+    t = (text or "").strip().lower()
+    if not t or len(t) > 20:
+        return False
+    if t in ("继续", "继续执行", "继续吧", "继续干活", "接着", "接着来", "接续", "continue", "keep going", "go on", "continue the task", "continue执行"):
+        return True
+    return any(t.startswith(k) for k in ("继续", "接着", "continue", "keep going"))
+
+
+def _rebuild_prior_history(history_messages: list[dict]) -> list[ChatMessage]:
+    """将会话持久化消息重建为传给模型的完整 ChatMessage 历史。
+
+    必须保留已执行的工具调用链（function_call / function_call_output），
+    否则中断后用户说"继续"时，模型看不到已执行到哪一步，只能从头重新执行。
+    """
+    prior_history: list[ChatMessage] = []
+    last_tool_call_id: str | None = None  # 最近一个 function_call 的 id（用于配对）
+    pending_tool_calls = 0  # 尚未配对的 function_call 数量
+    for m in history_messages:
+        role = m.get("role")
+        mtype = m.get("type")
+        if role == "user" and not mtype:
+            prior_history.append(ChatMessage(role="user", content=m.get("content", "")))
+        elif role == "assistant" and not mtype:
+            prior_history.append(ChatMessage(role="assistant", content=m.get("content", "")))
+        elif mtype == "function_call":
+            pending_tool_calls += 1
+            last_tool_call_id = m.get("id") or f"call_{pending_tool_calls}"
+            args = m.get("arguments")
+            if isinstance(args, (dict, list)):
+                args_str = json.dumps(args, ensure_ascii=False)
+            else:
+                args_str = str(args or "{}")
+            prior_history.append(
+                ChatMessage(
+                    role="assistant",
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": last_tool_call_id,
+                            "type": "function",
+                            "function": {
+                                "name": m.get("name", ""),
+                                "arguments": args_str,
+                            },
+                        }
+                    ],
+                )
+            )
+        elif mtype == "function_call_output":
+            # 旧数据可能没有 id：复用最近一个 function_call 的 id 完成配对
+            pending_tool_calls = max(0, pending_tool_calls - 1)
+            prior_history.append(
+                ChatMessage(
+                    role="tool",
+                    content=m.get("output", ""),
+                    tool_call_id=m.get("id") or last_tool_call_id or "call_0",
+                    name=m.get("name", ""),
+                )
+            )
+    # 兜底：若最后存在孤立的 function_call（中断时工具尚未返回结果），
+    # 补一条 tool 消息，保证 OpenAI 格式中 assistant(tool_calls) 与 tool 成对。
+    if pending_tool_calls > 0:
+        prior_history.append(
+            ChatMessage(
+                role="tool",
+                content="（中断：工具执行未返回结果）",
+                tool_call_id=last_tool_call_id or "call_0",
+            )
+        )
+    return prior_history
+
+
+async def _with_sse_heartbeat(agen, interval: float = 15.0):
+    """包装异步生成器，静默期定期产出心跳，防止长时工具执行导致连接超时断开。
+
+    产出形式为 ``(kind, item)``：
+    - ``("event", event)``：上游生成器产出的原始事件
+    - ``("heartbeat", None)``：超过 ``interval`` 秒无事件时产出的心跳标记
+
+    调用方对心跳标记应输出 SSE 注释行（``: keepalive``），不触发前端事件，
+    但能维持 TCP 连接活跃，避免代理/网络设备因空闲超时切断会话。
+    """
+    next_task: asyncio.Task | None = None
+    sleep_task: asyncio.Task | None = None
+    try:
+        while True:
+            if next_task is None:
+                next_task = asyncio.ensure_future(agen.__anext__())
+            if sleep_task is None:
+                sleep_task = asyncio.ensure_future(asyncio.sleep(interval))
+            done, _ = await asyncio.wait(
+                {next_task, sleep_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if next_task in done:
+                if sleep_task is not None and not sleep_task.done():
+                    sleep_task.cancel()
+                sleep_task = None
+                try:
+                    item = next_task.result()
+                except StopAsyncIteration:
+                    return
+                next_task = None
+                yield "event", item
+            else:
+                yield "heartbeat", None
+                sleep_task = None
+    finally:
+        for t in (next_task, sleep_task):
+            if t is not None and not t.done():
+                t.cancel()
+        try:
+            await agen.aclose()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ----------------------------------------------------------------------
@@ -719,15 +842,13 @@ def create_baize_api_app(
         if agent is None:
             agent = get_agent(None)  # 回退默认
 
-        # 拼接历史（stateful 会话）：将会话已有消息作为上下文传给 Agent
-        from baize.sdk.client import ChatMessage
-
+        # 拼接历史（stateful 会话）：将会话已有消息作为上下文传给 Agent。
+        # 关键：不能只保留 user/assistant 纯文本消息——已执行的工具调用链
+        # （function_call / function_call_output 中间产物）必须转回 ChatMessage
+        # 原样传回模型。否则中断后用户说"继续"时，模型看不到已执行到哪一步，
+        # 只能从头重新执行整个任务。
         history_messages = app.state.session_manager.get_messages(session_id)
-        prior_history = [
-            ChatMessage(role=m["role"], content=m.get("content", ""))
-            for m in history_messages
-            if m.get("role") in ("user", "assistant") and not m.get("type")
-        ]
+        prior_history = _rebuild_prior_history(history_messages)
 
         # ── 多模态附件处理 ──
         # 获取会话全部附件（会话级，长期可用）
@@ -747,6 +868,18 @@ def create_baize_api_app(
             attachment_store=attachment_store,
             session_id=session_id,
         )
+
+        # ── 中断续跑：用户输入"继续"类指令且历史中存在已执行内容时，
+        # 明确要求模型基于已有上下文继续，避免从头重复执行已完成步骤 ──
+        if _is_continue_intent(payload.input) and prior_history:
+            _hint = (
+                "\n\n（用户希望继续之前中断的任务。请基于以上已执行的对话与工具结果"
+                "继续处理，不要重新执行已经完成过的步骤。）"
+            )
+            if user_chat_message.content_parts:
+                user_chat_message.content_parts.append({"type": "text", "text": _hint})
+            else:
+                user_chat_message.content += _hint
 
         # ── 长期记忆：检索相关历史经验并注入 agent 上下文 ──
         experience_block = ""
@@ -810,16 +943,24 @@ def create_baize_api_app(
 
             try:
                 # 流式对话（传入历史上下文 + 多模态 user 消息 + 附件工具 + 历史经验）
-                async for event in agent.run_stream(
-                    payload.input,
-                    prior_history=prior_history,
-                    extra_tools=extra_tools,
-                    user_chat_message=user_chat_message,
-                    experience_block=experience_block,
+                # 包一层 SSE 心跳：工具执行等静默期定期发送注释行保活，防止连接超时断开
+                async for kind, event in _with_sse_heartbeat(
+                    agent.run_stream(
+                        payload.input,
+                        prior_history=prior_history,
+                        extra_tools=extra_tools,
+                        user_chat_message=user_chat_message,
+                        experience_block=experience_block,
+                    ),
+                    interval=15.0,
                 ):
                     if await request.is_disconnected():
                         # 前端断开（切换页面/刷新）：保留已产生内容
                         break
+                    if kind == "heartbeat":
+                        # SSE 注释行：不产生前端事件，仅维持 TCP 连接活跃
+                        yield ": keepalive\n\n"
+                        continue
                     if event.type == "reasoning":
                         reasoning_parts.append(event.content)
                         yield (
@@ -846,6 +987,7 @@ def create_baize_api_app(
                         tool_events.append(
                             {
                                 "type": "function_call_output",
+                                "id": event.tool_call_id,
                                 "name": event.tool_name,
                                 "output": event.tool_result,
                             }
@@ -1302,7 +1444,7 @@ def _print_credentials(app: FastAPI, cfg) -> None:
     if auth.default_password and auth.default_token:
         lines = [
             f"\n{separator}",
-            "  白泽 (Baize) 登录凭证（首次启动自动生成，请妥善保存）",
+            "  白泽·智脑 (Baize) 登录凭证（首次启动自动生成，请妥善保存）",
             f"  用户名:   {username}",
             f"  密码:     {auth.default_password}",
             f"  Token:    {auth.default_token}",
@@ -1316,7 +1458,7 @@ def _print_credentials(app: FastAPI, cfg) -> None:
 
         lines = [
             f"\n{separator}",
-            "  白泽 (Baize) 登录凭证沿用首次启动时生成的密码/Token。",
+            "  白泽·智脑 (Baize) 登录凭证沿用首次启动时生成的密码/Token。",
             f"  用户名:   {username}",
             f"  如需重置，删除认证文件 {AUTH_DB_FILE} 后重启，",
             "  或设置环境变量 BAIZE_AUTH_RESET_ON_BOOT=1。",

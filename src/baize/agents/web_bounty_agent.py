@@ -1,4 +1,4 @@
-"""web_bounty_agent — 白泽智能体模块。
+"""web_bounty_agent — 白泽·智脑智能体模块。
 
 Prompt: ``system_web_bounty_agent.md``
 Tools: ['generic_linux_command', 'http_request', 'make_web_search_with_explanation', 'think']

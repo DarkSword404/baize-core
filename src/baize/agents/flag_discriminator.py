@@ -1,4 +1,4 @@
-"""flag_discriminator — 白泽智能体模块。
+"""flag_discriminator — 白泽·智脑智能体模块。
 
 Prompt: ``system_flag_discriminator.md``
 Tools: ['think']

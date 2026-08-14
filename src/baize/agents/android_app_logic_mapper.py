@@ -1,4 +1,4 @@
-"""android_app_logic_mapper — 白泽智能体模块。
+"""android_app_logic_mapper — 白泽·智脑智能体模块。
 
 Prompt: ``system_android_app_logic_mapper.md``
 Tools: ['think']

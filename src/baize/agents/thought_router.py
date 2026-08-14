@@ -1,4 +1,4 @@
-"""thought_router — 白泽智能体模块。
+"""thought_router — 白泽·智脑智能体模块。
 
 Prompt: ``system_thought_router.md``
 Tools: ['think']

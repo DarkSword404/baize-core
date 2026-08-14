@@ -135,7 +135,7 @@ export function Settings(): JSX.Element {
       const r = await healthCheck();
       setServerConnected(true);
       setServerVersion(r.version);
-      addToast({ type: 'success', title: '连接成功', message: `白泽 v${r.version}` });
+      addToast({ type: 'success', title: '连接成功', message: `白泽·智脑 v${r.version}` });
     } catch (err: any) {
       setServerConnected(false);
       addToast({ type: 'error', title: '连接失败', message: err.message });
@@ -226,7 +226,7 @@ export function Settings(): JSX.Element {
             type="text"
             value={apiUrl}
             onChange={e => setApiUrl(e.target.value)}
-            placeholder="http://localhost:9999/api/v1"
+            placeholder="http://localhost:8001/api/v1"
             className={`${inputCls} flex-1 font-mono`}
           />
           <button
@@ -571,10 +571,10 @@ export function Settings(): JSX.Element {
 
       {/* About */}
       <section className="bg-gray-900 border border-gray-800 rounded-2xl p-6">
-        <h2 className="text-sm font-semibold mb-3">关于白泽</h2>
+        <h2 className="text-sm font-semibold mb-3">关于白泽·智脑</h2>
         <div className="space-y-2 text-sm text-gray-400">
           <p>
-            <strong className="text-gray-300">白泽 (Baize)</strong>
+            <strong className="text-gray-300">白泽·智脑 (Baize)</strong>
             开源 AI 安全框架，内置 30+ 安全智能体，
             支持多阶段渗透测试杀伤链。
           </p>

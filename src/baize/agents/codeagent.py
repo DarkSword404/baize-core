@@ -1,4 +1,4 @@
-"""codeagent — 白泽智能体模块。
+"""codeagent — 白泽·智脑智能体模块。
 
 Prompt: ``system_codeagent.md``
 Tools: ['execute_code', 'think']

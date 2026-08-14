@@ -17,7 +17,7 @@ export function SettingsModal(): JSX.Element | null {
       const r = await healthCheck();
       setServerConnected(true);
       setServerVersion(r.version);
-      addToast({ type: 'success', title: '已连接', message: `白泽 v${r.version}` });
+      addToast({ type: 'success', title: '已连接', message: `白泽·智脑 v${r.version}` });
       setSettingsOpen(false);
     } catch (err: any) {
       setServerConnected(false);
@@ -43,7 +43,7 @@ export function SettingsModal(): JSX.Element | null {
               placeholder="http://localhost:9999/api/v1"
               className="w-full px-3 py-2.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 focus:border-blue-500 outline-none font-mono"
             />
-            <p className="text-[10px] text-gray-600 mt-1.5">默认 Vite 开发代理自动转发 /api → localhost:9999</p>
+            <p className="text-[10px] text-gray-600 mt-1.5">默认 Vite 开发代理自动转发 /api → localhost:8001</p>
           </div>
 
           <button

@@ -1,6 +1,6 @@
 // ============================================================
-// 白泽前端 — 智能体与工具描述中文本地化
-// 所有映射基于白泽 API 真实返回数据构建，不影响 API 通信
+// 白泽·智脑前端 — 智能体与工具描述中文本地化
+// 所有映射基于白泽·智脑 API 真实返回数据构建，不影响 API 通信
 // ============================================================
 
 export const agentDescCN: Record<string, string> = {
@@ -52,10 +52,10 @@ export const agentDescCN: Record<string, string> = {
 
   // ---- 编排与管理 ----
   'Orchestration Agent':
-    '白泽默认编排器，采用广度优先多智能体委派策略：先并行派发多个侦察兵，' +
+    '白泽·智脑默认编排器，采用广度优先多智能体委派策略：先并行派发多个侦察兵，' +
     '可选双方案对比竞赛，再按需委派专项跟进，直至达成用户目标。',
   'Selection Agent':
-    '白泽编排路由器，将网络安全任务自动路由到最合适的专项智能体，' +
+    '白泽·智脑编排路由器，将网络安全任务自动路由到最合适的专项智能体，' +
     '也可纯会话式回答"该用哪个智能体"类元问题。',
   'Continuous Ops Agent':
     '7×24 小时持续安全监控任务编排智能体，提供 CLI 向导验证任务间隔、tmux 后台运行、' +
@@ -70,7 +70,7 @@ export const agentDescCN: Record<string, string> = {
   'reporting agent':
     'HTML 格式安全报告自动生成智能体。',
   'Use Case Agent':
-    '高质量网络安全案例研究生成智能体，展示白泽在各种安全场景、CTF 挑战与' +
+    '高质量网络安全案例研究生成智能体，展示白泽·智脑在各种安全场景、CTF 挑战与' +
     '网络安全演练中的实战能力。',
 
   // ---- 模式 / 多智能体组合 ----
@@ -81,7 +81,7 @@ export const agentDescCN: Record<string, string> = {
   'blue_team_red_team_split_context':
     '红蓝队独立上下文综合评估模式，双方以不同视角并行执行全面的安全评估。',
   'meta_agent':
-    '白泽元智能体开关，启用后激活全局 TUI 编排器（BAIZE_META_AGENT=True）。',
+    '白泽·智脑元智能体开关，启用后激活全局 TUI 编排器（BAIZE_META_AGENT=True）。',
 };
 
 export const toolDescCN: Record<string, string> = {
@@ -112,7 +112,7 @@ export const toolDescCN: Record<string, string> = {
   'null_tool':
     '占位工具（无实际操作），用于纯分析型智能体。',
   'check_available_agents':
-    '查询 白泽系统中所有可用智能体及其详细信息。',
+    '查询 白泽·智脑系统中所有可用智能体及其详细信息。',
   'execute_cli_command':
     '执行 CLI 命令并返回输出结果。',
   'run_specialist':

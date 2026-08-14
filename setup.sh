@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 白泽 (Baize) — v1.3.0 环境安装脚本
+# 白泽·智脑 (Baize) — v1.3.1 环境安装脚本
 #
 # 功能：
 #   1. 创建 Python 虚拟环境 (.venv)
@@ -46,7 +46,7 @@ fi
 
 echo ""
 echo -e "${C_CYAN}══════════════════════════════════════════════════════════${C_RESET}"
-echo -e "${C_CYAN}  白泽 (Baize) v1.3.0 环境就绪${C_RESET}"
+echo -e "${C_CYAN}  白泽·智脑 (Baize) v1.3.1 环境就绪${C_RESET}"
 echo -e "${C_CYAN}  启动服务：./start.sh${C_RESET}"
 echo -e "${C_CYAN}  停止服务：./stop.sh${C_RESET}"
 echo -e "${C_CYAN}══════════════════════════════════════════════════════════${C_RESET}"

@@ -50,6 +50,10 @@ class FileWatcherReceiver:
             logger.error(f"FileWatcherReceiver [{self._cfg.id}] invalid watch_dir: {watch_dir}")
             return
 
+        # 保存事件循环引用：watchdog 在独立线程中回调，该线程内没有运行中的
+        # 事件循环，调用 asyncio.get_running_loop() 会抛 RuntimeError。
+        loop = asyncio.get_running_loop()
+
         patterns = [p.strip() for p in self._cfg.watch_patterns.split(",") if p.strip()] or ["*"]
         logger.info(
             f"FileWatcherReceiver [{self._cfg.id}] watching {watch_dir} "
@@ -57,9 +61,10 @@ class FileWatcherReceiver:
         )
 
         class Handler(FileSystemEventHandler):
-            def __init__(self):
+            def __init__(self, receiver_id: str, loop: asyncio.AbstractEventLoop):
                 self._on_data = on_data
-                self._receiver_id = cfg.id
+                self._receiver_id = receiver_id
+                self._loop = loop
                 self._processed: set[str] = set()
 
             def on_created(self, event):
@@ -71,8 +76,12 @@ class FileWatcherReceiver:
                     self._handle(event.src_path)
 
             def _handle(self, path: str):
-                # 防重复
-                key = f"{path}:{os.path.getsize(path)}"
+                # 防重复（文件可能已被删除，getsize 失败则跳过）
+                try:
+                    size = os.path.getsize(path)
+                except OSError:
+                    return
+                key = f"{path}:{size}"
                 if key in self._processed:
                     return
                 self._processed.add(key)
@@ -119,15 +128,21 @@ class FileWatcherReceiver:
                         "size": len(raw),
                     },
                 )
-                # 在事件循环中回调
+                # 在事件循环中回调（watchdog 线程 -> 事件循环线程）
                 try:
-                    loop = asyncio.get_running_loop()
-                    asyncio.run_coroutine_threadsafe(self._on_data(self._receiver_id, rd), loop)
+                    asyncio.run_coroutine_threadsafe(
+                        self._on_data(self._receiver_id, rd), self._loop
+                    )
                 except RuntimeError:
+                    # 事件循环已关闭（shutdown 竞态），忽略
                     pass
 
         self._observer = Observer()
-        self._observer.schedule(Handler(), watch_dir, recursive=self._cfg.watch_recursive)
+        self._observer.schedule(
+            Handler(self._cfg.id, loop),
+            watch_dir,
+            recursive=self._cfg.watch_recursive,
+        )
         self._observer.start()
         logger.info(f"FileWatcherReceiver [{self._cfg.id}] started")
 

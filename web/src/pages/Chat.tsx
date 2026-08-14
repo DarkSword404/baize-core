@@ -774,7 +774,7 @@ export function Chat(): JSX.Element {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
                 </svg>
               </div>
-              <h3 className="text-lg font-semibold mb-1">白泽对话渗透</h3>
+              <h3 className="text-lg font-semibold mb-1">白泽·智脑对话渗透</h3>
               <p className="text-sm text-gray-600 max-w-md">
                 选择一个智能体，在对话中引导它执行安全渗透任务。所有AI操作将被完整记录。
               </p>

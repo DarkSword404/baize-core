@@ -1,4 +1,4 @@
-"""replay_attack_agent — 白泽智能体模块。
+"""replay_attack_agent — 白泽·智脑智能体模块。
 
 Prompt: ``system_replay_attack_agent.md``
 Tools: ['generic_linux_command', 'execute_code', 'http_request', 'think']

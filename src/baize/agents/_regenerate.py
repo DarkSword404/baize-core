@@ -82,7 +82,7 @@ def _generate_module(agent_key: str) -> str:
 
     tool_filter = "\n".join(f'        "{t}",' for t in tool_names)
 
-    return f'''"""{agent_key} — 白泽智能体模块。
+    return f'''"""{agent_key} — 白泽·智脑智能体模块。
 
 Prompt: ``system_{agent_key}.md``
 Tools: {tool_names}
@@ -127,7 +127,7 @@ def _generate_special_module(agent_key: str, tool_names: list[str]) -> str:
     extra_import = NON_STANDARD_IMPORTS.get(agent_key, "")
     extra_tools = NON_STANDARD_TOOLS.get(agent_key, "[]")
 
-    return f'''"""{agent_key} — 白泽路由/元智能体模块。
+    return f'''"""{agent_key} — 白泽·智脑路由/元智能体模块。
 
 Prompt: ``system_{agent_key}.md``
 Tools: {tool_names}

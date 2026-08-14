@@ -67,9 +67,9 @@ export function Sidebar(): JSX.Element {
     <aside className="w-56 min-w-[224px] bg-gray-900 border-r border-gray-800 flex flex-col select-none">
       {/* Logo */}
       <div className="px-5 py-4 border-b border-gray-800 flex items-center gap-3">
-        <div className="w-8 h-8 bg-blue-600 rounded-lg flex items-center justify-center text-sm font-bold">C</div>
+        <img src="/logo.png" alt="白泽·智脑" className="w-8 h-8 rounded-lg object-contain" />
         <div>
-          <div className="text-sm font-semibold tracking-tight">白泽</div>
+          <div className="text-sm font-semibold tracking-tight">白泽·智脑</div>
           <div className="text-[10px] text-gray-500">AI 安全助手</div>
         </div>
       </div>
@@ -112,7 +112,7 @@ export function Sidebar(): JSX.Element {
 
       {/* Footer */}
       <div className="px-4 py-3 border-t border-gray-800 text-[10px] text-gray-600 text-center">
-        白泽 v{serverVersion || '—'} · 
+        白泽·智脑 v{serverVersion || '—'} · 
       </div>
     </aside>
   );

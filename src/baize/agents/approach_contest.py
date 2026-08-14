@@ -1,5 +1,5 @@
 """
-白泽编排竞赛工具 — 供 Orchestration Agent 调度专项智能体使用
+白泽·智脑编排竞赛工具 — 供 Orchestration Agent 调度专项智能体使用
 
 提供三个核心编排工具:
 1. ``run_specialist`` — 单个专项智能体执行

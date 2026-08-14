@@ -1,4 +1,4 @@
-/*/* ===== 白泽(Baize) API Client ===== */
+/*/* ===== 白泽·智脑(Baize) API Client ===== */
 
 import type {
   HealthResponse,

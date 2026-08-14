@@ -222,9 +222,14 @@ class AttachmentStore:
         att = self.get_attachment(session_id, file_id)
         if att is None:
             return None
-        # 原始文件路径由存储结构重新计算（不依赖持久化的绝对路径）
-        p = self._file_dir(session_id, file_id) / "original" / att.filename
-        if not p.exists():
+        # 原始文件路径由存储结构重新计算（不依赖持久化的绝对路径）。
+        # 索引中保存的是上传时的原始 filename，可能包含目录成分；
+        # 必须清洗为 basename 并再次 _safe_join，防止目录穿越读取沙箱外文件。
+        safe_name = Path(att.filename.replace("\\", "/")).name.strip()
+        if not safe_name or safe_name in (".", ".."):
+            return None
+        p = _safe_join(self._file_dir(session_id, file_id) / "original", safe_name)
+        if p is None or not p.exists():
             return None
         return p
 

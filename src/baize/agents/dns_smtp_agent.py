@@ -1,4 +1,4 @@
-"""dns_smtp_agent — 白泽智能体模块。
+"""dns_smtp_agent — 白泽·智脑智能体模块。
 
 Prompt: ``system_dns_smtp_agent.md``
 Tools: ['generic_linux_command', 'http_request', 'think']

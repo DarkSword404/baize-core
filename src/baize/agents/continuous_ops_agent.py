@@ -1,4 +1,4 @@
-"""continuous_ops_agent — 白泽智能体模块。
+"""continuous_ops_agent — 白泽·智脑智能体模块。
 
 Prompt: ``system_continuous_ops_agent.md``
 Tools: ['generic_linux_command', 'execute_code', 'think']

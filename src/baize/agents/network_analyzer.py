@@ -1,4 +1,4 @@
-"""network_analyzer — 白泽智能体模块。
+"""network_analyzer — 白泽·智脑智能体模块。
 
 Prompt: ``system_network_analyzer.md``
 Tools: ['generic_linux_command', 'http_request', 'shodan_search', 'think', 'port_scan', 'execute_code']
