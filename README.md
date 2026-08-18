@@ -298,8 +298,10 @@ baize-core/
 
 ## 📝 更新日志
 
-### v1.3.1（当前）
+### v1.4.0（当前）
 
+- 🧰 **自定义工具系统**：`ToolBuilder` 智能体 + Web「工具」页在线创建/编辑自定义工具，
+  启动热注册，无需改代码
 - 🔌 **标准 Tool 协议 + 动态注册**：`ToolSpec` / `ToolRegistry` / `@register_tool`，
   参数 Schema 从类型注解自动推导；entry point 插件自动发现（`baize.tools` 组）
 - 🛠️ **安全工具逐一封装（45 个）**：nmap / nuclei / nikto / sqlmap / gobuster /
@@ -327,8 +329,24 @@ baize-core/
   安全工具），`pip install -e .[test]` 后 `pytest` 一键运行
 - 🐛 **修复断点**：Agent 别名解析、编排模板工具名校准、schema 类型推导、
   `Union` 导入、bytes 语法等
+- 🐛 **Agent 稳定性修复**：30+ 智能体运行时稳健性优化（流式增量处理、工具调用链
+  无损重建、空回复兜底续答等）
 - 📚 **文档**：`docs/EXTENDING.md`（四大扩展点 + deepseek-harness 对照）、
   `docs/PLUGIN_MARKET.md` 与插件示例 `examples/security-tools-plugin/`
+
+### v1.3.1
+
+- 🐛 **修复 对话中断**：SSE 心跳保活（长时工具执行静默期不再被网络设备断开）；
+  流式 chunk 内 content / reasoning / tool_calls 独立处理，工具调用增量不再丢失
+- 🔁 **修复「继续」重跑**：会话历史中已执行的工具调用链（function_call /
+  function_call_output）无损重建回模型上下文，中断后输入「继续」可基于已有进度
+  续跑，不再从头重复执行
+- 🐛 **修复 空回复中断**：模型在工具调用后返回空回复时，主动要求其继续完成任务
+  而非静默结束
+- 💾 **修复 经验库**：agent scope 规范化，消除缓存 key 不一致导致的
+  「创建成功但库中不增加」
+- 🔒 **安全修复**：附件读取路径穿越防护；文件监听线程/事件循环竞态修复
+- 🚀 **升级**：版本号统一为 1.3.1
 
 ### v1.3.0
 
