@@ -189,7 +189,7 @@ export interface Toast {
   message?: string;
 }
 
-export type ViewPage = 'dashboard' | 'chat' | 'agents' | 'sessions' | 'guardrails' | 'settings' | 'orchestration' | 'experiences';
+export type ViewPage = 'dashboard' | 'chat' | 'agents' | 'tools' | 'sessions' | 'guardrails' | 'settings' | 'orchestration' | 'experiences';
 
 // ===== 长期记忆：经验条目 =====
 export interface ExperienceItem {

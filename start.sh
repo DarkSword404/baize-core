@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# Baize (白泽) — 启动脚本
+# Baize (白泽) — 启动脚本 v1.4.0
 #
 # 启动后端 (FastAPI/uvicorn, 端口 8001) 和前端 (Vite, 端口 5173)。
 # 项目布局：
-#   baize-core-v1.3.0          核心框架（含前端 web/）
+#   baize-core-v1.4.0          核心框架（含前端 web/）
+#   baize-orchestration        流水线编排模块（可选）
 #
 set -euo pipefail
 

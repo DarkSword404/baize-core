@@ -22,9 +22,14 @@ _display_desc = "安全分类 — 对漏洞扫描结果、PoC 与告警进行去
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "generic_linux_command",
+        "cve_lookup",
+        "dns_lookup",
         "execute_code",
+        "generic_linux_command",
+        "hashid_detect",
+        "searchsploit",
         "think",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

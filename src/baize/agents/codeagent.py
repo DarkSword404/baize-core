@@ -22,8 +22,10 @@ _display_desc = "CodeAgent (CodeAct) — 面向代码理解、审查与重构的
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
+        "dns_lookup",
         "execute_code",
         "think",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

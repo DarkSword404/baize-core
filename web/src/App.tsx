@@ -6,6 +6,7 @@ import { Layout } from './components/Layout';
 import { Dashboard } from './pages/Dashboard';
 import { Chat } from './pages/Chat';
 import { Agents } from './pages/Agents';
+import { Tools } from './pages/Tools';
 import PipelineEditor from './pages/PipelineEditor';
 import { Sessions } from './pages/Sessions';
 import { Guardrails } from './pages/Guardrails';
@@ -34,6 +35,7 @@ export default function App(): JSX.Element {
                 <Route path="dashboard" element={<Dashboard />} />
                 <Route path="chat" element={<Chat />} />
                 <Route path="agents" element={<Agents />} />
+                <Route path="tools" element={<Tools />} />
                 <Route path="orchestration" element={<OrchestrationRoute />} />
                 <Route path="sessions" element={<Sessions />} />
                 <Route path="guardrails" element={<Guardrails />} />

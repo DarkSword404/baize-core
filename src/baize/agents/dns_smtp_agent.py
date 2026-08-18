@@ -22,9 +22,14 @@ _display_desc = "DNS/SMTP 邮件安全 — SPF、DKIM、DMARC 配置审计，邮
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
+        "crt_sh_lookup",
+        "cve_lookup",
+        "dns_lookup",
         "generic_linux_command",
         "http_request",
         "think",
+        "traceroute_path",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

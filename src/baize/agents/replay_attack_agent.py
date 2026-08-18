@@ -22,10 +22,16 @@ _display_desc = "重放攻击测试 — 抓取、编辑、重放网络请求，�
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "generic_linux_command",
+        "cve_lookup",
+        "dns_lookup",
         "execute_code",
+        "generic_linux_command",
+        "hashid_detect",
         "http_request",
+        "httpx_probe",
+        "searchsploit",
         "think",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

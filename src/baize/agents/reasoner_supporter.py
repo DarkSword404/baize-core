@@ -21,7 +21,11 @@ _display_desc = "推理辅助 — 纯分析角色，提供假设推演、因果�
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
+        "cve_lookup",
+        "dns_lookup",
+        "searchsploit",
         "think",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

@@ -32,6 +32,9 @@ from baize.prompts_util import get_agent_instructions
 # ---------------------------------------------------------------------------
 _AGENTS: Dict[str, Agent] = {}
 
+# 别名映射：别名 → 注册名（如模块 AGENT_KEY "web_pentester" → "Web Application Pentester"）
+_AGENT_ALIASES: Dict[str, str] = {}
+
 # ---------------------------------------------------------------------------
 # 定义每个模块中主 Agent 实例的变量名（按模块文件名）
 #
@@ -64,6 +67,7 @@ _MODULE_AGENT_VARS: Dict[str, str] = {
     "selection_agent": "selection_agent",
     "subghz_agent": "subghz_agent",
     "thought_router": "thought_router",
+    "tool_builder": "tool_builder",
     "triage_agent": "triage_agent",
     "use_cases": "use_cases",
     "web_bounty_agent": "web_bounty_agent",
@@ -120,6 +124,9 @@ def _discover_and_register() -> None:
                     register_agent(agent.name, agent)
                 else:
                     print(f"[baize.agents] 跳过 {mod_name}._VARIANTS 中非 Agent 实例: {agent!r}")
+            # 变体模式：仍将模块名注册为别名（指向首个变体）
+            if variants and isinstance(variants[0], Agent):
+                register_agent_alias(mod_name, variants[0].name)
             continue  # 变体模式：不注册主 Agent
 
         # 标准模式：注册主 Agent 实例
@@ -127,6 +134,10 @@ def _discover_and_register() -> None:
             agent = getattr(module, agent_var_name, None)
             if isinstance(agent, Agent) and hasattr(agent, "name"):
                 register_agent(agent.name, agent)
+                # 模块名（AGENT_KEY）注册为别名，便于编排模板引用
+                key = getattr(module, "AGENT_KEY", mod_name)
+                register_agent_alias(key, agent.name)
+                register_agent_alias(mod_name, agent.name)
             else:
                 print(
                     f"[baize.agents] {mod_name}.{agent_var_name} 不是有效的 Agent 实例 (type={type(agent).__name__})"
@@ -149,6 +160,21 @@ def register_agent(name: str, agent: Agent) -> None:
     _AGENTS[name] = agent
 
 
+def register_agent_alias(alias: str, agent_name: str) -> None:
+    """为 Agent 注册别名（如模块名 AGENT_KEY、snake_case 名等）。
+
+    便于编排模板等以非 display name 引用 Agent，对齐
+    ``get_agent`` 的别名解析能力。
+
+    Args:
+        alias: 别名（如 "web_pentester"、"recon_agent"）。
+        agent_name: 已注册的 Agent 名称。
+    """
+    if not alias:
+        return
+    _AGENT_ALIASES[alias] = agent_name
+
+
 def unregister_agent(name: str) -> None:
     """从注册表中移除指定 Agent。
 
@@ -156,6 +182,10 @@ def unregister_agent(name: str) -> None:
         name: Agent 名称。
     """
     _AGENTS.pop(name, None)
+    # 同时清理指向该 Agent 的别名
+    for alias, target in list(_AGENT_ALIASES.items()):
+        if target == name:
+            del _AGENT_ALIASES[alias]
 
 
 
@@ -192,8 +222,14 @@ def list_agents() -> List[Dict[str, Any]]:
 def get_agent(name: Optional[str] = None) -> Optional[Agent]:
     """按名称获取 Agent 对象。
 
+    解析顺序:
+    1. 精确名称匹配（Agent.name / display name）。
+    2. 别名匹配（模块 AGENT_KEY、snake_case 别名等）。
+    3. 大小写不敏感匹配（名称与别名）。
+    4. ``None`` 时返回第一个注册的 Agent。
+
     Args:
-        name: Agent 名称。如果为 None，返回第一个注册的 Agent。
+        name: Agent 名称或别名。如果为 None，返回第一个注册的 Agent。
 
     Returns:
         Agent | None: 找到的 Agent 实例。
@@ -202,7 +238,26 @@ def get_agent(name: Optional[str] = None) -> Optional[Agent]:
         if _AGENTS:
             return next(iter(_AGENTS.values()))
         return None
-    return _AGENTS.get(name)
+
+    # 1. 精确匹配
+    if name in _AGENTS:
+        return _AGENTS[name]
+
+    # 2. 别名匹配
+    if name in _AGENT_ALIASES:
+        target = _AGENT_ALIASES[name]
+        return _AGENTS.get(target)
+
+    # 3. 大小写不敏感匹配（名称与别名）
+    name_lower = name.lower()
+    for reg_name, agent in _AGENTS.items():
+        if reg_name.lower() == name_lower:
+            return agent
+    for alias, target in _AGENT_ALIASES.items():
+        if alias.lower() == name_lower:
+            return _AGENTS.get(target)
+
+    return None
 
 
 def list_tools() -> List[Dict[str, str]]:

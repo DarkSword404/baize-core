@@ -21,7 +21,11 @@ _display_desc = "安全用例生成 — 为防御、执法与授权培训场景�
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
+        "cve_lookup",
+        "dns_lookup",
+        "searchsploit",
         "think",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

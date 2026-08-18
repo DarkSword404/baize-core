@@ -183,6 +183,8 @@ export interface ToolInfo {
   description: string;
   category: string;
   import_path: string;
+  is_custom?: boolean;
+  enabled?: boolean;
 }
 export interface ToolsResponse {
   tools: ToolInfo[];
@@ -190,6 +192,70 @@ export interface ToolsResponse {
 
 export async function listAvailableTools(): Promise<ToolsResponse> {
   return request('/tools');
+}
+
+// ===== Custom Tools CRUD =====
+export interface CustomTool {
+  id: string;
+  name: string;
+  display_name: string;
+  description: string;
+  category: string;
+  code: string;
+  parameters: Record<string, unknown> | null;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+  is_custom: boolean;
+}
+export interface CustomToolsResponse {
+  tools: CustomTool[];
+}
+
+export async function listCustomTools(): Promise<CustomToolsResponse> {
+  return request('/tools/custom');
+}
+
+export async function createCustomTool(data: {
+  name: string;
+  display_name?: string;
+  description?: string;
+  category?: string;
+  code: string;
+  parameters?: Record<string, unknown>;
+  enabled?: boolean;
+}): Promise<{ ok: boolean; tool: CustomTool }> {
+  return request('/tools/custom', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function updateCustomTool(id: string, data: {
+  name?: string;
+  display_name?: string;
+  description?: string;
+  category?: string;
+  code?: string;
+  parameters?: Record<string, unknown>;
+  enabled?: boolean;
+}): Promise<{ ok: boolean; tool: CustomTool }> {
+  return request(`/tools/custom/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+export async function deleteCustomTool(id: string): Promise<{ ok: boolean }> {
+  return request(`/tools/custom/${id}`, { method: 'DELETE' });
+}
+
+export async function toggleCustomTool(id: string, enabled: boolean): Promise<{ ok: boolean; tool: CustomTool }> {
+  return request(`/tools/custom/${id}/toggle`, { method: 'POST', body: JSON.stringify({ enabled }) });
+}
+
+export async function testCustomTool(code: string, args?: Record<string, unknown>, timeout?: number): Promise<{
+  ok: boolean;
+  result?: string;
+  error?: string;
+  stdout?: string;
+  stderr?: string;
+}> {
+  return request('/tools/custom/test', { method: 'POST', body: JSON.stringify({ code, args, timeout }) });
 }
 
 export async function listCustomAgents(): Promise<CustomAgentsResponse> {

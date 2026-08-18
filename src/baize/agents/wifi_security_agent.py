@@ -21,9 +21,16 @@ _display_desc = "WiFi 无线安全 — 802.11 数据包捕获分析、WPA2/WPA3 
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "generic_linux_command",
+        "aircrack_crack",
+        "airodump_scan",
+        "cve_lookup",
+        "dns_lookup",
         "execute_code",
+        "generic_linux_command",
+        "hashid_detect",
+        "searchsploit",
         "think",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

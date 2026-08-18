@@ -305,13 +305,25 @@ def _save_custom_agent_json(config: dict[str, Any], agent_name: str) -> str:
 # ===========================================================================
 
 def _tool_list_available_tools() -> str:
-    """列出白泽·智脑平台可用的全部工具及其用途。"""
-    tools_info = {}
+    """列出白泽·智脑平台可用的全部工具及其用途（内置 + 插件注册）。"""
+    from baize.tools import registry as _tool_registry
+
+    tools_info: dict[str, dict[str, Any]] = {}
+    # 内置工具（静态描述，含详细用途）
     for tool_id, tool_data in AgentBuilder.AVAILABLE_TOOLS_INFO.items():
         tools_info[tool_id] = {
             "name": tool_data["name"],
             "description": tool_data["description"],
         }
+    # 注册表动态工具（插件、安全工具等）
+    for spec in _tool_registry.all():
+        if spec.name not in tools_info:
+            tools_info[spec.name] = {
+                "name": spec.name,
+                "description": spec.description,
+                "category": spec.category,
+                "author": spec.author,
+            }
     return json.dumps(tools_info, ensure_ascii=False, indent=2)
 
 

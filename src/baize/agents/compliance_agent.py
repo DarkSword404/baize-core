@@ -22,7 +22,10 @@ _display_desc = "GRC 风险与合规 — 对标 ISO 27001、NIST CSF、GDPR 等�
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
+        "cve_lookup",
+        "dns_lookup",
         "think",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

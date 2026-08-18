@@ -330,9 +330,20 @@ export function Chat(): JSX.Element {
         ));
       },
       () => {
-        setMessages(prev => prev.map((m: ChatMessageType) =>
-          m.id === assistantId ? { ...m, isStreaming: false } : m
-        ));
+        setMessages(prev => prev.map((m: ChatMessageType) => {
+          if (m.id !== assistantId) return m;
+          const hasText = (m.content || '').trim().length > 0;
+          if (hasText) return { ...m, isStreaming: false };
+          // 流结束但无文本输出：给出明确状态，避免"无声中断"
+          const hasIntermediates = (m.intermediates || []).length > 0;
+          return {
+            ...m,
+            isStreaming: false,
+            content: hasIntermediates
+              ? '\n\n> ⚠️ 本轮执行了多次工具调用但未产出最终回复（可能已达工具调用上限）。可继续追问，我会基于已收集的信息继续。'
+              : '\n\n> ⚠️ 本轮未产出回复，请重试或换一种问法。',
+          };
+        }));
         setIsStreaming(false);
         handleRefreshSessions();
       },

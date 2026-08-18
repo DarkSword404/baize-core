@@ -22,9 +22,27 @@ _display_desc = "CTF 竞赛智能体 — 覆盖 Crypto、Reverse、Pwn、Web、F
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "generic_linux_command",
+        "arp_scan",
+        "crt_sh_lookup",
+        "cve_lookup",
+        "dns_lookup",
         "execute_code",
+        "exiftool_read",
+        "ffuf_fuzz",
+        "generic_linux_command",
+        "hashid_detect",
+        "httpx_probe",
+        "john_crack",
+        "masscan_scan",
+        "netdiscover",
+        "searchsploit",
+        "ssl_cert_check",
+        "strings_extract",
         "think",
+        "traceroute_path",
+        "wafw00f_detect",
+        "whatweb_identify",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

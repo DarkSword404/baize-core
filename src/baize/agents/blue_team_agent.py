@@ -21,9 +21,15 @@ _display_desc = "蓝队防御 — 基于遥测与配置证据驱动检测、溯�
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "generic_linux_command",
+        "cve_lookup",
+        "dns_lookup",
         "execute_code",
+        "generic_linux_command",
+        "hashid_detect",
+        "searchsploit",
         "think",
+        "traceroute_path",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

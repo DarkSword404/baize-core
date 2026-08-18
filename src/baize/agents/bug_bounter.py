@@ -22,13 +22,30 @@ _display_desc = "漏洞赏金猎人 — 自动化 Web 漏洞发现，涵盖 XSS�
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "generic_linux_command",
-        "http_request",
+        "browser_click",
+        "browser_evaluate",
+        "browser_fetch",
+        "browser_fill",
+        "browser_screenshot",
+        "crt_sh_lookup",
+        "cve_lookup",
+        "dns_lookup",
         "execute_code",
-        "port_scan",
-        "shodan_search",
+        "ffuf_fuzz",
+        "generic_linux_command",
+        "hashid_detect",
+        "http_request",
+        "httpx_probe",
+        "john_crack",
         "make_web_search_with_explanation",
+        "port_scan",
+        "searchsploit",
+        "shodan_search",
+        "ssl_cert_check",
         "think",
+        "wafw00f_detect",
+        "whatweb_identify",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

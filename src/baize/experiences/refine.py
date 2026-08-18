@@ -62,9 +62,11 @@ def detect_turn_signals(
     elif concluded:
         reasons.append("本轮任务有明确结论")
 
-    # 用户指导信号（下一轮判定时由 prior 提供）
+    # 用户指导信号（下一轮判定时由 prior 提供）。
+    # 仅当本轮确有产出（final_text 非空）时才提示提炼，
+    # 避免模型空转/空回复时仅凭用户措辞就触发经验提示。
     guidance_keywords = ["应该", "可以试", "试试", "用这个", "换一个", "不要", "别用", "记得", "先"]
-    if _has_any(user_message, guidance_keywords):
+    if final_text.strip() and _has_any(user_message, guidance_keywords):
         reasons.append("用户消息含纠正/指导，可能蕴含经验")
 
     # 上一轮失败、本轮成功 → 用户辅助后成功（最高价值）

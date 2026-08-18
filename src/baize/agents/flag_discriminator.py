@@ -22,6 +22,8 @@ _display_desc = "Flag 鉴别器 — 从大量文本中快速识别与提取 CTF 
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
+        "hashid_detect",
+        "searchsploit",
         "think",
 }
 _all_tools = extended_tools()

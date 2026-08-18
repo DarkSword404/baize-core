@@ -21,8 +21,11 @@ _display_desc = "内存分析 — 对进程转储、内存镜像进行分析，�
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "generic_linux_command",
         "execute_code",
+        "exiftool_read",
+        "generic_linux_command",
+        "searchsploit",
+        "strings_extract",
         "think",
 }
 _all_tools = extended_tools()

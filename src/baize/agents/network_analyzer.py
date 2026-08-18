@@ -21,12 +21,22 @@ _display_desc = "网络流量分析 — PCAP 深度解析、协议还原、C2 �
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
+        "arp_scan",
+        "crt_sh_lookup",
+        "cve_lookup",
+        "dns_lookup",
+        "execute_code",
         "generic_linux_command",
+        "hashid_detect",
         "http_request",
+        "masscan_scan",
+        "netdiscover",
+        "port_scan",
+        "searchsploit",
         "shodan_search",
         "think",
-        "port_scan",
-        "execute_code",
+        "traceroute_path",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

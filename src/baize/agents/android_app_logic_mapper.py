@@ -21,7 +21,9 @@ _display_desc = "Android 应用逻辑映射 — 对反编译后的 APK 代码进
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
+        "dns_lookup",
         "think",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

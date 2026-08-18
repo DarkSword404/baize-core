@@ -21,8 +21,12 @@ _display_desc = "Android 静态安全分析 — 对 APK 执行白盒审计，检
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "generic_linux_command",
         "execute_code",
+        "exiftool_read",
+        "generic_linux_command",
+        "hashid_detect",
+        "searchsploit",
+        "strings_extract",
         "think",
 }
 _all_tools = extended_tools()

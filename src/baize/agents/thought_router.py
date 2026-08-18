@@ -21,7 +21,9 @@ _display_desc = "思路路由器 — 将复杂任务分解为有序的执行阶�
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
+        "dns_lookup",
         "think",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

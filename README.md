@@ -8,7 +8,7 @@
 
 > 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
 
-[![Version](https://img.shields.io/badge/version-v1.3.1-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.4.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
@@ -24,7 +24,13 @@
 |---|---|---|
 | 🧠 | **多智能体协同** | 30+ 专业安全智能体，按需调度、协同作战 |
 | 🔌 | **LLM 无关** | 兼容 OpenAI / DeepSeek / 通义千问 / Ollama 等 OpenAI 协议端点，模型热切换 |
-| 🛠️ | **工具调用** | 内置 10+ 安全专用工具（端口扫描、HTTP 探测、DNS 解析等），智能体自主调用 |
+| 🛠️ | **工具调用** | 内置 45+ 工具（29 个安全专用 + 5 个浏览器自动化），智能体自主调用 |
+| 🔌 | **标准 Tool 协议（v1.4.0）** | `ToolSpec` + `@register_tool` 动态注册，entry point 插件自动发现，无需改源码 |
+| 🧠 | **模型层抽象（v1.4.0）** | `BaseChatModel` / `ModelRouter` 多模型路由 + 失败 fallback，任意 OpenAI 兼容端点 |
+| 🧩 | **Agent 扩展（v1.4.0）** | `state` 运行时状态、`memory` 记忆注入、`hooks` 瀑布式事件链 |
+| 🖥️ | **执行环境抽象（v1.4.0）** | 统一执行器接口 + 沙箱隔离，工具可无缝切换 local / docker / ssh 后端 |
+| 📋 | **会话日志（v1.4.0）** | append-only 审计日志，模型历史可重建、攻击链可重放（DFIR 取证） |
+| 🧰 | **自定义工具（v1.4.0）** | Web「工具」页在线创建/编辑自定义工具，启动热注册，无需改代码 |
 | 💾 | **长期记忆（v1.3.0）** | 会话经验自动向量化入库，新问题自动检索命中，越用越聪明 |
 | 🛡️ | **护栏 Guardrails（v1.3.0）** | 文件化可配置的输入/输出策略，注入防护与敏感信息保护 |
 | 📡 | **外部接收器（v1.3.0）** | Webhook / Syslog / 文件监听，打通外部事件源 |
@@ -55,7 +61,7 @@
 ### 安装
 
 ```bash
-cd baize-core-v1.3.0
+cd baize-core-v1.4.0
 ./setup.sh    # 创建虚拟环境 + 安装 baize-core + 构建前端
 ```
 
@@ -218,22 +224,30 @@ Web 端「护栏」页可查看、开关各项策略；策略文件位于 `promp
 ## 📁 目录结构
 
 ```
-baize-core-v1.3.0/
+baize-core/
 ├── src/baize/
 │   ├── agents/           # 30+ 安全智能体 + 护栏策略实现
 │   ├── api/              # FastAPI 路由
 │   ├── experiences/      # 经验系统（embedding / retriever / store / refine）
 │   ├── receivers/        # 外部接收器（Webhook / Syslog / 文件监听）
-│   ├── sdk/              # SDK 与协议封装
-│   ├── tools/            # 安全工具集
+│   ├── sdk/              # SDK 与协议封装（models.py / memory.py / agent.py / session_log.py）
+│   ├── tools/            # 安全工具集（registry / security_tools / security_tools_extra / browser_tools）
+│   ├── executors.py      # 执行环境抽象（local / docker / ssh + 沙箱 fail-closed）
 │   └── util/             # 通用工具
 ├── web/                  # React 前端
 ├── prompts/              # 提示词与护栏策略文件
-├── docs/                 # 文档与图片
+├── docs/                 # 文档（EXTENDING.md / PLUGIN_MARKET.md）
+├── examples/             # 插件示例（security-tools-plugin）
 ├── setup.sh              # 环境安装
 ├── start.sh / stop.sh    # 启停脚本
 └── update.sh             # 更新脚本
 ```
+
+### 扩展开发
+
+- **工具协议 / 模型抽象 / Agent 扩展 / 执行器** → [docs/EXTENDING.md](docs/EXTENDING.md)
+- **插件市场（entry point 机制）** → [docs/PLUGIN_MARKET.md](docs/PLUGIN_MARKET.md)
+- **可运行插件示例** → [examples/security-tools-plugin/](examples/security-tools-plugin/)
 
 ---
 
@@ -243,8 +257,8 @@ baize-core-v1.3.0/
 - [x] **v1.1** 工具调用与模型热切换
 - [x] **v1.2** 会话管理 + 前端界面优化
 - [x] **v1.3** 经验系统（长期记忆）+ 护栏 + 外部接收器
-- [ ] **v1.4** 多智能体并行协作优化
-- [ ] **v1.5** 外部威胁情报接入
+- [x] **v1.4** 自定义工具系统 + Agent 稳定性优化
+- [ ] **v1.5** 多智能体并行协作优化 + 外部威胁情报接入
 
 ---
 
@@ -286,12 +300,35 @@ baize-core-v1.3.0/
 
 ### v1.3.1（当前）
 
-- 🐛 **修复 对话中断**：SSE 心跳保活（长时工具执行静默期不再被网络设备断开）；流式 chunk 内 content / reasoning / tool_calls 独立处理，工具调用增量不再丢失
-- 🔁 **修复「继续」重跑**：会话历史中已执行的工具调用链（function_call / function_call_output）无损重建回模型上下文，中断后输入「继续」可基于已有进度续跑，不再从头重复执行
-- 🐛 **修复 空回复中断**：模型在工具调用后返回空回复时，主动要求其继续完成任务而非静默结束
-- 💾 **修复 经验库**：agent scope 规范化，消除缓存 key 不一致导致的「创建成功但库中不增加」
-- 🔒 **安全修复**：附件读取路径穿越防护；文件监听线程/事件循环竞态修复
-- 🚀 **升级**：版本号统一为 1.3.1
+- 🔌 **标准 Tool 协议 + 动态注册**：`ToolSpec` / `ToolRegistry` / `@register_tool`，
+  参数 Schema 从类型注解自动推导；entry point 插件自动发现（`baize.tools` 组）
+- 🛠️ **安全工具逐一封装（45 个）**：nmap / nuclei / nikto / sqlmap / gobuster /
+  hydra / tshark / hashcat / metasploit 等核心 9 个，加信息收集（whois / dig /
+  crt.sh / httpx / openssl / whatweb / wafw00f）、漏洞研究（searchsploit / NVD
+  CVE）、爆破枚举（ffuf / arp-scan / masscan / traceroute）、无线（airodump /
+  aircrack）、取证（exiftool / strings / binwalk / john / hashid）等 20 个扩展，
+  全部含危险参数黑名单拦截
+- 🌐 **浏览器自动化工具**：基于 Playwright 的 `browser_fetch` / `browser_screenshot` /
+  `browser_click` / `browser_fill` / `browser_evaluate`，页面侦察 / 表单分析 /
+  JS 提取，含 SSRF 防护与 fail-closed 依赖检查
+- 🧠 **模型层抽象**：`BaseChatModel` / `OpenAICompatibleModel` / `ModelRouter`
+  （primary + fallbacks 链式降级），旧 `LLMClient` 完全兼容
+- 🧩 **Agent 定义扩展**：`state` 运行时状态、`memory` 记忆注入（`BaseMemory` /
+  `InMemoryMemory`）、`hooks` 多处理器瀑布式事件链（`next()` 委托 + 短路拦截，
+  对齐 deepseek-harness 的 tools/* 事件）
+- 📋 **会话日志（单一事实源）**：`SessionLog` append-only 审计日志，模型历史
+  可重建（`derive_messages`）、攻击链可重放（`replay`）、JSONL 落盘，满足
+  合规审计与 DFIR 取证
+- 🖥️ **安全执行环境抽象 + 沙箱**：`BaseExecutor`（local / docker / ssh）+
+  `SandboxMode`（read_only / workspace_write / danger_full_access）fail-closed
+  隔离，`EnforcementLevel` 诚实报告，错误双通道分类（sandbox_denied /
+  runner_failure），环境变量 `BAIZE_EXEC_*` 无缝切换后端
+- ✅ **正式测试套件**：pytest 42 个用例（注册表 / 沙箱 / 会话日志 / 瀑布链 /
+  安全工具），`pip install -e .[test]` 后 `pytest` 一键运行
+- 🐛 **修复断点**：Agent 别名解析、编排模板工具名校准、schema 类型推导、
+  `Union` 导入、bytes 语法等
+- 📚 **文档**：`docs/EXTENDING.md`（四大扩展点 + deepseek-harness 对照）、
+  `docs/PLUGIN_MARKET.md` 与插件示例 `examples/security-tools-plugin/`
 
 ### v1.3.0
 
@@ -325,6 +362,6 @@ baize-core-v1.3.0/
 
 **白泽·智脑 (Baize)** · 仅供安全研究与授权测试使用
 
-[![Version](https://img.shields.io/badge/version-v1.3.1-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.4.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
 
 </div>

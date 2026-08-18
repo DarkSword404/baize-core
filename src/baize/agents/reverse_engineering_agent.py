@@ -21,8 +21,13 @@ _display_desc = "逆向工程 — 二进制/固件/协议逆向，使用 Ghidra�
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "generic_linux_command",
+        "binwalk_analyze",
         "execute_code",
+        "exiftool_read",
+        "generic_linux_command",
+        "hashid_detect",
+        "searchsploit",
+        "strings_extract",
         "think",
 }
 _all_tools = extended_tools()

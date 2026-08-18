@@ -2,14 +2,53 @@
 
 提供智能体可调用的安全分析工具，并按类别划分为不同工具集，
 使不同智能体拥有差异化的工具配置（对齐 Baize v1.0.0 的智能体工具差异）。
+
+工具统一注册到标准注册表（``baize.tools.registry``），支持:
+- 内置工具自动注册
+- 第三方插件通过 ``baize.tools`` entry point 动态发现（无需修改源码）
 """
 
 from __future__ import annotations
 
 from baize.sdk.agent import AgentTool
-from baize.tools.extended import extended_tools
+from baize.tools.registry import ToolSpec, register_tool, registry
 
-_tool_index = {t.name: t for t in extended_tools()}
+# ----------------------------------------------------------------------
+# 注册内置工具（来自 extended.py 的既有实现，保持行为一致）
+# ----------------------------------------------------------------------
+from baize.tools.extended import extended_tools as _builtin_extended_tools
+
+for _t in _builtin_extended_tools():
+    if registry.get(_t.name) is None:
+        registry.register(
+            ToolSpec(
+                name=_t.name,
+                description=_t.description,
+                handler=_t.handler,
+                parameters=_t.parameters,
+                category="general",
+                author="baize",
+            )
+        )
+
+# 注册封装的安全工具（nmap/sqlmap/tshark 等，通过 register_tool 装饰器）
+from baize.tools import security_tools as _security_tools  # noqa: F401
+
+# 注册扩展安全工具（信息收集/漏洞/爆破/无线/取证，通过 register_tool 装饰器）
+from baize.tools import security_tools_extra as _security_tools_extra  # noqa: F401
+
+# 注册浏览器自动化工具（页面侦察/链接提取/表单分析/截图）
+from baize.tools import browser_tools as _browser_tools  # noqa: F401
+
+# 发现已安装的工具插件（baize.tools entry point）
+registry.discover_entry_points()
+
+_tool_index = {t.name: t for t in registry.to_agent_tools()}
+
+
+def extended_tools() -> list[AgentTool]:
+    """返回扩展工具的完整集合（内置 + 插件注册的全部工具）。"""
+    return registry.to_agent_tools()
 
 
 def command_tool() -> AgentTool:
@@ -167,3 +206,39 @@ def android_sast_tools() -> list[AgentTool]:
     return _pick(
         "generic_linux_command", "execute_code",
     )
+
+
+# 安全工具集（任务 3：封装的外部安全工具，通过注册表提供）
+def security_tools() -> list[AgentTool]:
+    """返回封装的外部安全工具（nmap/sqlmap/tshark 等，若已注册）。"""
+    return [t.to_agent_tool() for t in registry.all() if t.category == "security"]
+
+
+__all__ = [
+    "registry",
+    "register_tool",
+    "ToolSpec",
+    "extended_tools",
+    "command_tool",
+    "http_tool",
+    "port_scan_tool",
+    "web_tools",
+    "redteam_tools",
+    "blueteam_tools",
+    "dfir_tools",
+    "reverse_engineering_tools",
+    "compliance_tools",
+    "reporting_tools",
+    "retester_tools",
+    "mail_tools",
+    "codeagent_tools",
+    "continuous_ops_tools",
+    "subghz_sdr_tools",
+    "orchestration_tools",
+    "selection_tools",
+    "general_tools",
+    "network_analysis_tools",
+    "wifi_security_tools",
+    "android_sast_tools",
+    "security_tools",
+]

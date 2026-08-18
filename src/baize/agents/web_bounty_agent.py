@@ -21,10 +21,27 @@ _display_desc = "Web 漏洞赏金 (变体) — 在规则框架内自主进行 We
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
+        "browser_click",
+        "browser_evaluate",
+        "browser_fetch",
+        "browser_fill",
+        "browser_screenshot",
+        "crt_sh_lookup",
+        "cve_lookup",
+        "dns_lookup",
+        "ffuf_fuzz",
         "generic_linux_command",
+        "hashid_detect",
         "http_request",
+        "httpx_probe",
+        "john_crack",
         "make_web_search_with_explanation",
+        "searchsploit",
+        "ssl_cert_check",
         "think",
+        "wafw00f_detect",
+        "whatweb_identify",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

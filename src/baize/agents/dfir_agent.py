@@ -21,9 +21,17 @@ _display_desc = "数字取证与应急响应 — 硬盘镜像分析、内存取�
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "generic_linux_command",
+        "binwalk_analyze",
+        "cve_lookup",
+        "dns_lookup",
         "execute_code",
+        "exiftool_read",
+        "generic_linux_command",
+        "hashid_detect",
+        "searchsploit",
+        "strings_extract",
         "think",
+        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

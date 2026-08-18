@@ -49,6 +49,7 @@ from baize.multimodal import build_user_message
 from baize.receivers.manager import ReceiverManager
 from baize.receivers.webhook import handle_webhook
 from baize.sdk.client import LLMClient, ModelNotConfiguredError, ChatMessage
+from baize.tools.custom_tools import test_custom_tool
 from baize.experiences import (
     GLOBAL_SCOPE,
     EmbeddingConfig,
@@ -160,6 +161,36 @@ class AgentsResponse(BaseModel):
 
 class ToolsResponse(BaseModel):
     tools: list[dict]
+
+
+class CustomToolCreateRequest(BaseModel):
+    name: str
+    display_name: Optional[str] = None
+    description: str = ""
+    category: str = "custom"
+    code: str
+    parameters: Optional[dict] = None
+    enabled: bool = True
+
+
+class CustomToolUpdateRequest(BaseModel):
+    name: Optional[str] = None
+    display_name: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    code: Optional[str] = None
+    parameters: Optional[dict] = None
+    enabled: Optional[bool] = None
+
+
+class CustomToolToggleRequest(BaseModel):
+    enabled: bool
+
+
+class CustomToolTestRequest(BaseModel):
+    code: str
+    args: Optional[dict] = None
+    timeout: Optional[int] = 60
 
 
 class GuardrailSettingsRequest(BaseModel):
@@ -354,6 +385,9 @@ def create_baize_api_app(
     app.state.auth_manager = AuthManager()
     app.state.custom_agents = CustomAgentStore()
     app.state.custom_pipelines = CustomPipelineStore()
+    from baize.tools.custom_tools import CustomToolStore
+    app.state.custom_tools = CustomToolStore()
+    app.state.custom_tools.register_all()  # 启动时热注册已有自定义工具
     app.state.attachment_store = AttachmentStore()
     app.state.require_auth = cfg.require_auth
     app.state.loaded_modules: dict[str, dict] = {}  # 已加载模块注册表
@@ -659,7 +693,92 @@ def create_baize_api_app(
         dependencies=[Depends(_require_api_key)],
     )
     def tools_list() -> ToolsResponse:
-        return ToolsResponse(tools=list_tools())
+        builtin = list_tools()
+        custom = [
+            {
+                "name": r["name"],
+                "description": r.get("description", ""),
+                "category": r.get("category", "custom"),
+                "is_custom": True,
+                "enabled": r.get("enabled", True),
+            }
+            for r in app.state.custom_tools.list()
+        ]
+        return ToolsResponse(tools=builtin + custom)
+
+    # ------------------------------------------------------------------
+    # 自定义工具管理 (Custom Tools)
+    # ------------------------------------------------------------------
+    @app.get(
+        "/api/v1/tools/custom",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def custom_tools_list() -> dict:
+        return {"tools": app.state.custom_tools.list()}
+
+    @app.post(
+        "/api/v1/tools/custom",
+        response_model=dict,
+        status_code=201,
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def custom_tools_create(payload: CustomToolCreateRequest) -> dict:
+        try:
+            record = app.state.custom_tools.create(payload.model_dump(exclude_none=True))
+            return {"ok": True, "tool": record}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put(
+        "/api/v1/tools/custom/{tool_id}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def custom_tools_update(tool_id: str, payload: CustomToolUpdateRequest) -> dict:
+        try:
+            record = app.state.custom_tools.update(
+                tool_id, payload.model_dump(exclude_none=True)
+            )
+            return {"ok": True, "tool": record}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete(
+        "/api/v1/tools/custom/{tool_id}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def custom_tools_delete(tool_id: str) -> dict:
+        try:
+            app.state.custom_tools.delete(tool_id)
+            return {"ok": True}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/tools/custom/{tool_id}/toggle",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def custom_tools_toggle(tool_id: str, payload: CustomToolToggleRequest) -> dict:
+        try:
+            record = app.state.custom_tools.set_enabled(tool_id, payload.enabled)
+            return {"ok": True, "tool": record}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post(
+        "/api/v1/tools/custom/test",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def custom_tools_test(payload: CustomToolTestRequest) -> dict:
+        result = await test_custom_tool(payload.code, payload.args, timeout=payload.timeout or 60)
+        return result
+
 
     # ------------------------------------------------------------------
     # 会话管理
@@ -1473,6 +1592,8 @@ def _discover_and_load_modules(app: FastAPI) -> None:
 
     每个 entry point 指向一个可调用对象 register(app: FastAPI) -> None，
     模块通过该函数向核心 app 注册额外路由和功能。
+
+    同时扫描 baize.tools entry point，动态注册第三方工具插件。
     """
     try:
         eps = entry_points(group="baize.modules")
@@ -1496,3 +1617,11 @@ def _discover_and_load_modules(app: FastAPI) -> None:
             logger.debug("模块 %s 未安装或缺少依赖，跳过", ep.name)
         except Exception:
             logger.exception("加载模块 %s 失败", ep.name)
+
+    # 动态发现第三方工具插件（baize.tools entry point）
+    try:
+        from baize.tools import registry as _tool_registry
+
+        _tool_registry.discover_entry_points()
+    except Exception:  # noqa: BLE001
+        logger.exception("发现工具插件失败")
