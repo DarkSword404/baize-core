@@ -306,6 +306,13 @@ baize-core/
 - 🛡️ **工具执行异常隔离**：单个工具抛异常不再中断整轮对话，转为错误消息返回给模型，由模型决定重试或改道
 - 🛡️ **工具参数防御**：模型生成 `null` / 数组 / 字符串等非法参数形态不再抛 `TypeError`，调用链保持健壮
 - 🐛 **非流式空回复兜底**：与流式路径对齐，模型空回复时最多强制续写一次，避免用户拿到空响应
+- 🕸️ **Swarm 集群协作模式**：Selection / Orchestration Agent 注册 `pattern_type='swarm'`，
+  前端新增「Swarm 协作」会话模式（红队集群协作、智能体间动态 Handoff），
+  集群本质为后端注册的 swarm 型智能体，可编排多个智能体并行协作
+- 🔗 **流水线模块接入（baize-orchestration）**：`_discover_and_load_modules` 扫描
+  `baize.modules` entry point 自动加载已安装扩展模块（`pip install baize-orchestration` 即接入）；
+  会话绑定流水线时自动走 orchestration runner（提交 run → SSE 事件转发为
+  `pipeline_step` / `user_prompt` 审批 / 文本 delta / done），支持人工确认后 `resume_after_confirm`
 - 🚀 **升级**：版本号统一为 1.5.0（后端 / 前端 / 脚本 / 文档）
 
 ### v1.4.0
