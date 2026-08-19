@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 白泽·智脑 (Baize) — v1.4.0 环境安装脚本
+# 白泽·智脑 (Baize) — v1.5.0 环境安装脚本
 #
 # 安装 baize-core（必需，含前端 web/）和 baize-orchestration（可选）到虚拟环境。
 # 前端依赖需在 baize-core/web 目录单独安装。

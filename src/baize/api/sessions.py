@@ -36,6 +36,7 @@ class Session:
     stateful: bool
     created_at: str
     updated_at: str
+    pattern: Optional[str] = None
     messages: list[dict] = field(default_factory=list)
 
     @property
@@ -53,6 +54,7 @@ class Session:
             "history_length": self.history_length,
             "history": self.messages,
             "metadata": {},
+            "pattern": self.pattern,
         }
 
 
@@ -83,6 +85,7 @@ class SessionManager:
                     stateful=data.get("stateful", True),
                     created_at=data.get("created_at", ""),
                     updated_at=data.get("updated_at", ""),
+                    pattern=data.get("pattern"),
                     messages=data.get("messages", []),
                 )
                 self._sessions[session.id] = session
@@ -97,6 +100,7 @@ class SessionManager:
             "stateful": session.stateful,
             "created_at": session.created_at,
             "updated_at": session.updated_at,
+            "pattern": session.pattern,
             "messages": session.messages,
         }
         f = self._dir / f"{session.id}.json"
@@ -118,9 +122,8 @@ class SessionManager:
             stateful=stateful,
             created_at=_now(),
             updated_at=_now(),
+            pattern=pattern,
         )
-        if pattern:
-            session.agent = pattern
         with self._lock:
             self._sessions[session.id] = session
             self._save(session)

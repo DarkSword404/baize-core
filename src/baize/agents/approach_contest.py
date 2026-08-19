@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import uuid
 from typing import Any
 
@@ -27,6 +28,15 @@ from baize.sdk.agent import Agent, AgentTool
 _DEFAULT_WORKER_MAX_TURNS: int = 6
 _MAX_WORKER_OUTPUT_CHARS: int = 4000
 _COMBINED_OUTPUT_BUDGET: int = 8500
+
+# token 模糊匹配阈值：相似度 >= 该值才接受近似智能体名（兜底 LLM 编造名）
+_AGENT_FUZZY_MIN_SCORE: float = 0.6
+
+# 编排智能体未提供 framing 时的兜底执行策略（LLM 可能省略该参数）
+_DEFAULT_FRAMING: str = (
+    "按用户任务广域执行：先快速侦察范围与关键面，再聚焦高风险点验证。"
+    "严格遵守执行约束，输出简洁执行摘要。"
+)
 
 _INTERNAL_OPEN: str = (
     "<orchestrator_internal>\n"
@@ -70,21 +80,79 @@ def _new_group_id(kind: str) -> str:
 def _resolve_agent(agent_type: str) -> tuple[Agent | None, str | None]:
     """按键名查找智能体。
 
+    解析顺序:
+    1. 复用 ``get_agent`` — display name / 注册别名（如 ``web_pentester``）/ 大小写不敏感。
+    2. 归一化精确匹配 — 忽略空格、下划线、连字符与大小写差异。
+    3. token 模糊匹配兜底 — 处理 LLM 生成的近似名
+       （如 ``network_security_analyzer_agent`` → ``Network Analyzer``）。
+
     Returns:
         (agent, error_message) — 成功时 error_message 为 None。
     """
-    from baize.agents import _AGENTS
+    from baize.agents import _AGENTS, _AGENT_ALIASES, aliases_for, get_agent
 
-    key = agent_type.strip()
-    if key in _AGENTS:
-        return _AGENTS[key], None
+    key = (agent_type or "").strip()
+    if not key:
+        return None, "未指定智能体"
 
-    # 尝试按 display_name 模糊匹配
-    for k, a in _AGENTS.items():
-        if a.name.strip().lower() == key.lower():
-            return a, None
+    # 1) 复用 get_agent：display name / 别名 / 大小写不敏感
+    agent = get_agent(key)
+    if agent is not None:
+        return agent, None
 
-    available = ", ".join(sorted(_AGENTS.keys()))
+    # 2) 归一化精确匹配（忽略空格、下划线、连字符与大小写差异）
+    def _norm(s: str) -> str:
+        return "".join(ch for ch in s.lower() if ch.isalnum())
+
+    norm_key = _norm(key)
+    matched: Agent | None = None
+    for reg_name, a in _AGENTS.items():
+        if _norm(reg_name) == norm_key:
+            matched = a
+            break
+    if matched is None:
+        for alias, target in _AGENT_ALIASES.items():
+            if _norm(alias) == norm_key:
+                matched = _AGENTS.get(target)
+                if matched is not None:
+                    break
+    if matched is not None:
+        return matched, None
+
+    # 3) token 模糊匹配兜底（近似名 / 编造名）
+    def _tokens(s: str) -> set[str]:
+        return {w for w in re.split(r"[^a-z0-9]+", s.lower()) if w}
+
+    in_tokens = _tokens(key)
+    if in_tokens:
+        import difflib
+
+        best_score = 0.0
+        best_agent: Agent | None = None
+        for reg_name, a in _AGENTS.items():
+            cand_names = {reg_name, a.name, *aliases_for(reg_name)}
+            for cand in cand_names:
+                cand_tokens = _tokens(cand)
+                if not cand_tokens:
+                    continue
+                token_score = len(in_tokens & cand_tokens) / max(
+                    len(in_tokens), len(cand_tokens)
+                )
+                seq_score = difflib.SequenceMatcher(
+                    None, _norm(key), _norm(cand)
+                ).ratio()
+                score = max(token_score, seq_score)
+                if score > best_score:
+                    best_score = score
+                    best_agent = a
+        if best_agent is not None and best_score >= _AGENT_FUZZY_MIN_SCORE:
+            return best_agent, None
+
+    # 4) 报错：列出显示名（含别名），便于编排智能体下次使用正确名称
+    available = ", ".join(
+        f"{name} ({', '.join(aliases_for(name))})" if aliases_for(name) else name
+        for name in sorted(_AGENTS.keys())
+    )
     return None, f"未找到智能体 '{key}'。可用: {available}"
 
 
@@ -242,7 +310,7 @@ async def tool_run_specialist(
     agent_type: str,
     allowed_tool_name: str,
     task: str,
-    framing: str,
+    framing: str = "",
 ) -> str:
     """运行单个专项智能体，编排智能体保持控制。
 
@@ -251,17 +319,18 @@ async def tool_run_specialist(
     ``tool_run_dual_approach_contest``。
 
     Args:
-        agent_type: 智能体注册键名 (如 ``red_teamer``)
+        agent_type: 智能体名称 — 显示名（如 ``Web Application Pentester``）
+           或注册键名/别名（如 ``web_pentester``），参见 check_available_agents 目录
         allowed_tool_name: worker 可使用的工具名，逗号分隔可授予小工具箱，
            或 ``none`` 表示纯推理模式。
         task: 具体工作任务（避免原文照搬用户完整简报）
-        framing: 执行策略和约束
+        framing: 执行策略和约束（可选，缺省时使用默认广域执行策略）
     """
     result = await _run_worker(
         agent_key=agent_type,
         agent_display_name=agent_type,
         allowed_tool_name=allowed_tool_name,
-        framing=framing,
+        framing=framing or _DEFAULT_FRAMING,
         user_task=task,
         rationale="编排智能体指定的单路执行",
         label="S",
@@ -280,12 +349,12 @@ async def tool_run_specialist(
 async def tool_run_dual_approach_contest(
     agent_type_for_approach_a: str,
     agent_type_for_approach_b: str,
-    allowed_tool_for_approach_a: str,
-    allowed_tool_for_approach_b: str,
-    approach_a_framing: str,
-    approach_b_framing: str,
-    shared_user_task: str,
-    contest_rationale: str,
+    allowed_tool_for_approach_a: str = "none",
+    allowed_tool_for_approach_b: str = "none",
+    approach_a_framing: str = "",
+    approach_b_framing: str = "",
+    shared_user_task: str = "",
+    contest_rationale: str = "",
 ) -> str:
     """双路并行探索竞赛 — 两路策略在同一任务上的并行比较。
 
@@ -294,23 +363,23 @@ async def tool_run_dual_approach_contest(
     **worker A/B 并发执行，互不干扰。**
 
     Args:
-        agent_type_for_approach_a: 策略A的智能体键名
-        agent_type_for_approach_b: 策略B的智能体键名
-        allowed_tool_for_approach_a: 策略A可用工具
-        allowed_tool_for_approach_b: 策略B可用工具
-        approach_a_framing: 策略A怎么解决问题的技术路线描述
-        approach_b_framing: 策略B怎么解决问题的技术路线描述（应与A正交）
-        shared_user_task: 两路共享的用户任务
-        contest_rationale: 为什么要进行竞赛的简短理由
+        agent_type_for_approach_a: 策略A的智能体（显示名或注册键名/别名）
+        agent_type_for_approach_b: 策略B的智能体（显示名或注册键名/别名）
+        allowed_tool_for_approach_a: 策略A可用工具（可选，缺省 ``none`` 纯推理）
+        allowed_tool_for_approach_b: 策略B可用工具（可选，缺省 ``none`` 纯推理）
+        approach_a_framing: 策略A怎么解决问题的技术路线描述（可选）
+        approach_b_framing: 策略B怎么解决问题的技术路线描述，应与A正交（可选）
+        shared_user_task: 两路共享的用户任务（可选，缺省用 framing 描述任务）
+        contest_rationale: 为什么要进行竞赛的简短理由（可选）
     """
     results = await asyncio.gather(
         _run_worker(
             agent_key=agent_type_for_approach_a,
             agent_display_name=agent_type_for_approach_a,
             allowed_tool_name=allowed_tool_for_approach_a,
-            framing=approach_a_framing,
-            user_task=shared_user_task,
-            rationale=contest_rationale,
+            framing=approach_a_framing or _DEFAULT_FRAMING,
+            user_task=shared_user_task or "（见上方 framing 描述）",
+            rationale=contest_rationale or "编排智能体发起的双路竞赛",
             label="A",
             max_output_chars=_COMBINED_OUTPUT_BUDGET // 2,
         ),
@@ -318,9 +387,9 @@ async def tool_run_dual_approach_contest(
             agent_key=agent_type_for_approach_b,
             agent_display_name=agent_type_for_approach_b,
             allowed_tool_name=allowed_tool_for_approach_b,
-            framing=approach_b_framing,
-            user_task=shared_user_task,
-            rationale=contest_rationale,
+            framing=approach_b_framing or _DEFAULT_FRAMING,
+            user_task=shared_user_task or "（见上方 framing 描述）",
+            rationale=contest_rationale or "编排智能体发起的双路竞赛",
             label="B",
             max_output_chars=_COMBINED_OUTPUT_BUDGET // 2,
         ),
@@ -348,21 +417,22 @@ async def tool_run_dual_approach_contest(
 
 async def tool_run_parallel_specialists(
     workers_json: str,
-    parallel_rationale: str,
+    parallel_rationale: str = "",
 ) -> str:
     """2–4 个专项智能体并行执行独立子任务。
 
     用于 wave-1 并行广域侦察（多个正交战线的并行 scouting）或用户明确提出多个工作流时。
 
     ``workers_json`` 为 JSON 数组，每项含:
-    - agent_type: 智能体键名
-    - allowed_tool_name: 可用工具（或 ``none``）
+    - agent_type: 智能体名称 — 显示名或注册键名/别名
+      （如 ``Web Application Pentester`` 或 ``web_pentester``）
+    - allowed_tool_name: 可用工具（或 ``none``，可选）
     - task: 子任务描述
-    - framing: 执行策略
+    - framing: 执行策略（可选，缺省用默认广域执行策略）
 
     Args:
         workers_json: JSON 数组，2–4 个 worker 配置
-        parallel_rationale: 为何需要并行执行的简短理由
+        parallel_rationale: 为何需要并行执行的简短理由（可选）
     """
     raw = (workers_json or "").strip()
     try:
@@ -379,7 +449,7 @@ async def tool_run_parallel_specialists(
     if len(data) > 4:
         return "最多 4 个并行 worker"
 
-    required = ("agent_type", "allowed_tool_name", "task", "framing")
+    required = ("agent_type", "task")
     for i, w in enumerate(data, start=1):
         if not isinstance(w, dict):
             return f"Worker {i} 必须是 JSON 对象"
@@ -393,10 +463,10 @@ async def tool_run_parallel_specialists(
         return await _run_worker(
             agent_key=str(w["agent_type"]),
             agent_display_name=str(w["agent_type"]),
-            allowed_tool_name=str(w["allowed_tool_name"]),
-            framing=str(w["framing"]),
+            allowed_tool_name=str(w.get("allowed_tool_name") or "none"),
+            framing=str(w.get("framing") or _DEFAULT_FRAMING),
             user_task=str(w["task"]),
-            rationale=parallel_rationale,
+            rationale=parallel_rationale or "编排智能体发起的并行广域侦察",
             label=f"P{idx}",
             max_output_chars=per_cap,
         )
@@ -451,10 +521,10 @@ APPROACH_CONTEST_TOOLS: list[dict[str, Any]] = [
                 },
                 "framing": {
                     "type": "string",
-                    "description": "执行策略和约束，包括是广域侦察还是窄范围跟进",
+                    "description": "执行策略和约束，包括是广域侦察还是窄范围跟进（可选，缺省用默认广域策略）",
                 },
             },
-            "required": ["agent_type", "allowed_tool_name", "task", "framing"],
+            "required": ["agent_type", "allowed_tool_name", "task"],
         },
         "handler": tool_run_specialist,
     },
@@ -467,24 +537,18 @@ APPROACH_CONTEST_TOOLS: list[dict[str, Any]] = [
         "parameters": {
             "type": "object",
             "properties": {
-                "agent_type_for_approach_a": {"type": "string", "description": "策略A的智能体键名"},
-                "agent_type_for_approach_b": {"type": "string", "description": "策略B的智能体键名"},
-                "allowed_tool_for_approach_a": {"type": "string", "description": "策略A可用工具"},
-                "allowed_tool_for_approach_b": {"type": "string", "description": "策略B可用工具"},
-                "approach_a_framing": {"type": "string", "description": "策略A的技术路线描述"},
-                "approach_b_framing": {"type": "string", "description": "策略B的技术路线描述（应与A正交）"},
-                "shared_user_task": {"type": "string", "description": "两路共享的用户任务"},
-                "contest_rationale": {"type": "string", "description": "为什么要进行竞赛的简短理由"},
+                "agent_type_for_approach_a": {"type": "string", "description": "策略A的智能体（显示名或注册键名/别名）"},
+                "agent_type_for_approach_b": {"type": "string", "description": "策略B的智能体（显示名或注册键名/别名）"},
+                "allowed_tool_for_approach_a": {"type": "string", "description": "策略A可用工具（可选，缺省 none 纯推理）"},
+                "allowed_tool_for_approach_b": {"type": "string", "description": "策略B可用工具（可选，缺省 none 纯推理）"},
+                "approach_a_framing": {"type": "string", "description": "策略A的技术路线描述（可选）"},
+                "approach_b_framing": {"type": "string", "description": "策略B的技术路线描述，应与A正交（可选）"},
+                "shared_user_task": {"type": "string", "description": "两路共享的用户任务（可选）"},
+                "contest_rationale": {"type": "string", "description": "为什么要进行竞赛的简短理由（可选）"},
             },
             "required": [
                 "agent_type_for_approach_a",
                 "agent_type_for_approach_b",
-                "allowed_tool_for_approach_a",
-                "allowed_tool_for_approach_b",
-                "approach_a_framing",
-                "approach_b_framing",
-                "shared_user_task",
-                "contest_rationale",
             ],
         },
         "handler": tool_run_dual_approach_contest,
@@ -500,14 +564,14 @@ APPROACH_CONTEST_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "workers_json": {
                     "type": "string",
-                    "description": "JSON 数组，每项含 agent_type/allowed_tool_name/task/framing",
+                    "description": "JSON 数组，每项含 agent_type/task（必填），allowed_tool_name/framing（可选）",
                 },
                 "parallel_rationale": {
                     "type": "string",
-                    "description": "为何需要并行执行的简短理由",
+                    "description": "为何需要并行执行的简短理由（可选）",
                 },
             },
-            "required": ["workers_json", "parallel_rationale"],
+            "required": ["workers_json"],
         },
         "handler": tool_run_parallel_specialists,
     },

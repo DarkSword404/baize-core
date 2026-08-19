@@ -370,6 +370,8 @@ def tool_check_available_agents() -> str:
         JSON 格式的智能体目录字符串（便于 LLM 解析）。
     """
     import json
+    from baize.agents import aliases_for
+
     data = _check_available_agents()
     summary = {
         "total_agents": data["total_agents"],
@@ -378,11 +380,13 @@ def tool_check_available_agents() -> str:
             {
                 "key": k,
                 "name": v["name"],
+                "aliases": aliases_for(v["name"]),
                 "specialization": v["specialization"],
                 "description": v["description"][:120],
             }
             for k, v in data["agents"].items()
         ],
+        "usage_hint": "agent_type 字段可填 name（显示名）或 aliases 中任一值（注册键名），两者都会被接受。",
     }
     return json.dumps(summary, ensure_ascii=False, indent=2)
 

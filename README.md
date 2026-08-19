@@ -8,7 +8,7 @@
 
 > 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
 
-[![Version](https://img.shields.io/badge/version-v1.4.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.5.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
@@ -61,7 +61,7 @@
 ### 安装
 
 ```bash
-cd baize-core-v1.4.0
+cd baize-core-v1.5.0
 ./setup.sh    # 创建虚拟环境 + 安装 baize-core + 构建前端
 ```
 
@@ -258,7 +258,8 @@ baize-core/
 - [x] **v1.2** 会话管理 + 前端界面优化
 - [x] **v1.3** 经验系统（长期记忆）+ 护栏 + 外部接收器
 - [x] **v1.4** 自定义工具系统 + Agent 稳定性优化
-- [ ] **v1.5** 多智能体并行协作优化 + 外部威胁情报接入
+- [x] **v1.5** 稳定性加固发布（LLM 调用重试、工具超时与异常隔离、空回复兜底）
+- [ ] **v1.6** 多智能体并行协作优化 + 外部威胁情报接入
 
 ---
 
@@ -298,7 +299,16 @@ baize-core/
 
 ## 📝 更新日志
 
-### v1.4.0（当前）
+### v1.5.0（当前）
+
+- 🔒 **LLM 调用异常捕获与指数退避重试**：网络抖动 / 超时 / 限流(429) / HTTP 5xx 等临时故障自动重试（1s → 2s，最多 2 次）；404 / 401 / 400 等配置类错误不重试、直接暴露诊断，避免配置损坏时反复无效请求。覆盖非流式工具循环与 SSE 流式主路径（流式仅连接阶段可安全重试，中途断流不重放，防止重复内容）
+- 🛡️ **工具执行超时保护**：单次工具调用超 5 分钟即中止并返回超时提示，网络卡住 / subprocess 阻塞等挂起工具不再拖死整轮对话
+- 🛡️ **工具执行异常隔离**：单个工具抛异常不再中断整轮对话，转为错误消息返回给模型，由模型决定重试或改道
+- 🛡️ **工具参数防御**：模型生成 `null` / 数组 / 字符串等非法参数形态不再抛 `TypeError`，调用链保持健壮
+- 🐛 **非流式空回复兜底**：与流式路径对齐，模型空回复时最多强制续写一次，避免用户拿到空响应
+- 🚀 **升级**：版本号统一为 1.5.0（后端 / 前端 / 脚本 / 文档）
+
+### v1.4.0
 
 - 🧰 **自定义工具系统**：`ToolBuilder` 智能体 + Web「工具」页在线创建/编辑自定义工具，
   启动热注册，无需改代码
@@ -380,6 +390,6 @@ baize-core/
 
 **白泽·智脑 (Baize)** · 仅供安全研究与授权测试使用
 
-[![Version](https://img.shields.io/badge/version-v1.4.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.5.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
 
 </div>

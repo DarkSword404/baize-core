@@ -23,6 +23,8 @@ from baize.sdk.client import (
     ChatMessage,
     CompletionResult,
     CompletionUsage,
+    LLM_MAX_RETRIES,
+    LLM_TIMEOUT,
     ModelNotConfiguredError,
     resolve_model_config,
 )
@@ -91,6 +93,8 @@ class OpenAICompatibleModel(BaseChatModel):
         self._client = AsyncOpenAI(
             base_url=self._config.base_url,
             api_key=self._config.api_key or "sk-placeholder",
+            timeout=LLM_TIMEOUT,
+            max_retries=LLM_MAX_RETRIES,
         )
 
     @property

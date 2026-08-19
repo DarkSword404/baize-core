@@ -10,9 +10,15 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Optional
 
+import httpx
 from openai import AsyncOpenAI
 
 from baize.config import ModelConfigStore, SingleModelConfig
+
+# LLM 端点的网络超时：connect 30s（容忍网络抖动），read 180s（长生成），
+# 配合 openai SDK 的 max_retries 自动重试连接错误，提高流水线稳定性。
+LLM_TIMEOUT = httpx.Timeout(connect=30.0, read=180.0, write=60.0, pool=30.0)
+LLM_MAX_RETRIES = 3
 
 
 def estimate_tokens(text: str) -> int:
@@ -86,6 +92,8 @@ class LLMClient:
         self._client = AsyncOpenAI(
             base_url=self._config.base_url,
             api_key=self._config.api_key or "sk-placeholder",
+            timeout=LLM_TIMEOUT,
+            max_retries=LLM_MAX_RETRIES,
         )
 
     @property

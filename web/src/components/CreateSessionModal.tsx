@@ -72,11 +72,13 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
   async function handleCreate() {
     setCreating(true);
     try {
+      // swarm 集群本质是后端注册的 agent（pattern_type='swarm'），
+      // 必须把选中的集群名传给 agent 字段；pattern 仅流水线模式使用。
       const session = await createSession({
-        agent: mode === 'single' ? (selectedAgent || null) : null,
+        agent: mode === 'single' || mode === 'swarm' ? (selectedAgent || null) : null,
         model: configuredModel || null,
         stateful: true,
-        pattern: mode === 'pipeline' ? (selectedPipeline || null) : mode === 'swarm' ? (selectedPipeline || 'swarm') : null,
+        pattern: mode === 'pipeline' ? (selectedPipeline || null) : null,
       });
       addSession(session);
       const patternLabel = mode === 'pipeline' ? ` · 人工流水线` : mode === 'swarm' ? ` · Swarm 协作` : '';

@@ -886,7 +886,24 @@ def create_baize_api_app(
         prompt_id: str,
         payload: dict,
     ) -> dict:
-        # 简化实现：将用户的交互响应作为普通消息追加。
+        # ── 流水线人工确认：prompt_id 格式 "run:{run_id}"，桥接 runner.resume_after_confirm ──
+        if prompt_id.startswith("run:"):
+            run_id = prompt_id[len("run:"):]
+            response = (payload.get("response") or payload.get("content") or "")
+            # 用户拒绝（rejected=true）时传入拒绝信号
+            rejected = payload.get("rejected")
+            choice = "reject" if rejected in ("true", True, "1") else response
+            try:
+                from baize.orchestration.runner import get_runner
+                record = await get_runner().resume_after_confirm(run_id, choice)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("流水线人工确认失败 %s: %s", run_id, e, exc_info=True)
+                return {"ok": False, "handled": False, "error": "流水线恢复失败，请查看服务端日志"}
+            if record is None:
+                return {"ok": False, "handled": False, "error": "流水线不存在或未处于暂停状态"}
+            return {"ok": True, "handled": True, "run_id": run_id}
+
+        # 原有逻辑：将用户的交互响应作为普通消息追加。
         response = (payload.get("response") or payload.get("content") or "")
         if response:
             app.state.session_manager.append_message(session_id, "user", f"[响应 {prompt_id}] {response}")
@@ -960,6 +977,15 @@ def create_baize_api_app(
             agent = _build_custom_agent(app.state.custom_agents, agent_name)
         if agent is None:
             agent = get_agent(None)  # 回退默认
+
+        # ── pattern 流水线会话：会话绑定了流水线时，走流水线事件源 ──
+        pipeline_def = None
+        if getattr(session, "pattern", None):
+            try:
+                from baize.orchestration.api import _find_pipeline
+                pipeline_def = _find_pipeline(session.pattern)
+            except Exception:  # orchestration 未安装或查找失败 → 回退默认 agent
+                pipeline_def = None
 
         # 拼接历史（stateful 会话）：将会话已有消息作为上下文传给 Agent。
         # 关键：不能只保留 user/assistant 纯文本消息——已执行的工具调用链
@@ -1059,6 +1085,106 @@ def create_baize_api_app(
                 if final_text.strip():
                     sm.append_message(session_id, "assistant", final_text)
                 saved = True
+
+            # ── pattern 流水线会话：提交 run 并转发 SSE 事件 ──
+            # 会话绑定了流水线（人工输入类模板）时，走 orchestration runner：
+            # 提交 run → 订阅事件 → 转换为前端 SSE 格式（pipeline_step / user_prompt 审批 / 文本 delta / done）
+            if pipeline_def is not None:
+                try:
+                    from baize.orchestration.runner import get_runner
+                    runner = get_runner()
+                    # 缓存定义，供人工确认后 resume 时查找
+                    runner.cache_pipeline(pipeline_def)
+
+                    # context：把用户输入同时放入 text/input/message，兼容各模板的 context_schema
+                    run_id = await runner.submit(
+                        pipeline_def,
+                        {
+                            "text": payload.input,
+                            "input": payload.input,
+                            "message": payload.input,
+                        },
+                    )
+
+                    node_index = {n.id: n for n in pipeline_def.nodes}
+                    phase = 0
+                    async for kind, event in _with_sse_heartbeat(
+                        runner.subscribe_events(run_id), interval=15.0
+                    ):
+                        if await request.is_disconnected():
+                            break
+                        if kind == "heartbeat":
+                            # SSE 注释行：仅维持 TCP 连接活跃
+                            yield ": keepalive\n\n"
+                            continue
+                        etype = event.get("type", "")
+                        edata = event.get("data", {}) or {}
+                        if etype == "node_started":
+                            node = node_index.get(edata.get("node_id", ""))
+                            phase += 1
+                            yield (
+                                f"event: reasoning_step\n"
+                                f"data: {json.dumps({'type': 'pipeline_step', 'phase': phase, 'total': len(pipeline_def.nodes), 'phase_name': getattr(node, 'display_name', '') or edata.get('node_id', ''), 'agent': getattr(node, 'agent', '')})}\n\n"
+                            )
+                        elif etype == "node_completed":
+                            node = node_index.get(edata.get("node_id", ""))
+                            output = edata.get("data", {}) or {}
+                            text = ""
+                            if isinstance(output, dict):
+                                text = (
+                                    output.get("report")
+                                    or output.get("text")
+                                    or output.get("output")
+                                    or output.get("final_output")
+                                    or ""
+                                )
+                            if isinstance(text, str) and text.strip():
+                                final_text += text
+                                yield f"data: {json.dumps({'type': 'delta', 'content': text})}\n\n"
+                            node_label = getattr(node, "display_name", "") or edata.get("node_id", "")
+                            yield (
+                                f"event: reasoning_step\n"
+                                f"data: {json.dumps({'type': 'pipeline_phase_complete', 'phase': phase, 'agent': getattr(node, 'agent', ''), 'message': f'{node_label} 完成'})}\n\n"
+                            )
+                        elif etype == "pipeline_paused":
+                            # 人工确认节点：转为 user_prompt 审批事件，前端弹窗等待用户确认
+                            node = node_index.get(edata.get("node_id", ""))
+                            confirm_prompt = getattr(node, "confirm_prompt", "") or "是否确认继续执行？"
+                            confirm_options = getattr(node, "confirm_options", None) or ["approve", "reject"]
+                            yield (
+                                "event: user_prompt\n"
+                                f"data: {json.dumps({'prompt_id': f'run:{run_id}', 'prompt_type': 'confirm', 'title': '人工确认', 'message': confirm_prompt, 'command': '', 'options': confirm_options, 'is_password': False})}\n\n"
+                            )
+                        elif etype == "pipeline_completed":
+                            # compiler 推送 data={"run_id","data":final_values}；runner 再推送 data={"report":...}
+                            report = (
+                                edata.get("report")
+                                or (edata.get("data") or {}).get("report")
+                                or (edata.get("data") or {}).get("final_output")
+                                or ""
+                            )
+                            if isinstance(report, str) and report.strip():
+                                final_text += report
+                                yield f"data: {json.dumps({'type': 'delta', 'content': report})}\n\n"
+                            _flush_to_session()
+                            yield f"data: {json.dumps({'type': 'done', 'content': report or final_text})}\n\n"
+                        elif etype == "pipeline_failed":
+                            error = (
+                                edata.get("error")
+                                or (edata.get("data") or {}).get("error")
+                                or "流水线执行失败"
+                            )
+                            yield f"data: {json.dumps({'type': 'error', 'error': error})}\n\n"
+                        elif etype == "done":
+                            break
+                    _flush_to_session()
+                    yield "data: [DONE]\n\n"
+                    return
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("流水线会话处理失败: %s", e)
+                    yield f"data: {json.dumps({'type': 'error', 'error': '流水线执行失败，请查看服务端日志'})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
             try:
                 # 流式对话（传入历史上下文 + 多模态 user 消息 + 附件工具 + 历史经验）

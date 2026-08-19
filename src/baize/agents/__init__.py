@@ -201,6 +201,11 @@ def list_agents() -> List[Dict[str, Any]]:
     Returns:
         List[dict]: 每个元素包含 name, description, instructions, type, source 字段。
     """
+    # 内置集群型智能体 → pattern_type 标记，供前端 Swarm 集群选择使用
+    _PATTERN_TYPE_MAP = {
+        "Selection Agent (default orchestrator)": "swarm",
+        "Orchestration Agent (default entry)": "swarm",
+    }
     result = []
     for name, agent in _AGENTS.items():
         result.append({
@@ -214,7 +219,7 @@ def list_agents() -> List[Dict[str, Any]]:
                 {"name": t.name, "description": t.description or ""}
                 for t in agent.tools
             ] if agent.tools else [],
-            "pattern_type": None,
+            "pattern_type": _PATTERN_TYPE_MAP.get(agent.name),
         })
     return result
 
@@ -258,6 +263,21 @@ def get_agent(name: Optional[str] = None) -> Optional[Agent]:
             return _AGENTS.get(target)
 
     return None
+
+
+def aliases_for(agent_name: str) -> List[str]:
+    """返回某智能体的全部注册别名（如模块 AGENT_KEY、snake_case 名）。
+
+    与 ``register_agent_alias`` 对应，供编排目录 / 报错信息向 LLM
+    暴露可用名称，避免 LLM 只能依赖 display name。
+
+    Args:
+        agent_name: 智能体注册名（display name）。
+
+    Returns:
+        List[str]: 按注册顺序的别名列表；无别名时返回空列表。
+    """
+    return [alias for alias, target in _AGENT_ALIASES.items() if target == agent_name]
 
 
 def list_tools() -> List[Dict[str, str]]:

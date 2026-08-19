@@ -141,20 +141,23 @@ def _specialist_specs() -> list[tuple[str, str, str, str]]:
 
 def _build_handoff_agent_info(agent_key: str, display_name: str, route_desc: str) -> dict[str, Any]:
     """为单个智能体构建路由信息字典。"""
-    from baize.agents import _AGENTS
+    from baize.agents import aliases_for, get_agent
 
-    agent = _AGENTS.get(agent_key)
+    # 路由表使用 snake_case 键名，须经 get_agent 解析到注册的显示名
+    agent = get_agent(agent_key) or get_agent(display_name)
     if agent is None:
         return {
             "key": agent_key,
             "name": display_name,
+            "aliases": aliases_for(display_name),
             "available": False,
             "description": route_desc,
         }
 
     return {
         "key": agent_key,
-        "name": display_name,
+        "name": agent.name,
+        "aliases": aliases_for(agent.name),
         "available": True,
         "description": route_desc,
         "agent_description": agent.description or "",
@@ -200,23 +203,29 @@ def _transfer_to_agent(agent_key: str) -> str:
     """将控制权转交给指定智能体。
 
     Args:
-        agent_key: 智能体注册键名 (如 red_teamer)。
+        agent_key: 智能体名称 — 显示名或注册键名/别名
+            (如 ``Web Application Pentester`` 或 ``web_pentester``)。
     """
     import json
-    from baize.agents import _AGENTS
+    from baize.agents import _AGENTS, aliases_for, get_agent
 
-    agent = _AGENTS.get(agent_key.strip())
+    agent = get_agent((agent_key or "").strip())
     if agent is None:
+        available = ", ".join(
+            f"{name} ({', '.join(aliases_for(name))})" if aliases_for(name) else name
+            for name in sorted(_AGENTS.keys())
+        )
         return json.dumps({
             "status": "error",
             "message": f"未找到智能体 '{agent_key}'",
-            "available_agents": sorted(_AGENTS.keys()),
+            "available_agents": available,
         }, ensure_ascii=False)
 
     return json.dumps({
         "status": "transferred",
         "agent_key": agent_key,
         "agent_name": agent.name,
+        "agent_aliases": aliases_for(agent.name),
         "agent_description": agent.description or "",
         "instructions": "控制权已转交给目标智能体。请在新上下文中继续完成用户任务。",
     }, ensure_ascii=False)
@@ -243,7 +252,8 @@ OPERATIONAL_HANDOFF_TOOLS: list[dict[str, Any]] = [
             "properties": {
                 "agent_key": {
                     "type": "string",
-                    "description": "目标智能体的注册键名 (如 red_teamer, web_pentester 等)",
+                    "description": "目标智能体名称 — 显示名或注册键名/别名"
+                    "(如 'Web Application Pentester' 或 'web_pentester')",
                 },
             },
             "required": ["agent_key"],

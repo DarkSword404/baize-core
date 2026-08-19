@@ -15,6 +15,9 @@ import json
 import asyncio
 import inspect
 import logging
+
+import httpx
+import openai
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Optional, Protocol
 
@@ -52,6 +55,62 @@ _TRIM_DEBOUNCE_MSGS = 4
 # 要求模型先给出阶段性结论，防止陷入无限工具探索导致 30 轮空转、无文本输出。
 _CONCLUDE_HINT_TOOL_TURNS = 5
 
+# LLM 调用重试：临时性故障（网络抖动/超时/限流/5xx）做指数退避重试；
+# 配置类错误（404/401/400 等）不重试，直接抛出交由上层诊断，
+# 避免配置损坏时反复无效请求、拖垮整轮对话。
+_LLM_RETRY_ATTEMPTS = 2        # 额外重试次数（总尝试 = 1 + 2 = 3 次）
+_LLM_RETRY_BACKOFF_BASE = 1.0  # 指数退避基础秒数（1s -> 2s）
+
+# 工具执行超时：单次工具调用（含同步 handler 的线程池执行）超过该秒数
+# 即中止等待并返回超时错误文本给模型，防止工具挂起（网络卡住/subprocess
+# 阻塞等）拖死整轮对话。超时后同步 handler 的底层线程仍会在后台跑完，
+# 但对话流程可继续，不阻塞后续轮次。
+_TOOL_EXEC_TIMEOUT = 300.0     # 单位：秒
+
+
+def _missing_required_params(handler: Callable[..., Any], args: dict[str, Any]) -> list[str]:
+    """返回 handler 中缺失的必填参数名列表（无法内省时返回空列表）。"""
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return []
+    missing: list[str] = []
+    for name, param in sig.parameters.items():
+        if name in args:
+            continue
+        if param.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            if param.default is inspect.Parameter.empty:
+                missing.append(name)
+    return missing
+
+
+def _is_retryable_llm_error(exc: Exception) -> bool:
+    """判断 LLM 调用异常是否属于值得重试的临时性故障。
+
+    可重试：httpx 网络层异常、openai 超时/连接错误/限流/HTTP 5xx。
+    不可重试：404/401/400/403 等配置类 4xx —— 重试无意义，
+    直接抛出交由上层诊断（例如 base_url 失效导致的 NotFoundError）。
+    """
+    retryable_httpx = (
+        httpx.ConnectError,
+        httpx.ConnectTimeout,
+        httpx.ReadTimeout,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        httpx.ReadError,
+        httpx.RemoteProtocolError,
+    )
+    if isinstance(exc, retryable_httpx):
+        return True
+    if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError)):
+        return True
+    if isinstance(exc, openai.InternalServerError):
+        return True
+    if isinstance(exc, openai.APIStatusError):
+        status = getattr(exc, "status_code", None)
+        return status is not None and status >= 500
+    return False
+
 
 class Tool(Protocol):
     """工具协议。"""
@@ -86,6 +145,19 @@ class AgentTool:
             args = json.loads(arguments) if arguments else {}
         except json.JSONDecodeError:
             args = {}
+        # 防御：LLM 可能生成非法参数形态（"null"、"[1,2]""、"字符串"等），
+        # json.loads 不报错但结果非 dict，后续 `name in args` 会抛 TypeError。
+        # 一律归一为 dict，保持调用链健壮。
+        if not isinstance(args, dict):
+            args = {}
+        # 防御：handler 必填参数缺失时返回友好错误而非抛 TypeError，
+        # 避免 LLM 省略参数导致整个对话流 500 中断。
+        missing = _missing_required_params(self.handler, args)
+        if missing:
+            return (
+                f"工具 `{self.name}` 调用缺少必填参数: "
+                f"{', '.join(missing)}。请补全后重新调用。"
+            )
         # 区分同步/异步 handler：
         # - 异步 handler（如编排智能体的 run_specialist 等）：直接在事件循环中
         #   await 执行（其内部应为纯异步实现，如 async LLM 调用，不会阻塞事件循环）。
@@ -94,10 +166,23 @@ class AgentTool:
         # 注意：不能对异步 handler 使用 asyncio.to_thread——它只会在线程池中创建
         # 协程对象（函数体不执行），随后仍在事件循环中运行，防阻塞机制形同虚设。
         handler = self.handler
-        if inspect.iscoroutinefunction(handler):
-            result = await handler(**args)
-        else:
-            result = await asyncio.to_thread(handler, **args)
+        try:
+            if inspect.iscoroutinefunction(handler):
+                # 异步 handler：直接在事件循环中 await（其内部应为纯异步实现，
+                # 如 async LLM 调用，不会阻塞事件循环）。
+                result = await asyncio.wait_for(handler(**args), timeout=_TOOL_EXEC_TIMEOUT)
+            else:
+                # 同步 handler（如内部使用 subprocess.run 的 shell/代码执行工具）
+                # 放到线程池执行：避免阻塞事件循环。wait_for 超时后协程被取消，
+                # 底层线程仍会在后台跑完，但对话流程可继续，不阻塞后续轮次。
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(handler, **args), timeout=_TOOL_EXEC_TIMEOUT
+                )
+        except asyncio.TimeoutError:
+            return (
+                f"工具 `{self.name}` 执行超时（超过 {int(_TOOL_EXEC_TIMEOUT)}s），"
+                f"结果未获取。请告知用户执行超时或改用其他方法。"
+            )
         return str(result)
 
 
@@ -653,6 +738,80 @@ class Agent:
             await self._summarize_old_turns(history, tool_schemas, max_ctx_tokens, client)
         return self._trim_history_to_budget(history, max_ctx_tokens, tool_schemas)
 
+    async def _maybe_retry_llm(self, exc: Exception, attempt: int, *, stream: bool = False) -> bool:
+        """LLM 调用异常后判断是否退避重试。
+
+        仅对临时性故障（网络抖动/超时/限流/5xx）重试，配置类错误
+        （404/401/400/403 等）不重试。返回 True 表示已等待退避、应重试；
+        返回 False 表示应直接抛出原异常。
+        """
+        if not _is_retryable_llm_error(exc) or attempt > _LLM_RETRY_ATTEMPTS:
+            return False
+        delay = _LLM_RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+        self._log_event(
+            "agent/retry",
+            attempt=attempt,
+            error=type(exc).__name__,
+            stream=stream,
+            retry_in=round(delay, 2),
+        )
+        logger.warning(
+            "LLM 调用失败（%s%s），%.1fs 后重试（第 %d/%d 次）",
+            type(exc).__name__,
+            "，连接阶段" if stream else "",
+            delay,
+            attempt,
+            _LLM_RETRY_ATTEMPTS,
+        )
+        await asyncio.sleep(delay)
+        return True
+
+    async def _complete_with_retry(
+        self,
+        client: LLMClient,
+        history: list[ChatMessage],
+        tool_schemas: Optional[list[dict]],
+    ) -> CompletionResult:
+        """调用模型完成一次非流式补全，带异常捕获与指数退避重试。
+
+        仅对临时性故障（网络抖动/超时/限流/5xx）重试最多
+        ``_LLM_RETRY_ATTEMPTS`` 次；配置类错误（404/401/400/403 等）
+        不重试，直接抛出，避免配置损坏时反复无效请求。
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await client.complete(history, tools=tool_schemas)
+            except Exception as exc:  # noqa: BLE001
+                if not await self._maybe_retry_llm(exc, attempt):
+                    raise
+
+    async def _stream_llm_with_retry(
+        self,
+        client: LLMClient,
+        history: list[ChatMessage],
+        tool_schemas: Optional[list[dict]],
+    ) -> AsyncIterator[CompletionResult]:
+        """流式请求模型，带异常捕获与退避重试。
+
+        仅当连接建立阶段（尚未产出任何数据块）失败时才能安全重试；
+        一旦流中已产出过数据（reasoning/content/工具增量）再中断，
+        重放会产生重复内容，因此直接抛出交由上层诊断。
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            produced = False
+            try:
+                async for result in client.stream(history, tools=tool_schemas):
+                    produced = True
+                    yield result
+                return
+            except Exception as exc:  # noqa: BLE001
+                if produced or not await self._maybe_retry_llm(exc, attempt, stream=True):
+                    raise
+
     async def _run_tool_loop(
         self,
         client: LLMClient,
@@ -674,6 +833,7 @@ class Agent:
         _, max_message_chars, _ = self._context_budget()
         self._ensure_session_started()
         turn_index = 0
+        forced_conclusion = False  # 空回复兜底：最多强制续写一次
         for _ in range(self.max_tool_calls):
             turn_index += 1
             self._log_event("turn/start", index=turn_index)
@@ -682,7 +842,7 @@ class Agent:
                 model=getattr(client, "model", None) or type(client).__name__,
                 message_count=len(history),
             )
-            result = await client.complete(history, tools=tool_schemas)
+            result = await self._complete_with_retry(client, history, tool_schemas)
             total.input_tokens += result.usage.input_tokens
             total.output_tokens += result.usage.output_tokens
             total.reasoning_tokens += result.usage.reasoning_tokens
@@ -713,9 +873,16 @@ class Agent:
                             output = f"(工具调用已被策略拦截: {deny_reason or '未说明'})"
                             self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
                         else:
-                            started_at = asyncio.get_event_loop().time()
-                            output = await tool.execute(final_args)
-                            duration = asyncio.get_event_loop().time() - started_at
+                            started_at = asyncio.get_running_loop().time()
+                            try:
+                                output = await tool.execute(final_args)
+                            except Exception as exc:  # noqa: BLE001
+                                # 工具异常隔离：工具自身抛出的异常不中断整轮对话，
+                                # 转为 tool 结果消息返回给模型，由模型决定重试或改道。
+                                output = f"(工具 {name} 执行失败: {type(exc).__name__}: {exc})"
+                                self._log_event("tool/error", name=name, error=str(exc))
+                                logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
+                            duration = asyncio.get_running_loop().time() - started_at
                             self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
                         await self._emit("on_tool_result", self, name, output)
                     history.append(
@@ -738,6 +905,14 @@ class Agent:
 
             # 无工具调用：返回模型文本
             self._log_event("agent/response", content=result.content or "")
+            # 空回复兜底：模型未调用工具且输出为空（幻觉/被裁剪等）时，
+            # 最多强制续写一次，避免用户拿到空回复；再次为空则原样返回。
+            if not result.content and not forced_conclusion:
+                forced_conclusion = True
+                history.append(
+                    ChatMessage(role="user", content="请继续回答我的问题，不要留空回复。")
+                )
+                continue
             self._log_event("turn/end", index=turn_index)
             return result.content, total
 
@@ -846,8 +1021,8 @@ class Agent:
                 tool_accum: dict[int, dict] = {}  # index -> 累积的工具调用片段
                 text_parts: list[str] = []
 
-                # 流式请求模型
-                async for result in client.stream(history, tools=tool_schemas):
+                # 流式请求模型（连接阶段失败自动退避重试，中途断流直接抛出）
+                async for result in self._stream_llm_with_retry(client, history, tool_schemas):
                     if result.reasoning:
                         # 实时思考过程
                         yield AgentEvent(type="reasoning", content=result.reasoning)
@@ -929,9 +1104,16 @@ class Agent:
                             output = f"(工具 {name} 不存在)"
                             self._log_event("tool/result", name=name, output=output, denied=False, reason="工具未注册")
                         else:
-                            started_at = asyncio.get_event_loop().time()
-                            output = await tool.execute(final_args)
-                            duration = asyncio.get_event_loop().time() - started_at
+                            started_at = asyncio.get_running_loop().time()
+                            try:
+                                output = await tool.execute(final_args)
+                            except Exception as exc:  # noqa: BLE001
+                                # 工具异常隔离：工具自身抛出的异常不中断整轮对话，
+                                # 转为 tool 结果消息返回给模型，由模型决定重试或改道。
+                                output = f"(工具 {name} 执行失败: {type(exc).__name__}: {exc})"
+                                self._log_event("tool/error", name=name, error=str(exc))
+                                logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
+                            duration = asyncio.get_running_loop().time() - started_at
                             self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
                         await self._emit("on_tool_result", self, name, output)
                         yield AgentEvent(type="tool_result", tool_name=name, tool_result=output, tool_call_id=tc_id)
