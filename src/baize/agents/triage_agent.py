@@ -1,12 +1,12 @@
 """triage_agent — 白泽·智脑智能体模块。
 
 Prompt: ``system_triage_agent.md``
-Tools: ['generic_linux_command', 'execute_code', 'think']
+Tools: ['generic_linux_command', 'execute_code', 'think', 'shared_browser_open', 'shared_browser_wait_user', 'shared_browser_snapshot', 'shared_browser_click', 'shared_browser_fill', 'shared_browser_evaluate', 'shared_browser_status', 'shared_browser_close']
 """
 
 from __future__ import annotations
 
-from baize.prompts_util import get_agent_instructions
+from baize.prompts_util import get_agent_instructions, extract_display_name_and_desc
 from baize.sdk.agent import Agent
 from baize.tools import extended_tools
 
@@ -15,21 +15,22 @@ AGENT_KEY = "triage_agent"
 # ── 提示词 ─────────────────────────────────────────────────────────
 _instructions = get_agent_instructions(AGENT_KEY)
 
-# ── 从提示词提取 display name ────────────────────────────────────
-_lines = _instructions.split("\n", 2)
-_display_name = _lines[0].lstrip("# ").strip() if _lines else "triage_agent"
-_display_desc = "安全分类 — 对漏洞扫描结果、PoC 与告警进行去重、验证与优先级分级"
+# ── 从提示词提取 display name(智能跳过 Baize layering 头部注入) ──
+_display_name, _display_desc = extract_display_name_and_desc(_instructions, fallback_key="triage_agent")
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "cve_lookup",
-        "dns_lookup",
-        "execute_code",
         "generic_linux_command",
-        "hashid_detect",
-        "searchsploit",
+        "execute_code",
         "think",
-        "whois_lookup",
+        "shared_browser_open",
+        "shared_browser_wait_user",
+        "shared_browser_snapshot",
+        "shared_browser_click",
+        "shared_browser_fill",
+        "shared_browser_evaluate",
+        "shared_browser_status",
+        "shared_browser_close",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

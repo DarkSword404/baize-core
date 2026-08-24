@@ -6,7 +6,7 @@ Tools: ['generic_linux_command', 'execute_code', 'think']
 
 from __future__ import annotations
 
-from baize.prompts_util import get_agent_instructions
+from baize.prompts_util import get_agent_instructions, extract_display_name_and_desc
 from baize.sdk.agent import Agent
 from baize.tools import extended_tools
 
@@ -15,18 +15,13 @@ AGENT_KEY = "android_sast"
 # ── 提示词 ─────────────────────────────────────────────────────────
 _instructions = get_agent_instructions(AGENT_KEY)
 
-# ── 从提示词提取 display name ────────────────────────────────────
-_display_name = "Android SAST Agent"
-_display_desc = "Android 静态安全分析 — 对 APK 执行白盒审计，检测 WebView、IPC、权限滥用及硬编码凭据等常见风险"
+# ── 从提示词提取 display name(智能跳过 Baize layering 头部注入) ──
+_display_name, _display_desc = extract_display_name_and_desc(_instructions, fallback_key="android_sast")
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "execute_code",
-        "exiftool_read",
         "generic_linux_command",
-        "hashid_detect",
-        "searchsploit",
-        "strings_extract",
+        "execute_code",
         "think",
 }
 _all_tools = extended_tools()

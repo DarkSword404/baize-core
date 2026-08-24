@@ -6,7 +6,7 @@ Tools: ['think']
 
 from __future__ import annotations
 
-from baize.prompts_util import get_agent_instructions
+from baize.prompts_util import get_agent_instructions, extract_display_name_and_desc
 from baize.sdk.agent import Agent
 from baize.tools import extended_tools
 
@@ -15,15 +15,11 @@ AGENT_KEY = "flag_discriminator"
 # ── 提示词 ─────────────────────────────────────────────────────────
 _instructions = get_agent_instructions(AGENT_KEY)
 
-# ── 从提示词提取 display name ────────────────────────────────────
-_lines = _instructions.split("\n", 2)
-_display_name = _lines[0].lstrip("# ").strip() if _lines else "flag_discriminator"
-_display_desc = "Flag 鉴别器 — 从大量文本中快速识别与提取 CTF flag 格式字符串，辅助自动化竞赛管道"
+# ── 从提示词提取 display name(智能跳过 Baize layering 头部注入) ──
+_display_name, _display_desc = extract_display_name_and_desc(_instructions, fallback_key="flag_discriminator")
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "hashid_detect",
-        "searchsploit",
         "think",
 }
 _all_tools = extended_tools()

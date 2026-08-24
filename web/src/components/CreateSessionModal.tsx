@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
 import { createSession, listAgents, listManualPipelines, getModelConfig } from '../api/client';
 import type { ManualPipelineBrief } from '../api/client';
+import { agentNameCN, toolNameCN, agentDescCN } from '../i18n/translations';
 import type { JSX } from 'react';
 
 interface Props {
@@ -24,6 +25,7 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
   const [configuredModel, setConfiguredModel] = useState('');
   const [creating, setCreating] = useState(false);
   const [loadingAgents, setLoadingAgents] = useState(false);
+  const [browserCollab, setBrowserCollab] = useState(false);
 
   // Pattern / pipeline selection
   const [mode, setMode] = useState<OrchestrationMode>('single');
@@ -79,10 +81,12 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
         model: configuredModel || null,
         stateful: true,
         pattern: mode === 'pipeline' ? (selectedPipeline || null) : null,
+        browser_collab: browserCollab,
       });
       addSession(session);
       const patternLabel = mode === 'pipeline' ? ` · 人工流水线` : mode === 'swarm' ? ` · Swarm 协作` : '';
-      addToast({ type: 'success', title: '会话已创建', message: `智能体: ${session.agent}${patternLabel}` });
+      const agentDisplay = session.agent ? (agentNameCN[session.agent] || session.agent) : '';
+      addToast({ type: 'success', title: '会话已创建', message: `智能体: ${agentDisplay}${patternLabel}` });
       onCreated(session.id);
       onClose();
     } catch (err: any) {
@@ -138,7 +142,10 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
               <div>
                 <label className="block text-xs font-medium text-gray-400 mb-1.5">安全智能体</label>
                 <div className="grid grid-cols-1 gap-1.5 max-h-48 overflow-y-auto">
-                  {plainAgents.map(a => (
+                  {plainAgents.map(a => {
+                    const cnName = agentNameCN[a.name] || a.name;
+                    const cnDesc = agentDescCN[a.name] || a.description;
+                    return (
                     <button
                       key={a.name}
                       onClick={() => setSelectedAgent(a.name)}
@@ -148,18 +155,19 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
                           : 'border-transparent bg-gray-800/50 text-gray-300 hover:bg-gray-800 hover:border-gray-700'
                       }`}
                     >
-                      <div className="font-medium text-xs">{a.name}</div>
-                      {a.description && <div className="text-[11px] text-gray-500 mt-0.5 line-clamp-2">{a.description}</div>}
+                      <div className="font-medium text-xs">{cnName}</div>
+                      {cnDesc && <div className="text-[11px] text-gray-500 mt-0.5 line-clamp-2">{cnDesc}</div>}
                       {a.tools && a.tools.length > 0 && (
                         <div className="flex gap-1 mt-1 flex-wrap">
                           {a.tools.slice(0, 4).map(t => (
-                            <span key={t.name} className="text-[9px] px-1.5 py-0.5 rounded bg-gray-700/50 text-gray-400">{t.name}</span>
+                            <span key={t.name} className="text-[9px] px-1.5 py-0.5 rounded bg-gray-700/50 text-gray-400">{toolNameCN[t.name] || t.name}</span>
                           ))}
                           {a.tools.length > 4 && <span className="text-[9px] text-gray-600">+{a.tools.length - 4}</span>}
                         </div>
                       )}
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -215,7 +223,10 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
                 <label className="block text-xs font-medium text-gray-400 mb-1.5">Swarm 集群选择</label>
                 <div className="text-[10px] text-gray-600 mb-2">选择一个集群，各智能体将自动协作、动态切换执行任务</div>
                 <div className="grid grid-cols-1 gap-1.5 max-h-48 overflow-y-auto">
-                  {patternAgents.map(a => (
+                  {patternAgents.map(a => {
+                    const cnName = agentNameCN[a.name] || a.name;
+                    const cnDesc = agentDescCN[a.name] || a.description;
+                    return (
                     <button
                       key={a.name}
                       onClick={() => setSelectedAgent(a.name)}
@@ -226,14 +237,15 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
                       }`}
                     >
                       <div className="font-medium text-xs flex items-center gap-1.5">
-                        <span>{a.name}</span>
+                        <span>{cnName}</span>
                         {a.pattern_type && (
                           <span className="text-[9px] px-1.5 py-0.5 rounded bg-purple-600/20 text-purple-400">集群协作</span>
                         )}
                       </div>
-                      {a.description && <div className="text-[11px] text-gray-500 mt-0.5 line-clamp-2">{a.description}</div>}
+                      {cnDesc && <div className="text-[11px] text-gray-500 mt-0.5 line-clamp-2">{cnDesc}</div>}
                     </button>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -250,7 +262,26 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
               </div>
             </div>
 
-            {/* Create Button */}
+            {/* ── 共享浏览器协作开关 ── */}
+            <div className="flex items-center justify-between p-3 rounded-xl border border-gray-800 bg-gray-900/60">
+              <div>
+                <div className="text-xs font-medium text-gray-300">共享浏览器协作</div>
+                <div className="text-[10px] text-gray-600 mt-0.5">
+                  AI 可在对话中调用共享协作浏览器（登录态持久化，仅本会话生效）
+                </div>
+              </div>
+              <button
+                onClick={() => setBrowserCollab(b => !b)}
+                className={`relative w-10 h-6 rounded-full transition-colors flex-shrink-0 ${browserCollab ? 'bg-blue-600' : 'bg-gray-700'}`}
+                role="switch"
+                aria-checked={browserCollab}
+              >
+                <span
+                  className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ${browserCollab ? 'translate-x-4' : ''}`}
+                />
+              </button>
+            </div>
+
             <button
               onClick={handleCreate}
               disabled={

@@ -10,14 +10,15 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import sys
 from importlib.metadata import entry_points
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -40,6 +41,7 @@ from baize.agents.guardrails import (
     GuardrailRule,
     GuardrailSettings,
     GuardrailStore,
+    SSRFGuardrailSettings,
     check_input_guardrail,
     test_guardrail,
     validate_guardrail_config,
@@ -50,6 +52,8 @@ from baize.receivers.manager import ReceiverManager
 from baize.receivers.webhook import handle_webhook
 from baize.sdk.client import LLMClient, ModelNotConfiguredError, ChatMessage
 from baize.tools.custom_tools import test_custom_tool
+from baize.tools.extended import _check_url_allowed
+from baize.tools.shared_browser import get_shared_browser
 from baize.experiences import (
     GLOBAL_SCOPE,
     EmbeddingConfig,
@@ -98,6 +102,7 @@ class CreateSessionRequest(BaseModel):
     model: Optional[str] = None
     stateful: bool = True
     pattern: Optional[str] = None
+    browser_collab: bool = False
 
 
 class MessageRequest(BaseModel):
@@ -193,10 +198,25 @@ class CustomToolTestRequest(BaseModel):
     timeout: Optional[int] = 60
 
 
+class SSRFGuardrailSettingsRequest(BaseModel):
+    """SSRF 护栏配置（运行时即时生效，JSON 持久化）。"""
+
+    enabled: bool = True
+    block_private: bool = True
+    block_loopback: bool = True
+    block_link_local: bool = True
+    block_reserved: bool = True
+    block_multicast: bool = True
+    block_unspecified: bool = True
+    allowlist_cidrs: list[str] = Field(default_factory=list)
+    allowlist_hosts: list[str] = Field(default_factory=list)
+
+
 class GuardrailSettingsRequest(BaseModel):
     input_enabled: bool = True
     output_enabled: bool = False
     max_input_length: int = 16384
+    ssrf: SSRFGuardrailSettingsRequest = Field(default_factory=SSRFGuardrailSettingsRequest)
 
 
 class GuardrailRuleRequest(BaseModel):
@@ -218,6 +238,44 @@ class GuardrailConfigRequest(BaseModel):
 class GuardrailTestRequest(BaseModel):
     text: str
     kind: str = "input"
+
+
+class SharedBrowserOpenRequest(BaseModel):
+    url: str = Field(..., description="要打开的 URL")
+
+
+class SharedBrowserClickRequest(BaseModel):
+    """按视口坐标点击共享浏览器页面（前端截图交互层映射后的坐标）。"""
+
+    x: float = Field(..., ge=0, description="视口 X 坐标")
+    y: float = Field(..., ge=0, description="视口 Y 坐标")
+    button: str = Field("left", description="鼠标按键: left/right/middle")
+    click_count: int = Field(1, ge=1, le=3, description="点击次数（2 为双击）")
+
+
+class SharedBrowserTypeRequest(BaseModel):
+    """向共享浏览器当前聚焦元素输入文本。"""
+
+    text: str = Field(..., description="要输入的文本")
+
+
+class SharedBrowserKeyRequest(BaseModel):
+    """在共享浏览器中按下指定按键。"""
+
+    key: str = Field(..., description="Playwright 键名，如 Enter/Tab/Backspace/Escape/ArrowUp")
+
+
+class SharedBrowserScrollRequest(BaseModel):
+    """滚动共享浏览器当前页面。"""
+
+    delta_x: float = Field(0, description="水平滚动量")
+    delta_y: float = Field(0, description="垂直滚动量")
+
+
+class SharedBrowserNavRequest(BaseModel):
+    """共享浏览器导航动作。"""
+
+    action: str = Field(..., description="back / forward / reload")
 
 
 # ----------------------------------------------------------------------
@@ -446,6 +504,208 @@ def create_baize_api_app(
     def modules_list() -> dict:
         """返回已安装并可用的模块列表。前端据此动态显示/隐藏功能。"""
         return {"modules": app.state.loaded_modules}
+
+    # ------------------------------------------------------------------
+    # 共享协作浏览器（人机共用可视化浏览器）
+    # ------------------------------------------------------------------
+
+    @app.get(
+        "/api/v1/shared-browser/status",
+        dependencies=[Depends(_require_api_key)],
+    )
+    def shared_browser_status() -> dict:
+        """查询共享浏览器状态（是否运行 / headless / 当前 URL）。"""
+        return get_shared_browser().status()
+
+    @app.post(
+        "/api/v1/shared-browser/open",
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def shared_browser_open(payload: SharedBrowserOpenRequest) -> dict:
+        """在共享浏览器中打开指定 URL（SSRF 校验后导航）。"""
+        url = payload.url.strip()
+        try:
+            _check_url_allowed(url, allow_internal=False)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"URL 校验失败: {exc}")
+        try:
+            result = await get_shared_browser().open(url)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"打开共享浏览器失败: {exc}")
+        return {"ok": True, "result": result}
+
+    @app.post(
+        "/api/v1/shared-browser/confirm",
+        dependencies=[Depends(_require_api_key)],
+    )
+    def shared_browser_confirm() -> dict:
+        """人工确认放行（唤醒 shared_browser_wait_user，用于扫码登录后继续）。"""
+        get_shared_browser().confirm()
+        return {"ok": True, "message": "已发送人工确认信号"}
+
+    @app.get(
+        "/api/v1/shared-browser/snapshot",
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def shared_browser_snapshot() -> Response:
+        """返回共享浏览器当前页面的 PNG 截图（前端面板轮询展示）。"""
+        image = await get_shared_browser().snapshot()
+        if image is None:
+            raise HTTPException(status_code=409, detail="共享浏览器未启动或窗口不可用")
+        return Response(content=image, media_type="image/png")
+
+    @app.post(
+        "/api/v1/shared-browser/click",
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def shared_browser_click(payload: SharedBrowserClickRequest) -> dict:
+        """按视口坐标点击（前端截图交互层把屏幕坐标映射为页面坐标后调用）。"""
+        try:
+            result = await get_shared_browser().click_viewport(
+                payload.x, payload.y, button=payload.button, click_count=payload.click_count
+            )
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"点击失败: {exc}")
+        return {"ok": True, "result": result}
+
+    @app.post(
+        "/api/v1/shared-browser/type",
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def shared_browser_type(payload: SharedBrowserTypeRequest) -> dict:
+        """向当前聚焦元素输入文本。"""
+        try:
+            result = await get_shared_browser().type_text(payload.text)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"输入失败: {exc}")
+        return {"ok": True, "result": result}
+
+    @app.post(
+        "/api/v1/shared-browser/key",
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def shared_browser_key(payload: SharedBrowserKeyRequest) -> dict:
+        """按下指定按键。"""
+        try:
+            result = await get_shared_browser().press_key(payload.key)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"按键失败: {exc}")
+        return {"ok": True, "result": result}
+
+    @app.post(
+        "/api/v1/shared-browser/scroll",
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def shared_browser_scroll(payload: SharedBrowserScrollRequest) -> dict:
+        """滚动当前页面。"""
+        try:
+            result = await get_shared_browser().scroll(payload.delta_x, payload.delta_y)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"滚动失败: {exc}")
+        return {"ok": True, "result": result}
+
+    @app.post(
+        "/api/v1/shared-browser/nav",
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def shared_browser_nav(payload: SharedBrowserNavRequest) -> dict:
+        """浏览器后退/前进/刷新。"""
+        try:
+            result = await get_shared_browser().nav(payload.action)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail=f"导航失败: {exc}")
+        return {"ok": True, "result": result}
+
+    @app.post(
+        "/api/v1/shared-browser/close",
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def shared_browser_close() -> dict:
+        """关闭共享浏览器（保留登录态）。"""
+        result = await get_shared_browser().close()
+        return {"ok": True, "result": result}
+
+    # ---- 共享浏览器 CDP 实时帧流 + 输入注入（WebSocket 双向）----------
+    async def _require_ws_api_key(ws: WebSocket) -> bool:
+        """WebSocket 鉴权：query `token` 或 `X-Baize-API-Key` 头。失败 close(4401)。"""
+        if not ws.app.state.require_auth:
+            return True
+        token = ws.query_params.get("token") or ws.headers.get("x-baize-api-key")
+        if not ws.app.state.auth_manager.validate_token(token or ""):
+            await ws.close(code=4401)
+            return False
+        return True
+
+    async def _sb_dispatch(
+        sb: Any, msg: dict, send_frame: Any, send_status: Any
+    ) -> None:
+        """按 msg.t 路由到共享浏览器的输入注入/导航方法。"""
+        t = msg.get("t")
+        if t == "open":
+            await sb.open(str(msg.get("url", "")))
+            if not sb.is_streaming():
+                await sb.start_stream(send_frame, send_status)
+            await send_status()
+        elif t == "nav":
+            await sb.nav(str(msg.get("action", "reload")))
+            await send_status()
+        elif t == "close":
+            await sb.close()
+            await send_status()
+        elif t == "confirm":
+            sb.confirm()
+        elif t == "mouseMove":
+            await sb.input_mouse_move(float(msg["x"]), float(msg["y"]))
+        elif t == "mouseDown":
+            await sb.input_mouse_down(float(msg["x"]), float(msg["y"]), msg.get("button", "left"), int(msg.get("clickCount", 1)))
+        elif t == "mouseUp":
+            await sb.input_mouse_up(float(msg["x"]), float(msg["y"]), msg.get("button", "left"), int(msg.get("clickCount", 1)))
+        elif t == "click":
+            await sb.input_click(float(msg["x"]), float(msg["y"]), msg.get("button", "left"), int(msg.get("count", 1)))
+        elif t == "wheel":
+            await sb.input_wheel(float(msg.get("dx", 0)), float(msg.get("dy", 0)))
+        elif t == "key":
+            await sb.input_key(str(msg["key"]))
+        elif t == "type":
+            await sb.input_type(str(msg.get("text", "")))
+            logger.debug(f"[ws] type received: {msg.get('text', '')[:20]!r}")
+
+    @app.websocket("/api/v1/shared-browser/stream")
+    async def shared_browser_stream(ws: WebSocket) -> None:
+        """CDP 实时帧流（下行）+ 输入事件注入（上行）双向 WebSocket。
+
+        鉴权：query `token` 或 `X-Baize-API-Key` 头。
+        下行：`{t:"frame",d:base64jpeg,w,h}` / `{t:"status",...}` / `{t:"error",msg}`。
+        上行：open/nav/close/confirm/mouseMove/mouseDown/mouseUp/click/wheel/key/type。
+        """
+        if not await _require_ws_api_key(ws):
+            return
+        await ws.accept()
+        sb = get_shared_browser()
+
+        async def _send_frame(data: bytes, w: int, h: int) -> None:
+            await ws.send_json({"t": "frame", "d": base64.b64encode(data).decode(), "w": w, "h": h})
+
+        async def _send_status() -> None:
+            await ws.send_json({"t": "status", **sb.status()})
+
+        try:
+            await _send_status()
+            if sb.is_running() and not sb.is_streaming():
+                await sb.start_stream(_send_frame, _send_status)
+            while True:
+                msg = await ws.receive_json()
+                await _sb_dispatch(sb, msg, _send_frame, _send_status)
+        except WebSocketDisconnect:
+            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("shared-browser stream ws error: %s", exc)
+            try:
+                await ws.send_json({"t": "error", "msg": str(exc)})
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            await sb.stop_stream()
 
     # ------------------------------------------------------------------
     # 模型配置（单模型）
@@ -795,6 +1055,7 @@ def create_baize_api_app(
             model=payload.model,
             stateful=payload.stateful,
             pattern=payload.pattern,
+            browser_collab=payload.browser_collab,
         )
         return session.to_dict()
 
@@ -853,6 +1114,20 @@ def create_baize_api_app(
             raise HTTPException(status_code=404, detail="会话不存在")
         model = (payload.get("model") or "").strip()
         app.state.session_manager.set_model(session_id, model)
+        updated = app.state.session_manager.get_session(session_id)
+        return {"session": updated.to_dict()}
+
+    @app.patch(
+        "/api/v1/sessions/{session_id}/browser-collab",
+        dependencies=[Depends(_require_api_key)],
+    )
+    def toggle_session_browser_collab(session_id: str, payload: dict) -> dict:
+        session = app.state.session_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        app.state.session_manager.set_browser_collab(
+            session_id, bool(payload.get("enabled", False))
+        )
         updated = app.state.session_manager.get_session(session_id)
         return {"session": updated.to_dict()}
 
@@ -1006,6 +1281,16 @@ def create_baize_api_app(
         ] if requested_ids else session_attachments
         # 附件访问工具（绑定当前会话）
         extra_tools = attachment_tools(attachment_store, session_id)
+        # 判断节点：仅当会话开启浏览器协作时才注入共享浏览器工具，
+        # 避免 AI 在普通对话中胡乱调用浏览器导致 token 消耗
+        if getattr(session, "browser_collab", False):
+            from baize.tools.registry import registry
+
+            extra_tools.extend(
+                spec.to_agent_tool()
+                for spec in registry.all()
+                if spec.name.startswith("shared_browser_")
+            )
         # 多模态 user 消息（图片注入 content_parts，其它注入附件提示）
         user_chat_message = build_user_message(
             payload.input,
@@ -1301,11 +1586,23 @@ def create_baize_api_app(
         dependencies=[Depends(_require_api_key)],
     )
     def update_guardrails(payload: GuardrailConfigRequest) -> dict:
+        ssrf_req = payload.settings.ssrf
         cfg = GuardrailConfig(
             settings=GuardrailSettings(
                 input_enabled=payload.settings.input_enabled,
                 output_enabled=payload.settings.output_enabled,
                 max_input_length=payload.settings.max_input_length,
+                ssrf=SSRFGuardrailSettings(
+                    enabled=ssrf_req.enabled,
+                    block_private=ssrf_req.block_private,
+                    block_loopback=ssrf_req.block_loopback,
+                    block_link_local=ssrf_req.block_link_local,
+                    block_reserved=ssrf_req.block_reserved,
+                    block_multicast=ssrf_req.block_multicast,
+                    block_unspecified=ssrf_req.block_unspecified,
+                    allowlist_cidrs=list(ssrf_req.allowlist_cidrs or []),
+                    allowlist_hosts=list(ssrf_req.allowlist_hosts or []),
+                ),
             ),
             rules=[GuardrailRule(**r.model_dump()) for r in payload.rules],
         )
@@ -1703,10 +2000,13 @@ def _print_credentials(app: FastAPI, cfg) -> None:
 
         lines = [
             f"\n{separator}",
-            "  白泽·智脑 (Baize) 登录凭证沿用首次启动时生成的密码/Token。",
+            "  白泽·智脑 (Baize) 认证模式：沿用已存在的 admin 用户。",
             f"  用户名:   {username}",
-            f"  如需重置，删除认证文件 {AUTH_DB_FILE} 后重启，",
-            "  或设置环境变量 BAIZE_AUTH_RESET_ON_BOOT=1。",
+            "  注意: 沿用模式下明文密码不可回溯（仅保存 PBKDF2 哈希），",
+            "  若忘记原密码或需要新凭证，请执行以下任一方式重置：",
+            f"    1) 删除认证文件 {AUTH_DB_FILE} 后重启；",
+            "    2) 启动前设置环境变量 BAIZE_AUTH_RESET_ON_BOOT=1。",
+            "  重置后将在此处打印新的用户名/密码/Token。",
             f"{separator}\n",
         ]
     sys.stdout.write("\n".join(lines))

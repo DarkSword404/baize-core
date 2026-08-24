@@ -1,12 +1,12 @@
 """web_bounty_agent — 白泽·智脑智能体模块。
 
 Prompt: ``system_web_bounty_agent.md``
-Tools: ['generic_linux_command', 'http_request', 'make_web_search_with_explanation', 'think']
+Tools: ['generic_linux_command', 'http_request', 'make_web_search_with_explanation', 'think', 'shared_browser_open', 'shared_browser_wait_user', 'shared_browser_snapshot', 'shared_browser_click', 'shared_browser_fill', 'shared_browser_evaluate', 'shared_browser_status', 'shared_browser_close']
 """
 
 from __future__ import annotations
 
-from baize.prompts_util import get_agent_instructions
+from baize.prompts_util import get_agent_instructions, extract_display_name_and_desc
 from baize.sdk.agent import Agent
 from baize.tools import extended_tools
 
@@ -15,33 +15,23 @@ AGENT_KEY = "web_bounty_agent"
 # ── 提示词 ─────────────────────────────────────────────────────────
 _instructions = get_agent_instructions(AGENT_KEY)
 
-# ── 从提示词提取 display name ────────────────────────────────────
-_display_name = "Web Bounty Agent"
-_display_desc = "Web 漏洞赏金 (变体) — 在规则框架内自主进行 Web 安全狩猎，严格遵循赏金计划范围"
+# ── 从提示词提取 display name(智能跳过 Baize layering 头部注入) ──
+_display_name, _display_desc = extract_display_name_and_desc(_instructions, fallback_key="web_bounty_agent")
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "browser_click",
-        "browser_evaluate",
-        "browser_fetch",
-        "browser_fill",
-        "browser_screenshot",
-        "crt_sh_lookup",
-        "cve_lookup",
-        "dns_lookup",
-        "ffuf_fuzz",
         "generic_linux_command",
-        "hashid_detect",
         "http_request",
-        "httpx_probe",
-        "john_crack",
         "make_web_search_with_explanation",
-        "searchsploit",
-        "ssl_cert_check",
         "think",
-        "wafw00f_detect",
-        "whatweb_identify",
-        "whois_lookup",
+        "shared_browser_open",
+        "shared_browser_wait_user",
+        "shared_browser_snapshot",
+        "shared_browser_click",
+        "shared_browser_fill",
+        "shared_browser_evaluate",
+        "shared_browser_status",
+        "shared_browser_close",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

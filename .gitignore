@@ -13,8 +13,15 @@ node_modules/
 logs/
 *.log
 *.pid
+.baize-data/
 
 # 本地敏感配置（运行期生成，勿提交）
 api_auth.json
 api_auth.json.key
 *.key
+.env
+.env.*
+!*.env.example
+
+# 前端构建产物
+web/dist/

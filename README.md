@@ -8,7 +8,7 @@
 
 > 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
 
-[![Version](https://img.shields.io/badge/version-v1.5.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.6.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
@@ -24,7 +24,7 @@
 |---|---|---|
 | 🧠 | **多智能体协同** | 30+ 专业安全智能体，按需调度、协同作战 |
 | 🔌 | **LLM 无关** | 兼容 OpenAI / DeepSeek / 通义千问 / Ollama 等 OpenAI 协议端点，模型热切换 |
-| 🛠️ | **工具调用** | 内置 45+ 工具（29 个安全专用 + 5 个浏览器自动化），智能体自主调用 |
+| 🛠️ | **工具调用** | 内置 50+ 工具（29 个安全专用 + 5 个静默浏览器 + 8 个共享协作浏览器），智能体自主调用 |
 | 🔌 | **标准 Tool 协议（v1.4.0）** | `ToolSpec` + `@register_tool` 动态注册，entry point 插件自动发现，无需改源码 |
 | 🧠 | **模型层抽象（v1.4.0）** | `BaseChatModel` / `ModelRouter` 多模型路由 + 失败 fallback，任意 OpenAI 兼容端点 |
 | 🧩 | **Agent 扩展（v1.4.0）** | `state` 运行时状态、`memory` 记忆注入、`hooks` 瀑布式事件链 |
@@ -61,7 +61,7 @@
 ### 安装
 
 ```bash
-cd baize-core-v1.5.0
+cd baize-core-v1.6.0
 ./setup.sh    # 创建虚拟环境 + 安装 baize-core + 构建前端
 ```
 
@@ -184,6 +184,56 @@ Web 端「护栏」页可查看、开关各项策略；策略文件位于 `promp
 
 ---
 
+## 🌐 双浏览器体系（v1.6.0）
+
+Baize 提供**两套相互独立的浏览器工具**，按场景选用：
+
+### 🕹️ 共享协作浏览器 `shared_browser_*` — 人机共用、可视化
+
+面向**需要登录 / 验证码 / 人工确认**的目标（如渗透测试登录后扫描）：
+
+- **有头可视化**：默认以有头模式启动 Chromium（窗口可见），人工可直接在桌面上
+  观察并操作**同一窗口**（扫码登录、输入验证码、绕过验证、点击确认）
+- **登录态持久化**：`launch_persistent_context` + 固定 `user_data_dir`
+  （默认 `~/.baize/shared-browser-profile`），Cookie / LocalStorage 跨会话保留 ——
+  人工登录一次，AI 后续操作全部复用登录态
+- **人工介入工具**：`shared_browser_wait_user` 让 AI 打开登录页后**阻塞等待**，
+  可配置 `success_url_prefix` 检测登录成功跳转自动放行，或由前端面板
+  「共享浏览器」页点击「我已完成」手动放行；超时后 AI 可再次调用续等
+- **🎮 实时可交互面板（v1.6.0）**：Web 端「共享浏览器」面板实时展示浏览器画面
+  （固定视口 1366×768，截图轮询），并支持**直接在面板内操作浏览器**——
+  点击 / 滚轮 / 键盘输入 / 前进后退刷新，交互坐标自动映射到浏览器视口；
+  亦可一键最大化面板获得更大视野，如同操作本地浏览器
+- **🔗 对话绑定（v1.6.0）**：共享浏览器与对话会话绑定，创建会话时开启
+  「共享浏览器协作」开关后，AI 才会注入 `shared_browser_*` 工具；
+  对话侧窗口实时展示浏览器状态，人工可随时放行 / 关闭
+- 无图形界面环境自动降级无头（可用 `BAIZE_SHARED_BROWSER_HEADLESS=1` 强制），
+  配合面板截图查看
+
+典型流程：`shared_browser_open(登录页)` → `shared_browser_wait_user("请扫码登录",
+success_url_prefix="https://target/console")` → 人工扫码 → AI 复用登录态继续。
+
+工具清单：`shared_browser_open` / `shared_browser_wait_user` / `shared_browser_snapshot` /
+`shared_browser_click` / `shared_browser_fill` / `shared_browser_evaluate` /
+`shared_browser_status` / `shared_browser_close`
+
+### 🤖 静默浏览器 `browser_*` — 无头、可中断、供流水线静默运行
+
+面向**无需人工介入**的自动化侦察（流水线无人值守场景）：
+
+- **无头静默**：每次调用独立 Chromium 实例，无窗口不打扰，用完即关
+- **可中断**：任务被取消 / 超时（单次工具 5 分钟上限）时，浏览器进程在后台
+  被可靠回收（`asyncio.shield` 保护清理），不泄漏、不阻塞流水线
+- **SSRF 防护**：禁止访问内网 / 保留地址（除非 `BAIZE_FETCH_ALLOW_INTERNAL=1`）
+
+工具清单：`browser_fetch` / `browser_screenshot` / `browser_click` /
+`browser_fill` / `browser_evaluate`
+
+> **依赖**：需安装 `playwright` 并执行 `playwright install chromium`。
+> 未安装时工具 fail-closed，返回明确提示。
+
+---
+
 ## 🔌 API 一览
 
 | 接口 | 方法 | 说明 |
@@ -197,6 +247,18 @@ Web 端「护栏」页可查看、开关各项策略；策略文件位于 `promp
 | `/api/v1/experiences` | GET/POST/DELETE | 经验系统（v1.3.0） |
 | `/api/v1/guardrails` | GET/PUT | 护栏策略（v1.3.0） |
 | `/api/v1/hook` | POST | 接收器 Webhook 入口 |
+| `/api/v1/shared-browser/status` | GET | 共享浏览器状态（v1.6.0，含视口信息） |
+| `/api/v1/shared-browser/open` | POST | 在共享浏览器打开 URL（SSRF 校验） |
+| `/api/v1/shared-browser/confirm` | POST | 人工确认放行（唤醒 wait_user） |
+| `/api/v1/shared-browser/snapshot` | GET | 共享浏览器实时截图（PNG） |
+| `/api/v1/shared-browser/click` | POST | 视口坐标点击（v1.6.0） |
+| `/api/v1/shared-browser/type` | POST | 输入文本（v1.6.0） |
+| `/api/v1/shared-browser/key` | POST | 按下按键（v1.6.0） |
+| `/api/v1/shared-browser/scroll` | POST | 滚动页面（v1.6.0） |
+| `/api/v1/shared-browser/nav` | POST | 前进 / 后退 / 刷新（v1.6.0） |
+| `/api/v1/shared-browser/close` | POST | 关闭共享浏览器（保留登录态） |
+| `/api/v1/sessions/{id}/browser-collab` | PATCH | 切换会话浏览器协作开关（v1.6.0） |
+| `/api/v1/guardrails` | GET/PUT | 护栏策略，新增 SSRF 防护运行时配置（v1.6.0） |
 
 ---
 
@@ -239,8 +301,7 @@ baize-core/
 ├── docs/                 # 文档（EXTENDING.md / PLUGIN_MARKET.md）
 ├── examples/             # 插件示例（security-tools-plugin）
 ├── setup.sh              # 环境安装
-├── start.sh / stop.sh    # 启停脚本
-└── update.sh             # 更新脚本
+└── start.sh / stop.sh    # 启停脚本
 ```
 
 ### 扩展开发
@@ -259,7 +320,8 @@ baize-core/
 - [x] **v1.3** 经验系统（长期记忆）+ 护栏 + 外部接收器
 - [x] **v1.4** 自定义工具系统 + Agent 稳定性优化
 - [x] **v1.5** 稳定性加固发布（LLM 调用重试、工具超时与异常隔离、空回复兜底）
-- [ ] **v1.6** 多智能体并行协作优化 + 外部威胁情报接入
+- [x] **v1.6** 共享浏览器与对话绑定 + 实时可交互浏览器面板 + SSRF 护栏配置
+- [ ] **v1.7** 多智能体并行协作优化 + 外部威胁情报接入
 
 ---
 
@@ -299,7 +361,29 @@ baize-core/
 
 ## 📝 更新日志
 
-### v1.5.0（当前）
+### v1.6.0（当前）
+
+- 🎮 **共享浏览器实时可交互面板**：Web「共享浏览器」面板从「截图查看」升级为**可实时操作**
+  ——固定视口 1366×768，前端截图轮询 + 透明交互层，点击 / 滚轮 / 键盘输入 / 前进后退刷新
+  全部坐标映射到浏览器视口，如同操作本地浏览器；支持一键最大化窗口
+- 🔗 **共享浏览器与对话绑定**：会话级 `browser_collab` 开关（创建会话时可选、对话内可随时切换），
+  仅当开关开启时 AI 才会注入 `shared_browser_*` 工具，避免无关会话乱调工具浪费 token；
+  对话侧窗口实时展示浏览器画面与状态
+- 🖱️ **共享浏览器交互 API**：新增 `/api/v1/shared-browser/click`、`/type`、`/key`、`/scroll`、
+  `/nav` 五个端点，`status` 暴露视口尺寸供前端坐标映射
+- 🛡️ **SSRF 护栏运行时配置**：`SSRFGuardrailSettings` 支持按会话启用 / 关闭 SSRF 防护，
+  细粒度控制私网 / 回环 / 链路本地 / 保留 / 组播 / 未指定地址阻断与 CIDR / 域名白名单，
+  即时生效并 JSON 持久化；前端「护栏」页新增 SSRF 防护配置面板
+- 📁 **数据目录可配置**：`BAIZE_DATA_DIR` 环境变量统一重定向 sessions / 自定义工具 / 附件 /
+  model.json / guardrails.json 等派生数据目录，`BAIZE_AUTH_DB` 单独指定认证库路径，
+  适配沙箱等受限环境
+- 🌐 **双浏览器语义强化**：静默浏览器 `browser_*` 与共享协作浏览器 `shared_browser_*`
+  明确分离（无头独立实例 vs 有头持久化），后台清理任务防泄漏、不阻塞流水线
+- 🧩 **Agent 提示词与护栏增强**：多智能体系统提示词对齐 v1.6 能力；护栏默认值随
+  `BAIZE_FETCH_ALLOW_INTERNAL` 环境联动
+- 🚀 **升级**：版本号统一为 1.6.0（后端 `__version__` / 前端 `package.json` / 脚本 / 文档）
+
+### v1.5.0
 
 - 🔒 **LLM 调用异常捕获与指数退避重试**：网络抖动 / 超时 / 限流(429) / HTTP 5xx 等临时故障自动重试（1s → 2s，最多 2 次）；404 / 401 / 400 等配置类错误不重试、直接暴露诊断，避免配置损坏时反复无效请求。覆盖非流式工具循环与 SSE 流式主路径（流式仅连接阶段可安全重试，中途断流不重放，防止重复内容）
 - 🛡️ **工具执行超时保护**：单次工具调用超 5 分钟即中止并返回超时提示，网络卡住 / subprocess 阻塞等挂起工具不再拖死整轮对话
@@ -313,6 +397,14 @@ baize-core/
   `baize.modules` entry point 自动加载已安装扩展模块（`pip install baize-orchestration` 即接入）；
   会话绑定流水线时自动走 orchestration runner（提交 run → SSE 事件转发为
   `pipeline_step` / `user_prompt` 审批 / 文本 delta / done），支持人工确认后 `resume_after_confirm`
+- 🌐 **双浏览器体系**：
+  - 🕹️ **共享协作浏览器 `shared_browser_*`**（新增）：有头持久化、人机共用的可视化浏览器，
+    AI 打开登录页后可用 `shared_browser_wait_user` 阻塞等待人工扫码 / 验证码，登录态
+    （Cookie / LocalStorage）跨会话持久化，人工登录一次 AI 全程复用；Web 端「共享浏览器」
+    面板实时截图 + 人工确认放行
+  - 🤖 **静默浏览器 `browser_*`**（增强）：明确无头静默语义、每次独立实例供流水线
+    无人值守运行；任务中断 / 超时后浏览器进程后台可靠回收（`asyncio.shield` 保护），
+    不泄漏进程、不阻塞流水线
 - 🚀 **升级**：版本号统一为 1.5.0（后端 / 前端 / 脚本 / 文档）
 
 ### v1.4.0
@@ -397,6 +489,6 @@ baize-core/
 
 **白泽·智脑 (Baize)** · 仅供安全研究与授权测试使用
 
-[![Version](https://img.shields.io/badge/version-v1.5.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.6.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
 
 </div>

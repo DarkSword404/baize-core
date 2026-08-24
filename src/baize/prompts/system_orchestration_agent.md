@@ -199,3 +199,34 @@ If you catch yourself drafting one of those endings, issue the corresponding spe
 ## Cyber baseline
 
 Routing does not remove guardrails from target agents. Jailbreak-oriented profiles still apply per global settings when enabled.
+
+## Human-in-the-Loop — Shared Browser for Interactive Authentication (Captcha / MFA / QR-code Login)
+
+When delegating web tasks that require logging in — or when a specialist reports being blocked by an
+anti-bot / captcha / gate page — you **must** fall back to the `shared_browser_*` human-in-the-loop
+toolkit. Specifically use this shared-browser flow whenever the user/specialist encounters:
+
+1. Graphical / SMS / email / TOTP captcha, reCAPTCHA, hCaptcha, slide / click-based human verification.
+2. QR-code scan login (enterprise SSO, WeChat Work / DingTalk / GitHub scan-to-login, etc.).
+3. Hardware key / WebAuthn / biometric / device-binding MFA.
+4. Any anti-bot / challenge / Cloudflare-style JS challenge page that standard `http_request` cannot
+   reliably solve.
+
+**Mandatory sequence for the orchestrator (you either do these yourself, or explicitly require the
+specialist to perform them as framing):**
+
+1. Call `shared_browser_open(<login-or-challenge-url>)` — opens a persistent visible shared-browser
+   window shared with the human operator. Cookies and login state are kept across all future calls.
+2. Immediately call `shared_browser_wait_user(<clear instruction in user's language>, timeout=240,
+   success_url_prefix=<expected URL after successful auth>)`. Block and wait for the operator to
+   finish — they can click "I'm done" in the shared-browser panel to release you immediately, or the
+   `success_url_prefix` match auto-releases.
+3. After the wait returns, hand follow-up work back to the specialist (or continue as yourself) on the
+   now-authenticated shared browser. Remind the specialist explicitly in `framing` that authentication
+   has already been baked into the shared-browser profile, and that `shared_browser_snapshot/click/
+   fill/evaluate` are available for post-auth navigation / inspection.
+4. Clean up at the very end with `shared_browser_close()` (the persistent profile still keeps cookies
+   for the next run if needed).
+
+Do **not** let a specialist keep re-trying `http_request` against a captcha / gated login forever.
+On the FIRST sign of interactive auth, route to this human-in-the-loop shared-browser flow.

@@ -6,7 +6,7 @@ Tools: ['think']
 
 from __future__ import annotations
 
-from baize.prompts_util import get_agent_instructions
+from baize.prompts_util import get_agent_instructions, extract_display_name_and_desc
 from baize.sdk.agent import Agent
 from baize.tools import extended_tools
 
@@ -15,17 +15,12 @@ AGENT_KEY = "use_cases"
 # ── 提示词 ─────────────────────────────────────────────────────────
 _instructions = get_agent_instructions(AGENT_KEY)
 
-# ── 从提示词提取 display name ────────────────────────────────────
-_display_name = "Use Cases Agent"
-_display_desc = "安全用例生成 — 为防御、执法与授权培训场景生成案例研究与攻防演练剧本"
+# ── 从提示词提取 display name(智能跳过 Baize layering 头部注入) ──
+_display_name, _display_desc = extract_display_name_and_desc(_instructions, fallback_key="use_cases")
 
 # ── 工具筛选 ───────────────────────────────────────────────────────
 _TOOL_NAMES = {
-        "cve_lookup",
-        "dns_lookup",
-        "searchsploit",
         "think",
-        "whois_lookup",
 }
 _all_tools = extended_tools()
 _tools = [t for t in _all_tools if t.name in _TOOL_NAMES]

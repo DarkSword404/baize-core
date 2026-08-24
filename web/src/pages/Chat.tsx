@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef } from 'react';
 import { useApp } from '../context/AppContext';
-import { listSessions, getSession, deleteSession, streamMessage, cancelSession, listAgents, respondToPrompt, uploadAttachment, deleteAttachment, refineSessionExperience, createExperience } from '../api/client';
+import { listSessions, getSession, deleteSession, streamMessage, cancelSession, listAgents, respondToPrompt, uploadAttachment, deleteAttachment, refineSessionExperience, createExperience, switchSessionBrowserCollab } from '../api/client';
+import { BrowserPanel } from './Browser';
 import type { PromptRequest, ReasoningStep, AttachmentInfo, ExperienceSignal } from '../api/client';
 import { ChatMessage } from '../components/ChatMessage';
 import { CreateSessionModal } from '../components/CreateSessionModal';
 import type { ChatMessage as ChatMessageType, IntermediateData } from '../types';
+import { agentNameCN, toolNameCN } from '../i18n/translations';
 import type { JSX } from 'react';
 
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
@@ -49,7 +51,8 @@ function buildChatMessage(h: any, fallbackTimestamp: string): ChatMessageType | 
 
   // 工具调用
   if (itemType === 'function_call') {
-    const toolName = h.name || '工具';
+    const rawTool = h.name || '工具';
+    const toolName = toolNameCN[rawTool] || rawTool;
     const args = formatArguments(h.arguments);
     return {
       id: genId(),
@@ -140,7 +143,7 @@ export function Chat(): JSX.Element {
   const {
     sessions, setSessions, activeSessionId, setActiveSessionId,
     messages, setMessages, isStreaming, setIsStreaming,
-    addToast, setAgents, removeSession,
+    addToast, setAgents, removeSession, updateSession,
   } = useApp();
 
   const [input, setInput] = useState('');
@@ -170,6 +173,8 @@ export function Chat(): JSX.Element {
 
   // Reasoning timeline panel
   const [reasoningPanelOpen, setReasoningPanelOpen] = useState(false);
+  // Shared browser side panel (bound to current session)
+  const [browserPanelOpen, setBrowserPanelOpen] = useState(false);
 
   // Multi-agent tracking
   const [currentAgent, setCurrentAgent] = useState<string | null>(null);
@@ -232,6 +237,26 @@ export function Chat(): JSX.Element {
   }
 
   const activeSession = sessions.find(s => s.id === activeSessionId);
+
+  /** 切换当前会话的浏览器协作开关（后端据此决定是否注入 shared_browser_* 工具） */
+  async function handleToggleBrowserCollab() {
+    if (!activeSessionId || !activeSession) return;
+    const next = !activeSession.browser_collab;
+    try {
+      await switchSessionBrowserCollab(activeSessionId, next);
+      updateSession(activeSessionId, { browser_collab: next });
+      setBrowserPanelOpen(prev => next || prev);
+      addToast({
+        type: 'success',
+        title: next ? '已开启浏览器协作' : '已关闭浏览器协作',
+        message: next
+          ? 'AI 现在可在对话中调用共享浏览器（登录态持久化）'
+          : 'AI 将不再调用共享浏览器',
+      });
+    } catch (err: any) {
+      addToast({ type: 'error', title: '切换失败', message: err.message });
+    }
+  }
 
   async function handleSelectSession(id: string) {
     setActiveSessionId(id);
@@ -386,12 +411,14 @@ export function Chat(): JSX.Element {
           return;
         }
         if (step.type === 'tool_call') {
+          const rawTool = step.tool || '';
+          const label = toolNameCN[rawTool] || rawTool || '未知工具';
           const argsStr = typeof step.arguments === 'string'
             ? step.arguments
             : JSON.stringify(step.arguments || {}, null, 2);
           intermediate = {
             itemType: 'function_call',
-            label: step.tool || 'unknown',
+            label,
             detail: argsStr,
           };
         } else if (step.type === 'tool_output') {
@@ -400,18 +427,21 @@ export function Chat(): JSX.Element {
             : JSON.stringify(step.output || '', null, 2);
           intermediate = {
             itemType: 'function_call_output',
-            label: 'output',
+            label: '工具输出',
             detail: outStr,
           };
         } else if (step.type === 'handoff' || step.type === 'agent_switched') {
+          const cnFrom = step.from_agent ? (agentNameCN[step.from_agent] || step.from_agent) : '?';
+          const cnTo = step.to_agent ? (agentNameCN[step.to_agent] || step.to_agent) : '?';
+          const cnAgent = step.agent ? (agentNameCN[step.agent] || step.agent) : '已切换';
           intermediate = {
             itemType: 'handoff',
             label: step.type === 'handoff'
-              ? `${step.from_agent || '?'} → ${step.to_agent || '?'}`
-              : step.agent || 'switched',
+              ? `${cnFrom} → ${cnTo}`
+              : cnAgent,
             detail: step.type === 'handoff'
-              ? `Handoff from ${step.from_agent || '?'} to ${step.to_agent || '?'}`
-              : `Agent switched to ${step.agent || 'unknown'}`,
+              ? `从 ${cnFrom} 切换到 ${cnTo}`
+              : `智能体已切换到 ${cnAgent}`,
           };
           // Track current agent
           if (step.type === 'agent_switched' && step.agent) {
@@ -726,6 +756,15 @@ export function Chat(): JSX.Element {
                     {activeSession.model || '未配置模型'}
                   </span>
                   <span>· {activeSession.history_length} 条消息</span>
+                  {activeSession.browser_collab && (
+                    <button
+                      onClick={handleToggleBrowserCollab}
+                      title="点击关闭浏览器协作（AI 将不再调用共享浏览器）"
+                      className="px-1.5 py-0.5 rounded bg-blue-600/10 text-blue-400 hover:bg-blue-600/20 flex-shrink-0 cursor-pointer"
+                    >
+                      浏览器协作 · 开
+                    </button>
+                  )}
                   {activeSession.pattern && activeSession.agent_stack && activeSession.agent_stack.length > 1 && (
                     <span className="text-purple-500">
                       {' · '}{activeSession.agent_stack.join(' → ')}
@@ -761,6 +800,17 @@ export function Chat(): JSX.Element {
                 title="推理过程时间线"
               >
                 {allSteps.length > 0 ? `推理 (${allSteps.length})` : '推理'}
+              </button>
+              <button
+                onClick={() => setBrowserPanelOpen(!browserPanelOpen)}
+                className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+                  browserPanelOpen
+                    ? 'bg-blue-600/10 border-blue-600/20 text-blue-400'
+                    : 'bg-gray-800/50 border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
+                }`}
+                title="共享浏览器侧窗口（仅浏览器协作开启的会话可用）"
+              >
+                浏览器
               </button>
             </>
           ) : (
@@ -1069,6 +1119,13 @@ export function Chat(): JSX.Element {
               </div>
             )}
           </div>
+        </div>
+      )}
+
+      {/* ═══ 共享浏览器侧窗口（与当前会话绑定）═══ */}
+      {activeSessionId && (
+        <div className={`${browserPanelOpen ? 'w-96 min-w-[384px]' : 'w-0 min-w-0'} transition-all duration-200 overflow-hidden`}>
+          <BrowserPanel open={browserPanelOpen} onClose={() => setBrowserPanelOpen(false)} />
         </div>
       )}
 

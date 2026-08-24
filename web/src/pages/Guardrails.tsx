@@ -3,7 +3,7 @@ import { useApp } from '../context/AppContext';
 import {
   getGuardrails, updateGuardrails, resetGuardrails, testGuardrail,
 } from '../api/client';
-import type { GuardrailConfig, GuardrailRule, GuardrailTestResult } from '../types';
+import type { GuardrailConfig, GuardrailRule, GuardrailTestResult, SSRFGuardrailSettings } from '../types';
 import type { JSX } from 'react';
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -75,6 +75,34 @@ export function Guardrails(): JSX.Element {
 
   function patchSettings(patch: Partial<GuardrailConfig['settings']>) {
     setConfig(cfg => (cfg ? { ...cfg, settings: { ...cfg.settings, ...patch } } : cfg));
+  }
+
+  function patchSSRF(patch: Partial<SSRFGuardrailSettings>) {
+    setConfig(cfg => {
+      if (!cfg) return cfg;
+      return {
+        ...cfg,
+        settings: {
+          ...cfg.settings,
+          ssrf: { ...cfg.settings.ssrf, ...patch },
+        },
+      };
+    });
+  }
+
+  function toggleSSRFBlock(key: keyof SSRFGuardrailSettings) {
+    setConfig(cfg => {
+      if (!cfg) return cfg;
+      const current = cfg.settings.ssrf[key];
+      if (typeof current !== 'boolean') return cfg;
+      return {
+        ...cfg,
+        settings: {
+          ...cfg.settings,
+          ssrf: { ...cfg.settings.ssrf, [key]: !current },
+        },
+      };
+    });
   }
 
   function patchRule(id: string, patch: Partial<GuardrailRule>) {
@@ -226,6 +254,173 @@ export function Guardrails(): JSX.Element {
                 />
                 <p className="text-[10px] text-gray-600 mt-1">0 表示不限制长度。</p>
               </div>
+            </div>
+          </section>
+
+          {/* SSRF 防护 */}
+          <section className="bg-gray-900 border border-gray-800 rounded-2xl p-6 mb-6">
+            <h2 className="text-sm font-semibold mb-4 flex items-center gap-2">
+              <span className={`w-2 h-2 rounded-full ${config.settings.ssrf.enabled ? 'bg-emerald-400' : 'bg-red-400'}`} />
+              SSRF 防护（服务端请求伪造）
+            </h2>
+            <p className="text-xs text-gray-500 mb-4">
+              控制智能体工具（浏览器、HTTP 请求等）访问内网/保留地址的防护策略。
+              渗透测试需要访问内网时，可关闭总开关或添加白名单例外。
+            </p>
+
+            {/* SSRF 总开关 */}
+            <div className="flex items-center justify-between gap-3 mb-4 pb-4 border-b border-gray-800">
+              <div>
+                <label className="block text-xs text-gray-400 mb-1">SSRF 总开关</label>
+                <p className="text-[10px] text-gray-600">
+                  关闭后完全放行所有地址（包括内网/回环/保留地址），适合内网渗透场景。
+                </p>
+              </div>
+              <button
+                onClick={() => patchSSRF({ enabled: !config.settings.ssrf.enabled })}
+                className={`shrink-0 w-11 h-6 rounded-full transition-colors ${config.settings.ssrf.enabled ? 'bg-emerald-600' : 'bg-red-600'}`}
+                title={config.settings.ssrf.enabled ? 'SSRF 防护已开启' : 'SSRF 防护已关闭（全放行）'}
+              >
+                <span className={`block w-4 h-4 rounded-full bg-white transition-transform ${config.settings.ssrf.enabled ? 'translate-x-6' : 'translate-x-1'}`} />
+              </button>
+            </div>
+
+            {/* 6 个拦截维度 */}
+            {config.settings.ssrf.enabled && (
+              <div className="mb-4 pb-4 border-b border-gray-800">
+                <p className="text-xs text-gray-400 mb-2">拦截维度（精细控制）</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {([
+                    { key: 'block_private' as const, label: '私有地址', desc: '10.x / 172.16-31 / 192.168' },
+                    { key: 'block_loopback' as const, label: '回环地址', desc: '127.x / ::1' },
+                    { key: 'block_link_local' as const, label: '链路本地', desc: '169.254.x / fe80::' },
+                    { key: 'block_reserved' as const, label: '保留地址', desc: '未分配 IANA 保留地址' },
+                    { key: 'block_multicast' as const, label: '组播地址', desc: '224.x–239.x / ff00::' },
+                    { key: 'block_unspecified' as const, label: '未指定地址', desc: '0.0.0.0 / ::' },
+                  ] as const).map(({ key, label, desc }) => (
+                    <div key={key} className="flex items-center justify-between gap-2 px-3 py-2 bg-gray-800/50 rounded-lg">
+                      <div>
+                        <span className="text-xs text-gray-300">{label}</span>
+                        <span className="text-[10px] text-gray-600 ml-1.5">{desc}</span>
+                      </div>
+                      <button
+                        onClick={() => toggleSSRFBlock(key)}
+                        className={`shrink-0 w-8 h-5 rounded-full transition-colors ${config.settings.ssrf[key] ? 'bg-emerald-600' : 'bg-gray-600'}`}
+                      >
+                        <span className={`block w-3.5 h-3.5 rounded-full bg-white transition-transform ${config.settings.ssrf[key] ? 'translate-x-3.5' : 'translate-x-0.5'}`} />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* CIDR 白名单 */}
+            <div className="mb-4">
+              <label className="block text-xs text-gray-400 mb-1">
+                CIDR 白名单
+                <span className="text-gray-600 ml-1">（命中任一即放行，如 192.168.1.0/24、10.0.0.0/8）</span>
+              </label>
+              <div className="flex gap-2 mb-2">
+                <input
+                  type="text"
+                  id="new-cidr"
+                  placeholder="192.168.1.0/24"
+                  className={`${inputCls} flex-1`}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      const v = (e.target as HTMLInputElement).value.trim();
+                      if (v && !config.settings.ssrf.allowlist_cidrs.includes(v)) {
+                        patchSSRF({ allowlist_cidrs: [...config.settings.ssrf.allowlist_cidrs, v] });
+                        (e.target as HTMLInputElement).value = '';
+                      }
+                    }
+                  }}
+                />
+                <button
+                  onClick={() => {
+                    const inp = document.getElementById('new-cidr') as HTMLInputElement;
+                    const v = inp?.value?.trim();
+                    if (v && !config.settings.ssrf.allowlist_cidrs.includes(v)) {
+                      patchSSRF({ allowlist_cidrs: [...config.settings.ssrf.allowlist_cidrs, v] });
+                      inp.value = '';
+                    }
+                  }}
+                  className="px-3 py-2 text-xs bg-blue-600 hover:bg-blue-500 rounded-xl transition-colors shrink-0"
+                >
+                  添加
+                </button>
+              </div>
+              {config.settings.ssrf.allowlist_cidrs.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {config.settings.ssrf.allowlist_cidrs.map((cidr, idx) => (
+                    <span key={idx} className="inline-flex items-center gap-1 text-[10px] px-2 py-1 bg-gray-800 rounded-md text-gray-300">
+                      {cidr}
+                      <button
+                        onClick={() => patchSSRF({ allowlist_cidrs: config.settings.ssrf.allowlist_cidrs.filter((_, i) => i !== idx) })}
+                        className="text-red-400 hover:text-red-300 ml-0.5"
+                      >×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              {config.settings.ssrf.allowlist_cidrs.length === 0 && (
+                <p className="text-[10px] text-gray-600">暂无 CIDR 白名单</p>
+              )}
+            </div>
+
+            {/* Host 白名单 */}
+            <div>
+              <label className="block text-xs text-gray-400 mb-1">
+                Host 白名单
+                <span className="text-gray-600 ml-1">（如 .corp.example.com 匹配所有子域名）</span>
+              </label>
+              <div className="flex gap-2 mb-2">
+                <input
+                  type="text"
+                  id="new-host"
+                  placeholder=".internal.example.com"
+                  className={`${inputCls} flex-1`}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter') {
+                      const v = (e.target as HTMLInputElement).value.trim();
+                      if (v && !config.settings.ssrf.allowlist_hosts.includes(v)) {
+                        patchSSRF({ allowlist_hosts: [...config.settings.ssrf.allowlist_hosts, v] });
+                        (e.target as HTMLInputElement).value = '';
+                      }
+                    }
+                  }}
+                />
+                <button
+                  onClick={() => {
+                    const inp = document.getElementById('new-host') as HTMLInputElement;
+                    const v = inp?.value?.trim();
+                    if (v && !config.settings.ssrf.allowlist_hosts.includes(v)) {
+                      patchSSRF({ allowlist_hosts: [...config.settings.ssrf.allowlist_hosts, v] });
+                      inp.value = '';
+                    }
+                  }}
+                  className="px-3 py-2 text-xs bg-blue-600 hover:bg-blue-500 rounded-xl transition-colors shrink-0"
+                >
+                  添加
+                </button>
+              </div>
+              {config.settings.ssrf.allowlist_hosts.length > 0 && (
+                <div className="flex flex-wrap gap-1.5">
+                  {config.settings.ssrf.allowlist_hosts.map((host, idx) => (
+                    <span key={idx} className="inline-flex items-center gap-1 text-[10px] px-2 py-1 bg-gray-800 rounded-md text-gray-300">
+                      {host}
+                      <button
+                        onClick={() => patchSSRF({ allowlist_hosts: config.settings.ssrf.allowlist_hosts.filter((_, i) => i !== idx) })}
+                        className="text-red-400 hover:text-red-300 ml-0.5"
+                      >×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
+              {config.settings.ssrf.allowlist_hosts.length === 0 && (
+                <p className="text-[10px] text-gray-600">暂无 Host 白名单</p>
+              )}
             </div>
           </section>
 

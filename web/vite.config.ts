@@ -6,10 +6,11 @@ export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     proxy: {
-      '/api': {
-        target: process.env.BAIZE_API_TARGET || 'http://localhost:8001',
-        changeOrigin: true,
+        '/api': {
+          target: process.env.BAIZE_API_TARGET || 'http://localhost:8001',
+          changeOrigin: true,
+          ws: true,
+        },
       },
-    },
   },
 })

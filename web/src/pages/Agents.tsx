@@ -3,7 +3,7 @@ import { useApp } from '../context/AppContext';
 import { listAgents, deleteCustomAgent, deleteBuiltinAgent, createSession, streamMessage, getAgentDetail } from '../api/client';
 import type { ReasoningStep } from '../api/client';
 import type { AgentMetadata } from '../types';
-import { agentDescCN, toolDescCN } from '../i18n/translations';
+import { agentDescCN, toolDescCN, agentNameCN, toolNameCN } from '../i18n/translations';
 import type { JSX } from 'react';
 
 export function Agents(): JSX.Element {
@@ -111,7 +111,7 @@ export function Agents(): JSX.Element {
         // onStep (tool calls)
         (step: ReasoningStep) => {
           if (step.type === 'tool_call' && step.tool) {
-            const toolName = step.tool;
+            const toolName = toolNameCN[step.tool] || step.tool;
             setCreateLog(prev => [...prev, {
               role: 'tool',
               content: `🔧 调用工具: ${toolName}`,
@@ -138,7 +138,8 @@ export function Agents(): JSX.Element {
   const filtered = agents.filter(a => {
     if (!search) return true;
     const s = search.toLowerCase();
-    if (a.name.toLowerCase().includes(s)) return true;
+    const displayName = agentNameCN[a.name] || a.name;
+    if (displayName.toLowerCase().includes(s)) return true;
     if (a.description && a.description.toLowerCase().includes(s)) return true;
     if (agentDescCN[a.name] && agentDescCN[a.name].toLowerCase().includes(s)) return true;
     return false;
@@ -227,12 +228,12 @@ export function Agents(): JSX.Element {
                     {a.is_custom ? '自定义' : (a.type === 'pattern' ? '模式' : '预置')}
                   </span>
                 </div>
-                <h3 className="text-sm font-semibold mb-1">{a.name}</h3>
+                <h3 className="text-sm font-semibold mb-1">{agentNameCN[a.name] || a.name}</h3>
                 <p className="text-xs text-gray-500 line-clamp-2 mb-3">{agentDescCN[a.name] || a.description || '无描述'}</p>
                 {a.tools && a.tools.length > 0 && (
                   <div className="flex flex-wrap gap-1">
                     {a.tools.map(t => (
-                      <span key={t.name} className="text-[10px] px-2 py-0.5 bg-gray-800 rounded-md text-gray-500">{t.name}</span>
+                      <span key={t.name} title={t.name} className="text-[10px] px-2 py-0.5 bg-gray-800 rounded-md text-gray-400">{toolNameCN[t.name] || t.name}</span>
                     ))}
                   </div>
                 )}
@@ -422,7 +423,7 @@ export function Agents(): JSX.Element {
           <div className="p-5">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
-                <h2 className="text-lg font-semibold">{selectedAgent.name}</h2>
+                <h2 className="text-lg font-semibold">{agentNameCN[selectedAgent.name] || selectedAgent.name}</h2>
                 {selectedAgent.is_custom ? (
                   <span className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-amber-600/10 text-amber-400">自定义</span>
                 ) : (
@@ -484,7 +485,7 @@ export function Agents(): JSX.Element {
                   <div className="space-y-1.5">
                     {selectedAgent.tools.map(t => (
                       <div key={t.name} className="px-3 py-2 bg-gray-800/60 rounded-lg">
-                        <div className="text-sm font-medium font-mono">{t.name}</div>
+                        <div className="text-sm font-medium">{toolNameCN[t.name] || t.name}</div>
                         {t.description && <div className="text-xs text-gray-500 mt-0.5">{toolDescCN[t.name] || t.description}</div>}
                       </div>
                     ))}

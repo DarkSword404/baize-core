@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Baize (白泽) — 启动脚本 v1.5.0
+# Baize (白泽) — 启动脚本 v1.6.0
 #
 # 启动后端 (FastAPI/uvicorn, 端口 8001) 和前端 (Vite, 端口 5173)。
 # 项目布局：
-#   baize-core-v1.5.0          核心框架（含前端 web/）
+#   baize-core-v1.6.0          核心框架（含前端 web/）
 #   baize-orchestration        流水线编排模块（可选）
 #
 set -euo pipefail
@@ -14,6 +14,15 @@ CORE_DIR="${BAIZE_CORE_DIR:-$SCRIPT_DIR}"
 WEB_DIR="${BAIZE_WEB_DIR:-$CORE_DIR/web}"
 LOG_DIR="${BAIZE_LOG_DIR:-$CORE_DIR/logs}"
 PYTHON_BIN="${BAIZE_PYTHON:-$CORE_DIR/.venv/bin/python}"
+
+# 白泽数据目录总开关：默认指向项目内 .baize-data/，绕过沙箱对 ~/.baize 的写入限制。
+# 此开关下，sessions / custom_agents / attachments / model.json / guardrails.json
+# 等所有派生目录与配置文件均自动落项目内。
+export BAIZE_DATA_DIR="${BAIZE_DATA_DIR:-$CORE_DIR/.baize-data}"
+# 协作浏览器持久化 profile（可单独覆盖，默认跟随 BAIZE_DATA_DIR）
+export BAIZE_SHARED_BROWSER_PROFILE="${BAIZE_SHARED_BROWSER_PROFILE:-$BAIZE_DATA_DIR/shared-browser-profile}"
+# 认证库（可单独覆盖，默认跟随 BAIZE_DATA_DIR）
+export BAIZE_AUTH_DB="${BAIZE_AUTH_DB:-$BAIZE_DATA_DIR/api_auth.json}"
 
 C_GREEN='\033[0;32m'; C_CYAN='\033[0;36m'; C_RED='\033[0;31m'; C_RESET='\033[0m'
 log()  { echo -e "${C_GREEN}[start]${C_RESET} $*"; }

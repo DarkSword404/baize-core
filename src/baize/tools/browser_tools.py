@@ -1,4 +1,8 @@
-"""Baize 浏览器自动化工具集 — Web 侦察与页面交互。
+"""Baize 静默浏览器工具集 — 无头自动化 Web 侦察与页面交互。
+
+本模块是 **静默浏览器**（headless、每次调用启动独立浏览器实例、用完即关、
+无窗口不打扰），专为**流水线静默运行**等无人值守场景设计；与
+:mod:`baize.tools.shared_browser`（有头、人机共用的共享协作浏览器）相互独立。
 
 基于 Playwright（Chromium 无头浏览器）封装常用浏览器能力，供智能体
 对 Web 目标做自动化侦察与交互:
@@ -7,6 +11,9 @@
 - ``browser_click``: 点击页面元素
 - ``browser_fill``: 填写表单输入框
 - ``browser_evaluate``: 在页面上下文执行 JS 表达式
+
+**静默语义**: 每次调用独立无头实例，任务结束 / 被中断（超时、取消）时
+浏览器进程在后台被可靠回收，不留窗口、不阻塞流水线。
 
 **SSRF 防护**: 所有 URL 目标复用 ``extended._check_url_allowed`` 校验
 （禁止访问内网/保留地址，除非显式 ``BAIZE_FETCH_ALLOW_INTERNAL=1``）。
@@ -19,6 +26,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -26,6 +34,25 @@ from baize.tools.extended import _check_url_allowed
 from baize.tools.registry import register_tool
 
 logger = logging.getLogger("baize.tools.browser")
+
+# 后台清理任务集合（防止被 GC），确保中断时浏览器进程也被可靠回收
+_background_tasks: set[asyncio.Task] = set()
+
+
+async def _close_quietly(coro: Any) -> None:
+    """在独立任务中执行清理协程（shield 防止被取消打断）。"""
+    try:
+        await asyncio.shield(coro)
+    except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        pass
+
+
+def _schedule_shutdown(*coros: Any) -> None:
+    """调度浏览器清理协程在后台执行（不阻塞当前协程，可安全用于 finally）。"""
+    for coro in coros:
+        task = asyncio.ensure_future(_close_quietly(coro))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
 
 def _require_playwright() -> Any:
@@ -58,18 +85,19 @@ async def _open_page(url: str, timeout: int = 30, headless: bool = True) -> Any:
     try:
         await page.goto(url, timeout=timeout * 1000, wait_until="domcontentloaded")
     except Exception as exc:  # noqa: BLE001
-        await browser.close()
-        await p.stop()
+        _schedule_shutdown(browser.close(), p.stop())
         raise RuntimeError(f"打开页面失败: {exc}") from exc
     return p, browser, page
 
 
 @register_tool(
     description=(
-        "使用无头浏览器打开目标页面并提取结构化侦察信息：页面标题、最终 URL、"
+        "[静默浏览器] 使用无头浏览器打开目标页面并提取结构化侦察信息：页面标题、最终 URL、"
         "响应状态、页面链接列表(含 href/文本)、表单元素(输入框/下拉/按钮)、"
         "可见文本摘要。参数: url 目标 URL; max_links 最多返回的链接数(默认 30);"
         "正文摘要长度 max_text(默认 800)。适合 Web 侦察、链接挖掘、表单分析。"
+        "每次调用独立实例、用完即关、无窗口，适合流水线静默运行；"
+        "如需人工介入（扫码登录等）请改用 shared_browser_* 系列。"
     ),
     category="security",
     tags=["browser", "recon", "web", "playwright"],
@@ -121,17 +149,18 @@ async def browser_fetch(
             ]
             return "\n".join(parts)
         finally:
-            await browser.close()
-            await p.stop()
+            _schedule_shutdown(browser.close(), p.stop())
     except Exception as exc:  # noqa: BLE001
         return f"[browser_fetch 失败] {exc}"
 
 
 @register_tool(
     description=(
-        "使用无头浏览器对目标页面截图并保存到本地路径。"
+        "[静默浏览器] 使用无头浏览器对目标页面截图并保存到本地路径。"
         "参数: url 目标 URL; output_path 截图保存路径(如 /tmp/page.png);"
         "full_page 是否截取整页(默认否，只截可视区域); 返回截图保存路径。"
+        "静默独立实例，供流水线无人值守使用；"
+        "如需可视化人工协作请用 shared_browser_*。"
     ),
     category="security",
     tags=["browser", "screenshot", "web"],
@@ -149,17 +178,17 @@ async def browser_screenshot(
             await page.screenshot(path=output_path, full_page=full_page)
             return f"截图已保存: {output_path}"
         finally:
-            await browser.close()
-            await p.stop()
+            _schedule_shutdown(browser.close(), p.stop())
     except Exception as exc:  # noqa: BLE001
         return f"[browser_screenshot 失败] {exc}"
 
 
 @register_tool(
     description=(
-        "在目标页面点击指定 CSS 选择器元素，然后返回页面标题与关键信息变化。"
+        "[静默浏览器] 在目标页面点击指定 CSS 选择器元素，然后返回页面标题与关键信息变化。"
         "参数: url 目标 URL; selector CSS 选择器(如 '#login-btn' 或 'a[href*=signup]');"
-        "返回点击后的页面标题与文本摘要。"
+        "返回点击后的页面标题与文本摘要。静默独立实例，供流水线无人值守使用；"
+        "如需人工介入请用 shared_browser_*。"
     ),
     category="security",
     tags=["browser", "click", "web", "automation"],
@@ -183,17 +212,16 @@ async def browser_click(
             body_text = (await page.inner_text("body")).strip().replace("\n", " ")[:max_text]
             return f"点击后标题: {title}\nURL: {page.url}\n文本: {body_text or '(空页面)'}"
         finally:
-            await browser.close()
-            await p.stop()
+            _schedule_shutdown(browser.close(), p.stop())
     except Exception as exc:  # noqa: BLE001
         return f"[browser_click 失败] {exc}"
 
 
 @register_tool(
     description=(
-        "在目标页面的输入框（CSS 选择器指定）填写指定值，然后返回确认。"
+        "[静默浏览器] 在目标页面的输入框（CSS 选择器指定）填写指定值，然后返回确认。"
         "参数: url 目标 URL; selector CSS 选择器(如 'input[name=username]');"
-        "value 要填写的值; 返回填写结果确认。"
+        "value 要填写的值; 返回填写结果确认。静默独立实例，供流水线无人值守使用。"
     ),
     category="security",
     tags=["browser", "form", "web", "automation"],
@@ -214,17 +242,17 @@ async def browser_fill(
             await el.fill(value)
             return f"已向 {selector} 填写: {value}"
         finally:
-            await browser.close()
-            await p.stop()
+            _schedule_shutdown(browser.close(), p.stop())
     except Exception as exc:  # noqa: BLE001
         return f"[browser_fill 失败] {exc}"
 
 
 @register_tool(
     description=(
-        "在目标页面上下文执行 JS 表达式并返回结果（用于动态页面数据提取）。"
+        "[静默浏览器] 在目标页面上下文执行 JS 表达式并返回结果（用于动态页面数据提取）。"
         "参数: url 目标 URL; script JS 表达式(如 'document.title' 或 "
         "'JSON.stringify(Object.keys(window))'); 返回执行结果字符串。"
+        "静默独立实例，供流水线无人值守使用。"
     ),
     category="security",
     tags=["browser", "js", "web", "automation"],
@@ -245,8 +273,7 @@ async def browser_evaluate(
                 return json.dumps(result, ensure_ascii=False, indent=2)
             return str(result)
         finally:
-            await browser.close()
-            await p.stop()
+            _schedule_shutdown(browser.close(), p.stop())
     except Exception as exc:  # noqa: BLE001
         return f"[browser_evaluate 失败] {exc}"
 

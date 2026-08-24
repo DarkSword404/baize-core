@@ -12,10 +12,14 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# 默认配置目录（用户级）
-DEFAULT_BAIZE_DIR = Path.home() / ".baize"
+# 默认配置目录（用户级）。环境变量 BAIZE_DATA_DIR 覆盖总目录，
+# 使 sessions / custom agents / attachments / model.json / guardrails.json
+# 等所有派生数据落到同一位置（如沙箱环境指向项目内目录绕过写入限制）。
+DEFAULT_BAIZE_DIR = Path(
+    os.getenv("BAIZE_DATA_DIR", str(Path.home() / ".baize"))
+)
 MODEL_CONFIG_FILE = DEFAULT_BAIZE_DIR / "model.json"
-AUTH_DB_FILE = DEFAULT_BAIZE_DIR / "api_auth.json"
+AUTH_DB_FILE = Path(os.getenv("BAIZE_AUTH_DB", str(DEFAULT_BAIZE_DIR / "api_auth.json")))
 GUARDRAILS_FILE = DEFAULT_BAIZE_DIR / "guardrails.json"
 
 

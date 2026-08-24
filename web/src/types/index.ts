@@ -66,6 +66,7 @@ export interface SessionSummary {
   pattern?: string | null;
   agent_stack?: string[];
   agent_transitions?: Array<{from_agent: string | null; to_agent: string; timestamp: string; reason: string}>;
+  browser_collab?: boolean;
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -86,6 +87,7 @@ export interface CreateSessionRequest {
   stateful?: boolean;
   metadata?: Record<string, unknown> | null;
   pattern?: string | null;
+  browser_collab?: boolean;
 }
 
 export interface RunResultPayload {
@@ -189,7 +191,18 @@ export interface Toast {
   message?: string;
 }
 
-export type ViewPage = 'dashboard' | 'chat' | 'agents' | 'tools' | 'sessions' | 'guardrails' | 'settings' | 'orchestration' | 'experiences';
+export type ViewPage = 'dashboard' | 'chat' | 'agents' | 'tools' | 'sessions' | 'guardrails' | 'settings' | 'orchestration' | 'experiences' | 'browser';
+
+/** 共享协作浏览器状态 */
+export interface SharedBrowserStatus {
+  running: boolean;
+  headless: boolean;
+  url: string;
+  profile: string;
+  confirm_pending: boolean;
+  /** 固定视口尺寸（截图坐标映射基准） */
+  viewport?: { width: number; height: number };
+}
 
 // ===== 长期记忆：经验条目 =====
 export interface ExperienceItem {
@@ -236,10 +249,23 @@ export interface EmbeddingConfigData {
 }
 
 // ===== 安全护栏 =====
+export interface SSRFGuardrailSettings {
+  enabled: boolean;
+  block_private: boolean;
+  block_loopback: boolean;
+  block_link_local: boolean;
+  block_reserved: boolean;
+  block_multicast: boolean;
+  block_unspecified: boolean;
+  allowlist_cidrs: string[];
+  allowlist_hosts: string[];
+}
+
 export interface GuardrailSettings {
   input_enabled: boolean;
   output_enabled: boolean;
   max_input_length: number;
+  ssrf: SSRFGuardrailSettings;
 }
 
 export interface GuardrailRule {

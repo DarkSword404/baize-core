@@ -37,6 +37,7 @@ class Session:
     created_at: str
     updated_at: str
     pattern: Optional[str] = None
+    browser_collab: bool = False
     messages: list[dict] = field(default_factory=list)
 
     @property
@@ -55,6 +56,7 @@ class Session:
             "history": self.messages,
             "metadata": {},
             "pattern": self.pattern,
+            "browser_collab": self.browser_collab,
         }
 
 
@@ -86,6 +88,7 @@ class SessionManager:
                     created_at=data.get("created_at", ""),
                     updated_at=data.get("updated_at", ""),
                     pattern=data.get("pattern"),
+                    browser_collab=data.get("browser_collab", False),
                     messages=data.get("messages", []),
                 )
                 self._sessions[session.id] = session
@@ -101,6 +104,7 @@ class SessionManager:
             "created_at": session.created_at,
             "updated_at": session.updated_at,
             "pattern": session.pattern,
+            "browser_collab": session.browser_collab,
             "messages": session.messages,
         }
         f = self._dir / f"{session.id}.json"
@@ -114,6 +118,7 @@ class SessionManager:
         model: Optional[str] = None,
         stateful: bool = True,
         pattern: Optional[str] = None,
+        browser_collab: bool = False,
     ) -> Session:
         session = Session(
             id=secrets.token_hex(12),
@@ -123,6 +128,7 @@ class SessionManager:
             created_at=_now(),
             updated_at=_now(),
             pattern=pattern,
+            browser_collab=browser_collab,
         )
         with self._lock:
             self._sessions[session.id] = session
@@ -190,6 +196,16 @@ class SessionManager:
             if session is None:
                 return False
             session.model = model or None
+            session.updated_at = _now()
+            self._save(session)
+            return True
+
+    def set_browser_collab(self, session_id: str, enabled: bool) -> bool:
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return False
+            session.browser_collab = bool(enabled)
             session.updated_at = _now()
             self._save(session)
             return True

@@ -31,13 +31,16 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+import socket
 import unicodedata  # noqa: F401  保留（模块历史依赖）
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 from baize.config import GUARDRAILS_FILE
 
@@ -52,6 +55,10 @@ class InputGuardrailError(Exception):
 
 class OutputGuardrailError(Exception):
     """输出被安全护栏拦截。"""
+
+
+class SSRFGuardrailError(Exception):
+    """URL 目标被 SSRF 护栏拦截。"""
 
 
 # ---------------------------------------------------------------------------
@@ -93,15 +100,52 @@ class GuardrailRule:
 
 
 @dataclass
+class SSRFGuardrailSettings:
+    """SSRF 防护护栏参数。
+
+    按"默认安全"原则：仅开启 SSRF 护栏，默认阻断私网/回环/链路本地/保留/组播/未指定地址。
+    渗透场景(内网渗透)可通过：
+    - 关闭 enabled(全放行，谨慎使用)；
+    - 或把某几类 block_* 改为 False(仅放行私网、仍阻断 metadata 等)；
+    - 或在 allowlist_cidrs / allowlist_hosts 里添加精确例外(最安全)。
+
+    每次检查前即时读磁盘最新配置；同时支持环境变量应急覆盖:
+    - ``BAIZE_FETCH_ALLOW_INTERNAL=1`` → 临时全部放行(等价 enabled=False)
+    """
+
+    enabled: bool = True
+    # 6 个拦截维度，对应 ipaddress.ip_address 的 6 个属性
+    block_private: bool = True
+    block_loopback: bool = True
+    block_link_local: bool = True
+    block_reserved: bool = True
+    block_multicast: bool = True
+    block_unspecified: bool = True
+    # 例外：CIDR 白名单(命中任一即放行)，如 ["192.168.1.0/24", "fd00::/8"]
+    allowlist_cidrs: list[str] = field(default_factory=list)
+    # 例外：hostname 精确/域名后缀白名单，如 ["localhost", ".corp.example.com"]
+    allowlist_hosts: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+@dataclass
 class GuardrailSettings:
     """护栏总开关与全局参数。"""
 
     input_enabled: bool = True
     output_enabled: bool = False
     max_input_length: int = 16384  # 16 KB
+    ssrf: SSRFGuardrailSettings = field(default_factory=SSRFGuardrailSettings)
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        return {
+            "input_enabled": self.input_enabled,
+            "output_enabled": self.output_enabled,
+            "max_input_length": self.max_input_length,
+            "ssrf": self.ssrf.to_dict(),
+        }
 
 
 @dataclass
@@ -168,12 +212,18 @@ _INVISIBLE_CHARS: dict[str, str] = {
 
 def _default_settings() -> GuardrailSettings:
     """默认总开关（支持环境变量覆盖，仅用于首次初始化）。"""
+    # 应急 env 全覆盖：BAIZE_FETCH_ALLOW_INTERNAL=1 等价 SSRF.enabled=False
+    env_allow_internal = (
+        os.getenv("BAIZE_FETCH_ALLOW_INTERNAL", "").lower() in ("1", "true", "yes")
+    )
+    ssrf_enabled_default = not env_allow_internal
     return GuardrailSettings(
         input_enabled=os.getenv("BAIZE_ENABLE_INPUT_GUARDRAIL", "1").lower()
         in ("1", "true", "yes"),
         output_enabled=os.getenv("BAIZE_ENABLE_OUTPUT_GUARDRAIL", "0").lower()
         in ("1", "true", "yes"),
         max_input_length=16384,
+        ssrf=SSRFGuardrailSettings(enabled=ssrf_enabled_default),
     )
 
 
@@ -384,10 +434,31 @@ class GuardrailStore:
     @staticmethod
     def _from_dict(data: dict) -> GuardrailConfig:
         s = data.get("settings") or {}
+        ssrf_raw = s.get("ssrf") if isinstance(s, dict) else None
+        if isinstance(ssrf_raw, dict):
+            ssrf = SSRFGuardrailSettings(
+                enabled=bool(ssrf_raw.get("enabled", True)),
+                block_private=bool(ssrf_raw.get("block_private", True)),
+                block_loopback=bool(ssrf_raw.get("block_loopback", True)),
+                block_link_local=bool(ssrf_raw.get("block_link_local", True)),
+                block_reserved=bool(ssrf_raw.get("block_reserved", True)),
+                block_multicast=bool(ssrf_raw.get("block_multicast", True)),
+                block_unspecified=bool(ssrf_raw.get("block_unspecified", True)),
+                allowlist_cidrs=[
+                    str(x) for x in (ssrf_raw.get("allowlist_cidrs") or []) if x
+                ],
+                allowlist_hosts=[
+                    str(x) for x in (ssrf_raw.get("allowlist_hosts") or []) if x
+                ],
+            )
+        else:
+            # 老版本 guardrails.json 没有 ssrf 字段 → 按默认值(全拦截)
+            ssrf = SSRFGuardrailSettings()
         settings = GuardrailSettings(
             input_enabled=bool(s.get("input_enabled", True)),
             output_enabled=bool(s.get("output_enabled", False)),
             max_input_length=int(s.get("max_input_length", 16384) or 16384),
+            ssrf=ssrf,
         )
         rules: list[GuardrailRule] = []
         seen: set[str] = set()
@@ -418,6 +489,26 @@ def validate_guardrail_config(cfg: GuardrailConfig) -> list[str]:
     errors: list[str] = []
     if not 1 <= cfg.settings.max_input_length <= 10_000_000:
         errors.append("max_input_length 必须在 1 ~ 10000000 之间")
+    # --- SSRF 护栏字段校验 ---
+    ssrf = cfg.settings.ssrf
+    for idx, cidr in enumerate(ssrf.allowlist_cidrs or []):
+        c = str(cidr).strip()
+        if not c:
+            errors.append(f"ssrf.allowlist_cidrs[{idx}]: 不能为空")
+            continue
+        try:
+            ipaddress.ip_network(c, strict=False)
+        except ValueError as exc:
+            errors.append(f"ssrf.allowlist_cidrs[{idx}]={c!r}: 非法 CIDR - {exc}")
+    for idx, host in enumerate(ssrf.allowlist_hosts or []):
+        h = str(host).strip()
+        if not h:
+            errors.append(f"ssrf.allowlist_hosts[{idx}]: 不能为空")
+            continue
+        # 合法 hostname: 精确(www.x.com)或点开头后缀(.corp.x.com)
+        if not (re.match(r"^[A-Za-z0-9._-]+$", h) or (h.startswith(".") and re.match(r"^\.[A-Za-z0-9._-]+$", h))):
+            errors.append(f"ssrf.allowlist_hosts[{idx}]={h!r}: hostname 格式非法(应为 example.com 或 .internal.example.com)")
+    # --- 规则校验 ---
     seen: set[str] = set()
     for rule in cfg.rules:
         if not rule.id.strip():
@@ -457,6 +548,155 @@ def validate_guardrail_config(cfg: GuardrailConfig) -> list[str]:
 
 def _active_rules(cfg: GuardrailConfig, category: str) -> list[GuardrailRule]:
     return [r for r in cfg.rules if r.category == category and r.enabled]
+
+
+# ---------------------------------------------------------------------------
+# SSRF 护栏（URL 目标访问控制）
+# ---------------------------------------------------------------------------
+
+_SSRF_RULE_ID = "ssrf_internal"
+
+
+def _resolve_host_ips(host: str) -> list[str]:
+    """把 hostname 解析为 IP 列表，失败返回空。"""
+    if not host:
+        return []
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError:
+        return []
+    seen: list[str] = []
+    for info in infos:
+        ip = info[4][0]
+        if ip not in seen:
+            seen.append(ip)
+    return seen
+
+
+def _cidr_networks(cidrs: list[str]) -> list[ipaddress._BaseNetwork]:
+    """把字符串 CIDR 列表预编译为 ip_network 对象；非法条目静默丢弃。"""
+    nets: list[ipaddress._BaseNetwork] = []
+    for c in cidrs or []:
+        try:
+            nets.append(ipaddress.ip_network(str(c).strip(), strict=False))
+        except ValueError:
+            continue
+    return nets
+
+
+def _ip_in_cidrs(ip_str: str, nets: list[ipaddress._BaseNetwork]) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return any(addr in net for net in nets)
+
+
+def _hostname_allowlisted(host: str, hostlist: list[str]) -> bool:
+    """hostname 精确匹配，或以“.后缀”形式命中域名后缀。"""
+    if not host:
+        return False
+    host = host.lower()
+    for h in (hostlist or []):
+        h = str(h).strip().lower()
+        if not h:
+            continue
+        if h.startswith("."):
+            if host.endswith(h):
+                return True
+        else:
+            if host == h:
+                return True
+    return False
+
+
+def _ssrf_ip_blocked(ip_str: str, s: SSRFGuardrailSettings) -> Optional[str]:
+    """若 IP 命中配置项,返回命中的分类名;否则返回 None。"""
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return None
+    if s.block_private and addr.is_private:
+        return "private"
+    if s.block_loopback and addr.is_loopback:
+        return "loopback"
+    if s.block_link_local and addr.is_link_local:
+        return "link-local(含云 metadata 169.254.169.254)"
+    if s.block_reserved and addr.is_reserved:
+        return "reserved"
+    if s.block_multicast and addr.is_multicast:
+        return "multicast"
+    if s.block_unspecified and addr.is_unspecified:
+        return "unspecified"
+    return None
+
+
+def _effective_ssrf_settings() -> SSRFGuardrailSettings:
+    """读取当前 SSRF 配置,并叠加环境变量应急覆盖。"""
+    cfg = GuardrailStore.get().load()
+    s = cfg.settings.ssrf
+    # 应急 env: BAIZE_FETCH_ALLOW_INTERNAL=1 → 强制 SSRF 关闭(全放行)
+    if os.getenv("BAIZE_FETCH_ALLOW_INTERNAL", "").lower() in ("1", "true", "yes"):
+        s = SSRFGuardrailSettings(
+            enabled=False,
+            block_private=s.block_private,
+            block_loopback=s.block_loopback,
+            block_link_local=s.block_link_local,
+            block_reserved=s.block_reserved,
+            block_multicast=s.block_multicast,
+            block_unspecified=s.block_unspecified,
+            allowlist_cidrs=list(s.allowlist_cidrs),
+            allowlist_hosts=list(s.allowlist_hosts),
+        )
+    return s
+
+
+def check_ssrf(url: str) -> Tuple[bool, str, Optional[str]]:
+    """对 URL 目标执行 SSRF 护栏检查。
+
+    返回 (passed, message, rule_id),风格与 check_input_guardrail /
+    check_output_guardrail 一致:
+    - passed=True  → 允许访问
+    - passed=False → 拒绝访问,message 为原因,rule_id 固定 ssrf_internal
+    """
+    s = _effective_ssrf_settings()
+    if not s.enabled:
+        return True, "", None
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").strip()
+    if not host:
+        return False, "无效 URL(缺少主机名)", _SSRF_RULE_ID
+    scheme = (parsed.scheme or "").lower()
+    if scheme and scheme not in ("http", "https"):
+        # 阻止 file:// / gopher:// / dict:// / ftp:// 等 SSRF 滥用协议
+        return False, f"禁止访问的协议: {scheme or '<empty>'}", _SSRF_RULE_ID
+
+    # 例外1: hostname 白名单(先 host 再 CIDR,最短路径)
+    if _hostname_allowlisted(host, s.allowlist_hosts):
+        return True, "", None
+    ips = _resolve_host_ips(host)
+    if not ips:
+        return False, "无法解析主机名", _SSRF_RULE_ID
+    allowlist_nets = _cidr_networks(s.allowlist_cidrs)
+    first_blocked_reason: Optional[str] = None
+    first_blocked_ip: Optional[str] = None
+    for ip in ips:
+        # 例外2: CIDR 白名单 —— 任一命中即放行(即使是内部地址也放行,满足内网渗透指定网段)
+        if allowlist_nets and _ip_in_cidrs(ip, allowlist_nets):
+            continue
+        blocked_as = _ssrf_ip_blocked(ip, s)
+        if blocked_as is not None:
+            if first_blocked_reason is None:
+                first_blocked_reason = blocked_as
+                first_blocked_ip = ip
+            # 任一 IP 命中黑名单 → 拒绝(防止 split-horizon DNS 一个公网+一个内网的绕过)
+            return (
+                False,
+                f"出于安全考虑,禁止访问内部/保留地址({first_blocked_ip} 命中 {first_blocked_reason})。"
+                f" 如需在渗透场景下放行内网,可在安全护栏设置中关闭 SSRF、或把目标加入 ssrf.allowlist_cidrs/allowlist_hosts。",
+                _SSRF_RULE_ID,
+            )
+    return True, "", None
 
 
 def _check_input(text: str) -> Tuple[bool, str, Optional[str]]:

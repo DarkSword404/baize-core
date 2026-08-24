@@ -127,25 +127,22 @@ def _is_blocked_ip(ip: str) -> bool:
 
 
 def _check_url_allowed(url: str, allow_internal: bool) -> None:
-    """校验 URL 目标是否允许访问；不允许时抛出 ValueError。
+    """SSRF 防护：校验 URL 目标是否允许访问；不允许时抛出 ValueError。
 
-    注意：域名解析后再校验，可阻止常规 SSRF；DNS rebinding 需
-    自定义 transport 做连接时校验，属后续增强项。
+    **兼容层**：核心逻辑已统一迁移到 ``baize.agents.guardrails.check_ssrf``
+    （安全护栏的 SSRF 子项），支持细粒度开关 + CIDR/域名白名单，可在
+    护栏面板或 guardrails.json 中为内网渗透等场景精细放行。
+
+    参数 ``allow_internal=True`` 等价临时绕过（``BAIZE_FETCH_ALLOW_INTERNAL=1``），
+    不再做任何检查，用于已知安全的 fetch 内部路径。
     """
-    from urllib.parse import urlparse
-
     if allow_internal:
         return
-    parsed = urlparse(url)
-    host = parsed.hostname or ""
-    if not host:
-        raise ValueError("无效 URL（缺少主机名）")
-    ips = _resolve_host_ips(host)
-    if not ips:
-        raise ValueError("无法解析主机名")
-    for ip in ips:
-        if _is_blocked_ip(ip):
-            raise ValueError("出于安全考虑，禁止访问内部/保留地址")
+    from baize.agents.guardrails import check_ssrf
+
+    ok, msg, _rid = check_ssrf(url)
+    if not ok:
+        raise ValueError(msg)
 
 
 def _http_request(
@@ -249,22 +246,47 @@ def _port_scan(target: str, ports: str = "common") -> str:
 
 
 def _analyze_task_requirements(task: str) -> str:
-    """分析任务需求，返回建议的智能体类型。"""
-    task_l = task.lower()
-    if any(k in task_l for k in ("web", "注入", "xss", "csrf", "upload")):
-        return "web_pentester_agent"
-    if any(k in task_l for k in ("取证", "forensic", "dfir", "内存", "磁盘")):
-        return "dfir_agent"
-    if any(k in task_l for k in ("扫描", "recon", "侦察", "端口", "枚举")):
-        return "recon_agent"
-    if any(k in task_l for k in ("红队", "redteam", "提权", "exploit", "攻击")):
-        return "redteam_agent"
-    return "general_agent"
+    """分析任务需求，返回建议的智能体 AGENT_KEY（可通过 check_available_agents 查看全部可用项）。
+
+    返回的标识符均为当前注册表中真实存在的智能体 key/别名，
+    可直接交给路由/编排层调用，避免历史硬编码导致指向已不存在的智能体。
+    """
+    task_l = (task or "").lower()
+    mapping = [
+        (("web", "注入", "xss", "csrf", "upload", "sql"), "web_pentester"),
+        (("取证", "forensic", "dfir", "内存", "磁盘"), "dfir_agent"),
+        (("扫描", "recon", "侦察", "端口", "枚举", "网络"), "network_analyzer"),
+        (("红队", "redteam", "提权", "exploit", "攻击", "apt"), "red_team_agent"),
+        (("蓝队", "blueteam", "应急", "响应"), "blue_team_agent"),
+        (("ctf", "flag", "夺旗"), "ctf_agent"),
+        (("合规", "compliance", "审计"), "compliance_agent"),
+        (("报告", "report", "总结"), "reporting_agent"),
+        (("无线", "wifi", "wlan"), "wifi_security_agent"),
+        (("android", "移动", "apk"), "android_sast"),
+        (("dns", "smtp", "邮件", "mail"), "dns_smtp_agent"),
+        (("逆向", "reverse", "反汇编"), "reverse_engineering_agent"),
+        (("射频", "subghz", "sdr", "重放"), "replay_attack_agent"),
+        (("内存", "memory", "volatility"), "memory_analysis_agent"),
+    ]
+    fallback = "triage_agent"
+    for keywords, key in mapping:
+        if any(k in task_l for k in keywords):
+            return key
+    return fallback
 
 
 def _check_available_agents() -> str:
-    """列出可用智能体。"""
-    return "可用智能体: general_agent, ctf_agent, web_pentester_agent, redteam_agent, blueteam_agent, dfir_agent, recon_agent, network_analysis_agent, reporting_agent, retester_agent, reverse_engineering_agent, wifi_security_agent, compliance_agent, dns_smtp_agent, codeagent"
+    """列出可用智能体（动态从注册表读取，避免硬编码过期列表）。"""
+    try:
+        from baize.agents import list_agents
+
+        agents = list_agents()
+        if not agents:
+            return "(无已注册智能体)"
+        names = [a.get("name", "") for a in agents]
+        return "可用智能体: " + ", ".join(n for n in names if n)
+    except Exception as e:  # noqa: BLE001 - 工具调用需返回可读错误而非抛出
+        return f"(读取智能体列表失败: {e})"
 
 
 def _verify_csv_inventory() -> str:

@@ -24,6 +24,7 @@ import type {
   EmbeddingConfigData,
   GuardrailConfig,
   GuardrailTestResult,
+  SharedBrowserStatus,
 } from '../types';
 
 export type SessionInfo = SessionSummary;
@@ -355,6 +356,17 @@ export async function switchSessionModel(id: string, model: string): Promise<Ses
   const raw = await request<{ session: SessionDetail }>(`/sessions/${id}/model`, {
     method: 'PATCH',
     body: JSON.stringify({ model }),
+  });
+  return raw.session;
+}
+
+export async function switchSessionBrowserCollab(
+  id: string,
+  enabled: boolean,
+): Promise<SessionDetail> {
+  const raw = await request<{ session: SessionDetail }>(`/sessions/${id}/browser-collab`, {
+    method: 'PATCH',
+    body: JSON.stringify({ enabled }),
   });
   return raw.session;
 }
@@ -981,6 +993,100 @@ export async function testGuardrail(text: string, kind: 'input' | 'output'): Pro
 /** 恢复护栏默认配置 */
 export async function resetGuardrails(): Promise<GuardrailConfig> {
   return request('/guardrails/reset', { method: 'POST' });
+}
+
+// ===== 共享协作浏览器 =====
+
+export interface SharedBrowserOpenResult {
+  ok: boolean;
+  result?: string;
+  detail?: string;
+}
+
+/** 查询共享浏览器状态 */
+export async function sharedBrowserStatus(): Promise<SharedBrowserStatus> {
+  return request('/shared-browser/status');
+}
+
+/** 在共享浏览器中打开 URL */
+export async function sharedBrowserOpen(url: string): Promise<SharedBrowserOpenResult> {
+  return request('/shared-browser/open', { method: 'POST', body: JSON.stringify({ url }) });
+}
+
+/** 人工确认放行（唤醒 shared_browser_wait_user） */
+export async function sharedBrowserConfirm(): Promise<{ ok: boolean; message: string }> {
+  return request('/shared-browser/confirm', { method: 'POST' });
+}
+
+/** 关闭共享浏览器 */
+export async function sharedBrowserClose(): Promise<{ ok: boolean; result?: string }> {
+  return request('/shared-browser/close', { method: 'POST' });
+}
+
+/** 获取共享浏览器实时截图（带认证头，返回 Blob 供前端展示） */
+export async function sharedBrowserSnapshotBlob(): Promise<Blob> {
+  const url = `${apiBase}/shared-browser/snapshot?t=${Date.now()}`;
+  const res = await fetch(url, { headers: { ...authHeaders() } });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = JSON.parse(await res.text()).detail || detail; } catch {}
+    throw new Error(`[${res.status}] ${detail}`);
+  }
+  return res.blob();
+}
+
+export interface SharedBrowserClickInput {
+  x: number;
+  y: number;
+  button?: 'left' | 'right' | 'middle';
+  click_count?: number;
+}
+
+export interface SharedBrowserActionResult {
+  ok: boolean;
+  result?: string;
+  detail?: string;
+}
+
+/** 按视口坐标点击共享浏览器页面 */
+export async function sharedBrowserClick(input: SharedBrowserClickInput): Promise<SharedBrowserActionResult> {
+  return request('/shared-browser/click', { method: 'POST', body: JSON.stringify(input) });
+}
+
+/** 向共享浏览器当前聚焦元素输入文本 */
+export async function sharedBrowserType(text: string): Promise<SharedBrowserActionResult> {
+  return request('/shared-browser/type', { method: 'POST', body: JSON.stringify({ text }) });
+}
+
+/** 在共享浏览器中按下指定按键（Playwright 键名） */
+export async function sharedBrowserKey(key: string): Promise<SharedBrowserActionResult> {
+  return request('/shared-browser/key', { method: 'POST', body: JSON.stringify({ key }) });
+}
+
+/** 滚动共享浏览器当前页面 */
+export async function sharedBrowserScroll(deltaX: number, deltaY: number): Promise<SharedBrowserActionResult> {
+  return request('/shared-browser/scroll', { method: 'POST', body: JSON.stringify({ delta_x: deltaX, delta_y: deltaY }) });
+}
+
+/** 共享浏览器导航：back / forward / reload */
+export async function sharedBrowserNav(action: 'back' | 'forward' | 'reload'): Promise<SharedBrowserActionResult> {
+  return request('/shared-browser/nav', { method: 'POST', body: JSON.stringify({ action }) });
+}
+
+/** 构建 CDP 实时帧流 WebSocket URL（带 token query 鉴权，浏览器原生 WS 无法设自定义头）。 */
+export function sharedBrowserStreamUrl(): string {
+  const token = getToken();
+  let url: string;
+  if (/^https?:\/\//i.test(apiBase)) {
+    // 绝对 base：http→ws / https→wss
+    url = apiBase.replace(/^http/i, 'ws') + '/shared-browser/stream';
+  } else {
+    // 相对 base：用当前页 host
+    const loc = window.location;
+    const proto = loc.protocol === 'https:' ? 'wss:' : 'ws:';
+    url = `${proto}//${loc.host}${apiBase}/shared-browser/stream`;
+  }
+  return token ? `${url}?token=${encodeURIComponent(token)}` : url;
 }
 
 // ===== 长期记忆：经验库 =====
