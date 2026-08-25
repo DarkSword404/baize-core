@@ -12,7 +12,7 @@
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
-**白泽·智脑** 是一个基于大型语言模型的本地化 AI 安全助手，面向 **Web 渗透、移动安全、无线/射频、红蓝对抗、应急响应与合规审计** 等场景，提供 30+ 个开箱即用的专用智能体，支持长期记忆、安全护栏与外部事件接入。
+**白泽·智脑** 是一个基于大型语言模型的本地化 AI 安全助手，面向 **Web 渗透、移动安全、无线/射频、红蓝对抗、应急响应与合规审计** 等场景，提供 30+ 个开箱即用的专用智能体，支持长期记忆、安全护栏、沙箱边界、执行记录与外部事件接入。
 
 </div>
 
@@ -22,17 +22,23 @@
 
 | | 特性 | 说明 |
 |---|---|---|
-| 🧠 | **多智能体协同** | 30+ 专业安全智能体，按需调度、协同作战 |
-| 🔌 | **LLM 无关** | 兼容 OpenAI / DeepSeek / 通义千问 / Ollama 等 OpenAI 协议端点，模型热切换 |
-| 🛠️ | **工具调用** | 内置 50+ 工具（29 个安全专用 + 5 个静默浏览器 + 8 个共享协作浏览器），智能体自主调用 |
-| 🔌 | **标准 Tool 协议（v1.4.0）** | `ToolSpec` + `@register_tool` 动态注册，entry point 插件自动发现，无需改源码 |
-| 🧠 | **模型层抽象（v1.4.0）** | `BaseChatModel` / `ModelRouter` 多模型路由 + 失败 fallback，任意 OpenAI 兼容端点 |
+| 🧠 | **多智能体协同** | 30+ 专业安全智能体，按需调度、协同作战；Swarm 集群协作模式支持智能体间动态 Handoff |
+| 🔌 | **LLM 无关** | 兼容 OpenAI / DeepSeek / 通义千问 / Ollama 等 OpenAI 协议端点，模型热切换 + 多模型路由 fallback |
+| 🛠️ | **工具调用** | 内置 50+ 工具（30+ 安全专用 + 静默浏览器 + 8 个共享协作浏览器），智能体自主调用 |
+| ⛓️ | **沙箱边界（v1.7.0）** | 安全区 / 危险区工具划分，危险工具执行前审批（`allow` / `approve` / `deny` 三级权限），会话级审批令牌 |
+| 🗜️ | **工具输出压缩（v1.7.0）** | 大体积工具输出 LLM 语义摘要，token 压缩 80%+，启动自动注入各 Agent |
+| 📼 | **执行记录存储（v1.7.0）** | SQLite 结构化执行记录（DbRecorder）：按会话 / 工具 / 时间检索、聚合统计、崩溃恢复断点重放 |
+| 🎯 | **评估框架（v1.7.0）** | 声明式实验（任务集 × 智能体 × 重复次数），多维评分，JSON 持久化与历史对比 |
+| 🎓 | **Skill 闭环学习（v1.7.0）** | 可执行结构化知识单元，任务完成自动沉淀，命中后自我改进（质量评分更新） |
+| 🖼️ | **多模态图片注入（v1.7.0）** | 工具输出中的截图 / 图片自动提取，构造多模态消息注入 LLM 上下文 |
+| 🌐 | **双浏览器体系（v1.6.0）** | 有头共享协作浏览器（人机共用、实时可交互面板、登录态持久化）+ 无头静默浏览器（流水线无人值守） |
+| 🔗 | **流水线接入（v1.5.0）** | `baize-orchestration` 模块 entry point 自动加载，会话绑定流水线自动走编排 runner |
+| 🧰 | **自定义工具（v1.4.0）** | Web「工具」页在线创建/编辑自定义工具，启动热注册，无需改代码 |
 | 🧩 | **Agent 扩展（v1.4.0）** | `state` 运行时状态、`memory` 记忆注入、`hooks` 瀑布式事件链 |
 | 🖥️ | **执行环境抽象（v1.4.0）** | 统一执行器接口 + 沙箱隔离，工具可无缝切换 local / docker / ssh 后端 |
 | 📋 | **会话日志（v1.4.0）** | append-only 审计日志，模型历史可重建、攻击链可重放（DFIR 取证） |
-| 🧰 | **自定义工具（v1.4.0）** | Web「工具」页在线创建/编辑自定义工具，启动热注册，无需改代码 |
 | 💾 | **长期记忆（v1.3.0）** | 会话经验自动向量化入库，新问题自动检索命中，越用越聪明 |
-| 🛡️ | **护栏 Guardrails（v1.3.0）** | 文件化可配置的输入/输出策略，注入防护与敏感信息保护 |
+| 🛡️ | **护栏 Guardrails（v1.3.0）** | 文件化可配置的输入/输出策略，注入防护、敏感信息保护与 SSRF 运行时配置 |
 | 📡 | **外部接收器（v1.3.0）** | Webhook / Syslog / 文件监听，打通外部事件源 |
 | ⚡ | **实时交互** | SSE 流式输出、会话持久化、美观的暗色 UI |
 | 🔒 | **本地化部署** | 全部数据保存在本地，隐私安全可控 |
@@ -43,10 +49,11 @@
 
 | 层 | 技术 |
 |---|---|
-| **后端** | Python 3.11+ · FastAPI · Uvicorn · Pydantic v2 |
+| **后端** | Python 3.11+ · FastAPI · Uvicorn · Pydantic v2 · SQLite（执行记录） |
 | **前端** | React 18 · TypeScript · Vite · Tailwind CSS |
+| **浏览器** | Playwright（静默浏览器 + 有头共享协作浏览器） |
 | **向量检索** | OpenAI 协议 Embedding（如 `qwen3.7-text-embedding`，1024 维） |
-| **存储** | 本地目录（会话 / 经验 / 护栏策略均落盘） |
+| **存储** | 本地目录（会话 / 经验 / 护栏策略 / 执行记录均落盘） |
 
 ---
 
@@ -117,6 +124,22 @@ cd baize-core-v1.7.0
 
 ---
 
+## 🖥️ Web 界面
+
+| 页面 | 功能 |
+|---|---|
+| 🖥️ **控制台** | 平台概览、会话 / 智能体 / 工具状态统计 |
+| 💬 **对话渗透** | 多智能体对话（SSE 流式）、会话级共享浏览器协作侧窗、经验一键提炼 |
+| 🔗 **流水线** | 编排流水线编辑与运行（需接入 `baize-orchestration` 模块） |
+| 🤖 **智能体** | 30+ 智能体浏览与切换、自定义智能体创建、Swarm 协作模式 |
+| 🛠️ **工具管理** | 内置工具查看、自定义工具在线创建 / 编辑 / 测试 / 启停 |
+| 📋 **会话管理** | 多会话浏览、重命名、删除、历史检索 |
+| 🛡️ **安全护栏** | 注入 / 敏感信息 / 输出合规策略开关、SSRF 防护运行时配置、沙箱权限面板 |
+| 💾 **经验库** | 经验浏览、编辑、删除、重新向量化 |
+| ⚙️ **设置** | 模型配置（多提供商）、管理员初始化、数据目录 |
+
+---
+
 ## 🤖 智能体体系
 
 内置 **30+** 安全智能体，覆盖以下方向：
@@ -130,9 +153,62 @@ cd baize-core-v1.7.0
 | 🔵 **蓝队 / 应急** | 蓝队 · DFIR · 内存分析 · 网络分析 · DNS/SMTP |
 | 🏁 **CTF** | CTF 解题 · Flag 判别 · 挑战策略 |
 | 📋 **合规 / 报告** | 合规审计 · 安全报告 · 运维值守 |
-| 🔗 **协同支撑** | 分流 · 任务选择 · 推理支撑 · 思维路由 · 经验沉淀 |
+| 🔗 **协同支撑** | 分流 · 任务选择 · 推理支撑 · 思维路由 · 经验沉淀 · 方案对抗 |
 
-所有智能体共享工具调用能力，可通过「智能体」页查看与切换。
+- **Swarm 集群协作**：Selection / Orchestration 智能体以 `pattern_type='swarm'` 注册，支持红队集群协作、智能体间动态 Handoff
+- 所有智能体共享工具调用能力，可通过「智能体」页查看与切换
+
+---
+
+## 🛠️ 工具体系
+
+### 安全工具
+
+内置 **30+** 安全工具（`ToolSpec` + `@register_tool` 动态注册，全部含危险参数黑名单拦截）：
+
+- **核心 9 个**：nmap / nuclei / nikto / sqlmap / gobuster / hydra / tshark / hashcat / metasploit
+- **信息收集**：whois / dig / crt.sh / httpx / openssl / whatweb / wafw00f
+- **漏洞研究**：searchsploit / NVD CVE 查询
+- **爆破枚举**：ffuf / arp-scan / masscan / traceroute
+- **无线 / 取证**：airodump / aircrack / exiftool / strings / binwalk / john / hashid 等
+
+### 自定义工具（v1.4.0）
+
+- Web「工具」页在线创建 / 编辑自定义工具（名称、描述、参数 Schema、执行命令），无需改代码
+- 启动热注册，支持启停切换与在线测试
+- entry point 插件自动发现（`baize.tools` 组），`pip install` 即接入
+
+### 双浏览器体系（v1.6.0）
+
+两套相互独立的浏览器工具，按场景选用：
+
+#### 🕹️ 共享协作浏览器 `shared_browser_*` — 人机共用、可视化
+
+面向**需要登录 / 验证码 / 人工确认**的目标（如渗透测试登录后扫描）：
+
+- **有头可视化**：默认以有头模式启动 Chromium（窗口可见），人工可直接在桌面上观察并操作**同一窗口**（扫码登录、输入验证码、绕过验证、点击确认）
+- **登录态持久化**：`launch_persistent_context` + 固定 `user_data_dir`（默认 `~/.baize/shared-browser-profile`），Cookie / LocalStorage 跨会话保留——人工登录一次，AI 后续操作全部复用登录态
+- **人工介入工具**：`shared_browser_wait_user` 让 AI 打开登录页后**阻塞等待**，可配置 `success_url_prefix` 检测登录成功跳转自动放行，或由前端面板点击「我已完成」手动放行
+- **🎮 实时可交互面板（v1.6.0）**：Web 端共享浏览器面板实时展示浏览器画面（固定视口 1366×768，截图轮询），支持**直接在面板内操作浏览器**——点击 / 滚轮 / 键盘输入 / 前进后退刷新，交互坐标自动映射到浏览器视口
+- **🔗 对话绑定（v1.6.0）**：共享浏览器与对话会话绑定，创建会话时开启「共享浏览器协作」开关后 AI 才会注入 `shared_browser_*` 工具；对话侧窗口实时展示浏览器状态
+- 无图形界面环境自动降级无头（可用 `BAIZE_SHARED_BROWSER_HEADLESS=1` 强制）
+
+典型流程：`shared_browser_open(登录页)` → `shared_browser_wait_user("请扫码登录", success_url_prefix="https://target/console")` → 人工扫码 → AI 复用登录态继续。
+
+工具清单：`shared_browser_open` / `shared_browser_wait_user` / `shared_browser_snapshot` / `shared_browser_click` / `shared_browser_fill` / `shared_browser_evaluate` / `shared_browser_status` / `shared_browser_close`
+
+#### 🤖 静默浏览器 `browser_*` — 无头、可中断、供流水线静默运行
+
+面向**无需人工介入**的自动化侦察（流水线无人值守场景）：
+
+- **无头静默**：每次调用独立 Chromium 实例，无窗口不打扰，用完即关
+- **可中断**：任务被取消 / 超时（单次工具 5 分钟上限）时，浏览器进程在后台被可靠回收（`asyncio.shield` 保护清理），不泄漏、不阻塞流水线
+- **SSRF 防护**：禁止访问内网 / 保留地址（除非 `BAIZE_FETCH_ALLOW_INTERNAL=1`）
+
+工具清单：`browser_fetch` / `browser_screenshot` / `browser_click` / `browser_fill` / `browser_evaluate`
+
+> **依赖**：需安装 `playwright` 并执行 `playwright install chromium`。
+> 未安装时工具 fail-closed，返回明确提示。
 
 ---
 
@@ -150,14 +226,7 @@ cd baize-core-v1.7.0
 
 - 经验支持标题、正文、标签，自动向量化存储
 - 检索门槛可配置（默认相似度 ≥ 0.5，避免无关内容误命中）
-- Web 端「经验」页可浏览、编辑、删除历史经验
-
-```bash
-GET    /api/v1/experiences          # 经验列表
-POST   /api/v1/experiences          # 创建经验（自动生成向量）
-GET    /api/v1/experiences/{id}     # 经验详情
-DELETE /api/v1/experiences/{id}     # 删除经验
-```
+- Web 端「经验」页可浏览、编辑、删除历史经验，支持手动重新向量化
 
 ---
 
@@ -168,6 +237,7 @@ DELETE /api/v1/experiences/{id}     # 删除经验
 - **Prompt 注入防护** — 识别并拦截指令注入尝试
 - **敏感信息保护** — 检测身份证号、手机号、密钥等敏感信息
 - **输出合规校验** — 拒绝协助非法操作（如未授权渗透、恶意软件编写）
+- **SSRF 防护运行时配置（v1.6.0）** — 按会话启用 / 关闭，细粒度控制私网 / 回环 / 链路本地 / 保留地址阻断与 CIDR / 域名白名单，即时生效并 JSON 持久化
 - **自定义策略** — 以 YAML 文件定义关键词规则，热加载生效
 
 Web 端「护栏」页可查看、开关各项策略；策略文件位于 `prompts/`。
@@ -182,10 +252,13 @@ Web 端「护栏」页可查看、开关各项策略；策略文件位于 `promp
 - **审批门控**：危险工具首次调用触发审批，通过后发放审批令牌，会话内后续调用自动放行
 - **会话级状态**：审批结果按会话持久化，重启不丢失
 - **策略可配置**：默认危险工具需审批，支持按工具覆盖权限
+- **执行统计**：按会话记录危险工具审批 / 拒绝 / 放行统计
 
 ```bash
-POST /api/v1/sandbox/check    # 检查工具是否允许执行（返回 allow/approve/deny）
-POST /api/v1/sandbox/approve  # 审批通过危险工具（发放会话级审批令牌）
+POST /api/v1/sandbox/check            # 检查工具是否允许执行（返回 allow/approve/deny）
+POST /api/v1/sandbox/approve          # 审批通过危险工具（发放会话级审批令牌）
+POST /api/v1/sandbox/deny             # 拒绝危险工具执行
+GET  /api/v1/sandbox/stats/{session}  # 会话沙箱执行统计
 ```
 
 ---
@@ -203,6 +276,10 @@ POST /api/v1/sandbox/approve  # 审批通过危险工具（发放会话级审批
 ## 🧠 智能增强（v1.7.0）
 
 围绕「更省、更稳、可衡量、会成长」增强核心引擎：
+
+### 🖼️ 多模态图片自动注入
+
+扫描本轮工具输出中引用的图片文件路径（截图、扫描结果图等），自动提取并构造多模态用户消息注入 LLM 上下文——单张最大 5MB，data URL 约 1.37x 原始大小，避免工具截图 / 图片结果丢失；构建消息时输出 content_parts / 图片数概要日志，便于排查多模态链路问题。
 
 ### 🗜️ 工具输出压缩器（TokenJuice 风格）
 
@@ -234,56 +311,6 @@ POST /api/v1/sandbox/approve  # 审批通过危险工具（发放会话级审批
 
 ---
 
-## 🌐 双浏览器体系（v1.6.0）
-
-Baize 提供**两套相互独立的浏览器工具**，按场景选用：
-
-### 🕹️ 共享协作浏览器 `shared_browser_*` — 人机共用、可视化
-
-面向**需要登录 / 验证码 / 人工确认**的目标（如渗透测试登录后扫描）：
-
-- **有头可视化**：默认以有头模式启动 Chromium（窗口可见），人工可直接在桌面上
-  观察并操作**同一窗口**（扫码登录、输入验证码、绕过验证、点击确认）
-- **登录态持久化**：`launch_persistent_context` + 固定 `user_data_dir`
-  （默认 `~/.baize/shared-browser-profile`），Cookie / LocalStorage 跨会话保留 ——
-  人工登录一次，AI 后续操作全部复用登录态
-- **人工介入工具**：`shared_browser_wait_user` 让 AI 打开登录页后**阻塞等待**，
-  可配置 `success_url_prefix` 检测登录成功跳转自动放行，或由前端面板
-  「共享浏览器」页点击「我已完成」手动放行；超时后 AI 可再次调用续等
-- **🎮 实时可交互面板（v1.6.0）**：Web 端「共享浏览器」面板实时展示浏览器画面
-  （固定视口 1366×768，截图轮询），并支持**直接在面板内操作浏览器**——
-  点击 / 滚轮 / 键盘输入 / 前进后退刷新，交互坐标自动映射到浏览器视口；
-  亦可一键最大化面板获得更大视野，如同操作本地浏览器
-- **🔗 对话绑定（v1.6.0）**：共享浏览器与对话会话绑定，创建会话时开启
-  「共享浏览器协作」开关后，AI 才会注入 `shared_browser_*` 工具；
-  对话侧窗口实时展示浏览器状态，人工可随时放行 / 关闭
-- 无图形界面环境自动降级无头（可用 `BAIZE_SHARED_BROWSER_HEADLESS=1` 强制），
-  配合面板截图查看
-
-典型流程：`shared_browser_open(登录页)` → `shared_browser_wait_user("请扫码登录",
-success_url_prefix="https://target/console")` → 人工扫码 → AI 复用登录态继续。
-
-工具清单：`shared_browser_open` / `shared_browser_wait_user` / `shared_browser_snapshot` /
-`shared_browser_click` / `shared_browser_fill` / `shared_browser_evaluate` /
-`shared_browser_status` / `shared_browser_close`
-
-### 🤖 静默浏览器 `browser_*` — 无头、可中断、供流水线静默运行
-
-面向**无需人工介入**的自动化侦察（流水线无人值守场景）：
-
-- **无头静默**：每次调用独立 Chromium 实例，无窗口不打扰，用完即关
-- **可中断**：任务被取消 / 超时（单次工具 5 分钟上限）时，浏览器进程在后台
-  被可靠回收（`asyncio.shield` 保护清理），不泄漏、不阻塞流水线
-- **SSRF 防护**：禁止访问内网 / 保留地址（除非 `BAIZE_FETCH_ALLOW_INTERNAL=1`）
-
-工具清单：`browser_fetch` / `browser_screenshot` / `browser_click` /
-`browser_fill` / `browser_evaluate`
-
-> **依赖**：需安装 `playwright` 并执行 `playwright install chromium`。
-> 未安装时工具 fail-closed，返回明确提示。
-
----
-
 ## 🔌 API 一览
 
 | 接口 | 方法 | 说明 |
@@ -291,45 +318,55 @@ success_url_prefix="https://target/console")` → 人工扫码 → AI 复用登�
 | `/api/v1/health` | GET | 健康检查（含版本号） |
 | `/api/v1/auth/login` | POST | 管理员登录 |
 | `/api/v1/agents` | GET | 智能体列表 |
+| `/api/v1/agents/custom` | POST | 创建自定义智能体 |
 | `/api/v1/models` | GET | 模型列表 |
+| `/api/v1/model-config` | GET/PUT | 模型配置（多模型 + fallback） |
 | `/api/v1/sessions` | GET/POST/DELETE | 会话管理 |
-| `/api/v1/chat/stream` | POST | SSE 流式对话 |
+| `/api/v1/sessions/{id}/messages/stream` | POST | SSE 流式对话（含图片注入） |
+| `/api/v1/sessions/{id}/reset` / `interrupt` / `cancel` | POST | 会话重置 / 中断 / 取消 |
+| `/api/v1/sessions/{id}/browser-collab` | PATCH | 会话浏览器协作开关 |
+| `/api/v1/sessions/{id}/experience/refine` | POST | 提炼本会话经验 |
 | `/api/v1/experiences` | GET/POST/DELETE | 经验系统（v1.3.0） |
+| `/api/v1/experiences/reindex` | POST | 经验重新向量化 |
 | `/api/v1/guardrails` | GET/PUT | 护栏策略，含 SSRF 防护运行时配置（v1.3.0 / v1.6.0） |
+| `/api/v1/guardrails/sandbox` | GET/PUT | 沙箱权限策略 |
+| `/api/v1/sandbox/check` / `approve` / `deny` | POST | 沙箱审批流（v1.7.0） |
+| `/api/v1/sandbox/stats/{session}` | GET | 沙箱执行统计（v1.7.0） |
+| `/api/v1/tools` | GET | 工具列表 |
+| `/api/v1/tools/custom` | POST | 创建自定义工具（v1.4.0） |
 | `/api/v1/hook` | POST | 接收器 Webhook 入口 |
+| `/api/v1/pipelines` | GET/POST | 流水线（v1.5.0，baize-orchestration） |
 | `/api/v1/shared-browser/status` | GET | 共享浏览器状态（v1.6.0，含视口信息） |
-| `/api/v1/shared-browser/open` | POST | 在共享浏览器打开 URL（SSRF 校验） |
-| `/api/v1/shared-browser/confirm` | POST | 人工确认放行（唤醒 wait_user） |
+| `/api/v1/shared-browser/open` / `confirm` | POST | 打开 URL / 人工确认放行 |
 | `/api/v1/shared-browser/snapshot` | GET | 共享浏览器实时截图（PNG） |
-| `/api/v1/shared-browser/click` | POST | 视口坐标点击（v1.6.0） |
-| `/api/v1/shared-browser/type` | POST | 输入文本（v1.6.0） |
-| `/api/v1/shared-browser/key` | POST | 按下按键（v1.6.0） |
-| `/api/v1/shared-browser/scroll` | POST | 滚动页面（v1.6.0） |
-| `/api/v1/shared-browser/nav` | POST | 前进 / 后退 / 刷新（v1.6.0） |
+| `/api/v1/shared-browser/click` / `type` / `key` / `scroll` / `nav` | POST | 面板内实时操作（v1.6.0） |
 | `/api/v1/shared-browser/close` | POST | 关闭共享浏览器（保留登录态） |
-| `/api/v1/sessions/{id}/browser-collab` | PATCH | 切换会话浏览器协作开关（v1.6.0） |
-| `/api/v1/sandbox/check` | POST | 检查工具是否允许执行（v1.7.0） |
-| `/api/v1/sandbox/approve` | POST | 审批通过危险工具（v1.7.0） |
+| `/api/v1/shared-browser/stream` | WS | 浏览器实时画面流 |
+| `/api/v1/ux/title` / `ux/summarize` | POST | 会话标题生成 / 内容摘要 |
 
 ---
 
 ## 🏛️ 架构
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                      Web 前端 (React)               │
-│        聊天 / 智能体 / 经验 / 护栏 / 设置            │
-└────────────────────────┬────────────────────────────┘
-                         │ SSE / REST
-┌────────────────────────▼────────────────────────────┐
-│                 baize-core（核心模块）                │
-│  ┌──────────┐ ┌───────────┐ ┌────────────────────┐  │
-│  │ 会话管理  │ │ 智能体调度 │ │ 经验系统(向量检索)   │  │
-│  └──────────┘ └───────────┘ └────────────────────┘  │
-│  ┌──────────┐ ┌───────────┐ ┌────────────────────┐  │
-│  │ 工具调用  │ │ 护栏策略   │ │ 接收器(webhook/…)   │  │
-│  └──────────┘ └───────────┘ └────────────────────┘  │
-└─────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│                      Web 前端 (React)                      │
+│   控制台 / 对话 / 流水线 / 智能体 / 工具 / 会话 / 护栏 /     │
+│        经验 / 设置 · 共享浏览器可交互面板                    │
+└──────────────────────────┬────────────────────────────────┘
+                           │ SSE / REST / WebSocket
+┌──────────────────────────▼────────────────────────────────┐
+│                    baize-core（核心模块）                    │
+│  ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐  │
+│  │   会话管理    │ │  智能体调度    │ │ 经验系统(向量检索)   │  │
+│  └──────────────┘ └──────────────┘ └────────────────────┘  │
+│  ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐  │
+│  │   工具调用    │ │ 护栏+沙箱边界 │ │ 接收器(webhook/…)   │  │
+│  └──────────────┘ └──────────────┘ └────────────────────┘  │
+│  ┌──────────────┐ ┌──────────────┐ ┌────────────────────┐  │
+│  │ 压缩器/DbRec  │ │ Eval/Skill  │ │ 多模态注入/服务注册表 │  │
+│  └──────────────┘ └──────────────┘ └────────────────────┘  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -339,13 +376,22 @@ success_url_prefix="https://target/console")` → 人工扫码 → AI 复用登�
 ```
 baize-core/
 ├── src/baize/
-│   ├── agents/           # 30+ 安全智能体 + 护栏策略实现
+│   ├── agents/           # 30+ 安全智能体（含编排 / swarm / 方案对抗）+ 护栏策略实现
 │   ├── api/              # FastAPI 路由
 │   ├── experiences/      # 经验系统（embedding / retriever / store / refine）
 │   ├── receivers/        # 外部接收器（Webhook / Syslog / 文件监听）
-│   ├── sdk/              # SDK 与协议封装（models.py / memory.py / agent.py / session_log.py）
-│   ├── tools/            # 安全工具集（registry / security_tools / security_tools_extra / browser_tools）
+│   ├── sdk/              # SDK 与协议封装（models / memory / agent / session_log）
+│   ├── tools/            # 安全工具集（registry / security / extended / browser / shared_browser）
+│   ├── compressor.py     # 工具输出压缩器（v1.7.0）
+│   ├── db_recorder.py    # SQLite 执行记录存储（v1.7.0）
+│   ├── eval_framework.py # 评估框架 EvalRunner（v1.7.0）
+│   ├── multimodal.py     # 多模态图片注入（v1.7.0）
+│   ├── sandbox.py        # 沙箱边界系统（v1.7.0）
+│   ├── services.py       # 全局服务注册表（v1.7.0）
+│   ├── skill_learner.py  # Skill 闭环学习系统（v1.7.0）
 │   ├── executors.py      # 执行环境抽象（local / docker / ssh + 沙箱 fail-closed）
+│   ├── config.py         # 全局配置（模型 / 数据目录 / 环境变量）
+│   ├── cli.py            # 命令行入口
 │   └── util/             # 通用工具
 ├── web/                  # React 前端
 ├── prompts/              # 提示词与护栏策略文件
@@ -370,9 +416,9 @@ baize-core/
 - [x] **v1.2** 会话管理 + 前端界面优化
 - [x] **v1.3** 经验系统（长期记忆）+ 护栏 + 外部接收器
 - [x] **v1.4** 自定义工具系统 + Agent 稳定性优化
-- [x] **v1.5** 稳定性加固发布（LLM 调用重试、工具超时与异常隔离、空回复兜底）
-- [x] **v1.6** 共享浏览器与对话绑定 + 实时可交互浏览器面板 + SSRF 护栏配置
-- [x] **v1.7** 沙箱边界系统 + 工具输出压缩 + 执行记录存储 + 评估框架 + Skill 闭环学习
+- [x] **v1.5** 稳定性加固（LLM 重试 / 工具超时 / 异常隔离）+ Swarm 协作 + 流水线接入 + 双浏览器
+- [x] **v1.6** 共享浏览器实时可交互面板 + 对话绑定 + SSRF 护栏配置 + 数据目录可配置
+- [x] **v1.7** 沙箱边界 + 工具输出压缩 + 执行记录存储 + 评估框架 + Skill 学习 + 多模态图片注入
 - [ ] **v1.8** 多智能体并行协作优化 + 外部威胁情报接入
 
 ---
@@ -397,6 +443,12 @@ baize-core/
 确认已启用 Embedding 模型（如 `qwen3.7-text-embedding`），新保存的经验会自动生成向量；历史经验可在「经验」页手动触发重新向量化。
 </details>
 
+<details>
+<summary><b>Q4：共享浏览器提示依赖缺失？</b></summary>
+
+确认已安装 `playwright` 并执行 `playwright install chromium`；未安装时浏览器工具 fail-closed，返回明确提示。
+</details>
+
 ---
 
 ## ⚠️ 安全声明
@@ -419,7 +471,7 @@ baize-core/
 - 🔍 **多模态链路日志增强**：构建用户消息时记录 content_parts / 附件数量 / 文本长度，请求按 role / parts / 图片数输出概要日志，便于排查多模态链路问题
 - 📄 **前端列表分页**：工具 / 智能体 / 经验 页面接入通用分页组件（Pagination），大数据量下列表分页加载
 - ⛓️ **沙箱边界系统**：安全区 / 危险区工具划分，危险工具执行前需审批（`allow` / `approve` / `deny`
-  三级权限），会话级审批令牌与状态持久化；新增 `/api/v1/sandbox/check` / `/approve` 端点
+  三级权限），会话级审批令牌与状态持久化；新增 `/api/v1/sandbox/check` / `/approve` / `/deny` / `/stats` 端点
 - 🗜️ **工具输出压缩器**（TokenJuice 风格）：大体积工具输出 LLM 语义摘要，token 压缩 80%+，
   保留关键信息避免简单截断；启动时自动注入各 Agent
 - 📼 **SQLite 执行记录存储（DbRecorder）**：结构化执行记录（按会话 / 工具 / 时间检索）、
