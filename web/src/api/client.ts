@@ -24,6 +24,7 @@ import type {
   EmbeddingConfigData,
   GuardrailConfig,
   GuardrailTestResult,
+  SandboxPolicyConfig,
   SharedBrowserStatus,
 } from '../types';
 
@@ -995,6 +996,16 @@ export async function resetGuardrails(): Promise<GuardrailConfig> {
   return request('/guardrails/reset', { method: 'POST' });
 }
 
+/** 获取沙箱策略配置 */
+export async function getSandboxPolicy(): Promise<SandboxPolicyConfig> {
+  return request('/guardrails/sandbox');
+}
+
+/** 更新沙箱策略配置 */
+export async function updateSandboxPolicy(config: SandboxPolicyConfig): Promise<SandboxPolicyConfig> {
+  return request('/guardrails/sandbox', { method: 'PUT', body: JSON.stringify(config) });
+}
+
 // ===== 共享协作浏览器 =====
 
 export interface SharedBrowserOpenResult {
@@ -1156,3 +1167,12 @@ export async function saveEmbeddingConfig(data: EmbeddingConfigData): Promise<{ 
 export async function reindexExperiences(): Promise<{ ok: boolean; indexed: number; total: number }> {
   return request('/experiences/reindex', { method: 'POST' });
 }
+
+// ===== Sandbox =====
+
+/** 拒绝沙箱工具执行 */
+export async function sandboxDeny(toolName: string, sessionId: string): Promise<{ status: string; tool: string }> {
+  return request('/sandbox/deny', { method: 'POST', body: JSON.stringify({ tool_name: toolName, session_id: sessionId }) });
+}
+
+// ===== Experiences =====

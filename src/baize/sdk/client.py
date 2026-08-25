@@ -6,9 +6,12 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Optional
+
+logger = logging.getLogger("baize.client")
 
 import httpx
 from openai import AsyncOpenAI
@@ -111,6 +114,12 @@ class LLMClient:
             if m.content_parts:
                 # 多模态内容块（含图片）
                 item["content"] = m.content_parts
+                part_types = [p.get("type") for p in m.content_parts]
+                image_count = sum(1 for p in m.content_parts if p.get("type") == "image_url")
+                logger.info(
+                    "[client] 多模态消息: role=%s, parts=%s, images=%d",
+                    m.role, part_types, image_count,
+                )
             elif m.content:
                 item["content"] = m.content
             if m.tool_calls:

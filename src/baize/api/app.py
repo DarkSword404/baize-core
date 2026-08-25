@@ -51,7 +51,7 @@ from baize.multimodal import build_user_message
 from baize.receivers.manager import ReceiverManager
 from baize.receivers.webhook import handle_webhook
 from baize.sdk.client import LLMClient, ModelNotConfiguredError, ChatMessage
-from baize.tools.custom_tools import test_custom_tool
+from baize.tools.custom_tools import CustomToolStore, test_custom_tool
 from baize.tools.extended import _check_url_allowed
 from baize.tools.shared_browser import get_shared_browser
 from baize.experiences import (
@@ -154,6 +154,29 @@ class AuthResponse(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class SandboxCheckRequest(BaseModel):
+    tool_name: str
+    session_id: str
+
+
+class SandboxApproveRequest(BaseModel):
+    tool_name: str
+    session_id: str
+
+
+class SandboxDenyRequest(BaseModel):
+    tool_name: str
+    session_id: str
+
+
+class SandboxPolicyRequest(BaseModel):
+    enabled: bool = True
+    default_permission: str = "approve"
+    tool_permissions: dict[str, str] = Field(default_factory=dict)
+    auto_approve_after: int = 3
+    max_dangerous_per_turn: int = 10
 
 
 class ListSessionsResponse(BaseModel):
@@ -443,8 +466,15 @@ def create_baize_api_app(
     app.state.auth_manager = AuthManager()
     app.state.custom_agents = CustomAgentStore()
     app.state.custom_pipelines = CustomPipelineStore()
-    from baize.tools.custom_tools import CustomToolStore
+    app.state.deleted_store = get_deleted_store()
     app.state.custom_tools = CustomToolStore()
+
+    # ── 沙箱边界系统 ──
+    from baize.sandbox import Sandbox, SandboxPolicy
+    from baize import services
+
+    app.state.sandbox = Sandbox(SandboxPolicy(enabled=True))
+
     app.state.custom_tools.register_all()  # 启动时热注册已有自定义工具
     app.state.attachment_store = AttachmentStore()
     app.state.require_auth = cfg.require_auth
@@ -456,6 +486,10 @@ def create_baize_api_app(
     app.state.experience_retriever = ExperienceRetriever(
         app.state.experience_store, app.state.embedding
     )
+
+    # 注册到全局服务表，供 Agent 运行时查找
+    services.register("sandbox", app.state.sandbox)
+    services.register("experience_store", app.state.experience_store)
 
     # ------------------------------------------------------------------
     # 启动凭证输出
@@ -1161,6 +1195,23 @@ def create_baize_api_app(
         prompt_id: str,
         payload: dict,
     ) -> dict:
+        # ── 沙箱审批：prompt_id 格式 "sandbox:{session_id}:{tool_name}" ──
+        if prompt_id.startswith("sandbox:"):
+            parts = prompt_id[len("sandbox:"):].split(":", 1)
+            if len(parts) == 2:
+                sandbox_sid, tool_name = parts
+                response = (payload.get("response") or payload.get("content") or "")
+                rejected = payload.get("rejected")
+                if rejected in ("true", True, "1") or response == "deny":
+                    sandbox: Sandbox = app.state.sandbox
+                    sandbox.deny(tool_name, sandbox_sid)
+                    return {"ok": True, "handled": True, "approved": False}
+                else:
+                    sandbox: Sandbox = app.state.sandbox
+                    sandbox.approve(tool_name, sandbox_sid)
+                    return {"ok": True, "handled": True, "approved": True}
+            return {"ok": False, "handled": False, "error": "无效的沙箱审批 prompt_id"}
+
         # ── 流水线人工确认：prompt_id 格式 "run:{run_id}"，桥接 runner.resume_after_confirm ──
         if prompt_id.startswith("run:"):
             run_id = prompt_id[len("run:"):]
@@ -1253,6 +1304,11 @@ def create_baize_api_app(
         if agent is None:
             agent = get_agent(None)  # 回退默认
 
+        # ── TokenJuice 语义压缩：为 agent 挂载工具输出压缩器 ──
+        if agent is not None and agent.tool_output_compressor is None:
+            from baize.compressor import CompressorConfig, ToolOutputCompressor
+            agent.tool_output_compressor = ToolOutputCompressor(CompressorConfig(enabled=True))
+
         # ── pattern 流水线会话：会话绑定了流水线时，走流水线事件源 ──
         pipeline_def = None
         if getattr(session, "pattern", None):
@@ -1297,6 +1353,12 @@ def create_baize_api_app(
             active_attachments,
             attachment_store=attachment_store,
             session_id=session_id,
+        )
+        logger.info(
+            "构建用户消息: has_content_parts=%s, attachments=%d, text_len=%d",
+            user_chat_message.content_parts is not None,
+            len(active_attachments),
+            len(payload.input),
         )
 
         # ── 中断续跑：用户输入"继续"类指令且历史中存在已执行内容时，
@@ -1472,6 +1534,8 @@ def create_baize_api_app(
                     return
 
             try:
+                # 设置会话 ID，使沙箱审批能识别当前会话
+                agent.session_id = session_id
                 # 流式对话（传入历史上下文 + 多模态 user 消息 + 附件工具 + 历史经验）
                 # 包一层 SSE 心跳：工具执行等静默期定期发送注释行保活，防止连接超时断开
                 async for kind, event in _with_sse_heartbeat(
@@ -1525,6 +1589,15 @@ def create_baize_api_app(
                         yield (
                             f"event: reasoning_step\n"
                             f"data: {json.dumps({'type': 'tool_output', 'tool': event.tool_name, 'output': event.tool_result})}\n\n"
+                        )
+                    elif event.type == "sandbox_approval":
+                        # 沙箱审批：转发为 user_prompt 事件，前端展示审批弹窗
+                        sandbox_sid = event.sandbox_session_id or ""
+                        prompt_id = f"sandbox:{sandbox_sid}:{event.tool_name}"
+                        reason = event.sandbox_reason or "需要审批"
+                        yield (
+                            "event: user_prompt\n"
+                            f"data: {json.dumps({'prompt_id': prompt_id, 'prompt_type': 'sandbox_approval', 'title': '工具执行审批', 'message': f'工具 `{event.tool_name}` 需要审批: {reason}', 'command': '', 'options': ['approve', 'deny'], 'is_password': False})}\n\n"
                         )
                     elif event.type == "done":
                         # 正常完成：保存完整内容
@@ -1631,6 +1704,47 @@ def create_baize_api_app(
     def reset_guardrails() -> dict:
         store = GuardrailStore.get()
         return store.reset().to_dict()
+
+    # ------------------------------------------------------------------
+    # 沙箱策略配置（集成在安全护栏下）
+    # ------------------------------------------------------------------
+    @app.get(
+        "/api/v1/guardrails/sandbox",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def get_sandbox_policy() -> dict:
+        """获取沙箱策略配置。"""
+        sandbox: Sandbox = app.state.sandbox
+        policy = sandbox.policy
+        return {
+            "enabled": policy.enabled,
+            "default_permission": policy.default_permission,
+            "tool_permissions": policy.tool_permissions,
+            "auto_approve_after": policy.auto_approve_after,
+            "max_dangerous_per_turn": policy.max_dangerous_per_turn,
+        }
+
+    @app.put(
+        "/api/v1/guardrails/sandbox",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def update_sandbox_policy(payload: SandboxPolicyRequest) -> dict:
+        """更新沙箱策略配置。"""
+        sandbox: Sandbox = app.state.sandbox
+        sandbox.policy.enabled = payload.enabled
+        sandbox.policy.default_permission = payload.default_permission
+        sandbox.policy.tool_permissions = payload.tool_permissions
+        sandbox.policy.auto_approve_after = payload.auto_approve_after
+        sandbox.policy.max_dangerous_per_turn = payload.max_dangerous_per_turn
+        return {
+            "enabled": sandbox.policy.enabled,
+            "default_permission": sandbox.policy.default_permission,
+            "tool_permissions": sandbox.policy.tool_permissions,
+            "auto_approve_after": sandbox.policy.auto_approve_after,
+            "max_dangerous_per_turn": sandbox.policy.max_dangerous_per_turn,
+        }
 
     # ------------------------------------------------------------------
     # 长期记忆：经验库管理（CRUD + 提炼 + embedding 配置）
@@ -1951,6 +2065,51 @@ def create_baize_api_app(
         text = (payload.get("text") or payload.get("input") or "")
         summary = text[:120] + "…" if len(text) > 120 else text
         return {"summary": summary}
+
+    # ------------------------------------------------------------------
+    # 沙箱边界 API
+    # ------------------------------------------------------------------
+    @app.post(
+        "/api/v1/sandbox/check",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def sandbox_check(payload: SandboxCheckRequest) -> dict:
+        """检查工具是否允许执行。"""
+        sandbox: Sandbox = app.state.sandbox
+        return sandbox.check(payload.tool_name, payload.session_id)
+
+    @app.post(
+        "/api/v1/sandbox/approve",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def sandbox_approve(payload: SandboxApproveRequest) -> dict:
+        """审批通过工具执行。"""
+        sandbox: Sandbox = app.state.sandbox
+        sandbox.approve(payload.tool_name, payload.session_id)
+        return {"status": "ok", "tool": payload.tool_name}
+
+    @app.post(
+        "/api/v1/sandbox/deny",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def sandbox_deny(payload: SandboxDenyRequest) -> dict:
+        """拒绝工具执行。"""
+        sandbox: Sandbox = app.state.sandbox
+        sandbox.deny(payload.tool_name, payload.session_id)
+        return {"status": "ok", "tool": payload.tool_name, "denied": True}
+
+    @app.get(
+        "/api/v1/sandbox/stats/{session_id}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def sandbox_stats(session_id: str) -> dict:
+        """获取会话沙箱统计。"""
+        sandbox: Sandbox = app.state.sandbox
+        return sandbox.get_session_stats(session_id)
 
     # ------------------------------------------------------------------
     # 认证

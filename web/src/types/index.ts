@@ -289,3 +289,12 @@ export interface GuardrailTestResult {
   message: string;
   rule_id: string | null;
 }
+
+// ===== 沙箱策略配置 =====
+export interface SandboxPolicyConfig {
+  enabled: boolean;
+  default_permission: string;   // allow | approve | deny
+  tool_permissions: Record<string, string>;  // tool_name -> allow | approve | deny
+  auto_approve_after: number;
+  max_dangerous_per_turn: number;
+}

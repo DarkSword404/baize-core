@@ -22,6 +22,3 @@ api_auth.json.key
 .env
 .env.*
 !*.env.example
-
-# 前端构建产物
-web/dist/

@@ -1,15 +1,18 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useMemo, useState, useRef } from 'react';
 import { useApp } from '../context/AppContext';
 import { listAgents, deleteCustomAgent, deleteBuiltinAgent, createSession, streamMessage, getAgentDetail } from '../api/client';
 import type { ReasoningStep } from '../api/client';
 import type { AgentMetadata } from '../types';
 import { agentDescCN, toolDescCN, agentNameCN, toolNameCN } from '../i18n/translations';
+import { Pagination } from '../components/Pagination';
 import type { JSX } from 'react';
 
 export function Agents(): JSX.Element {
   const { agents, setAgents, addToast } = useApp();
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(12);
   const [selectedAgent, setSelectedAgent] = useState<AgentMetadata | null>(null);
 
   // 创建智能体 (Agent Builder)
@@ -25,6 +28,8 @@ export function Agents(): JSX.Element {
   useEffect(() => {
     loadAgents();
   }, []);
+
+  useEffect(() => { setPage(1); }, [search]);
 
   async function loadAgents() {
     setLoading(true);
@@ -145,6 +150,12 @@ export function Agents(): JSX.Element {
     return false;
   });
 
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const paginatedItems = useMemo(() => {
+    const start = (page - 1) * pageSize;
+    return filtered.slice(start, start + pageSize);
+  }, [filtered, page, pageSize]);
+
   return (
     <div className="h-full overflow-y-auto p-6 lg:p-8">
       <div className="flex items-center justify-between mb-6">
@@ -192,8 +203,9 @@ export function Agents(): JSX.Element {
           {search ? '未找到匹配的智能体' : '暂无可用智能体'}
         </div>
       ) : (
+        <>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filtered.map(a => (
+          {paginatedItems.map(a => (
             <div
               key={a.id || a.name}
               className={`relative text-left p-5 rounded-2xl border transition-all hover:shadow-xl ${
@@ -253,6 +265,16 @@ export function Agents(): JSX.Element {
             </div>
           ))}
         </div>
+
+        <Pagination
+          currentPage={page}
+          totalPages={totalPages}
+          pageSize={pageSize}
+          totalItems={filtered.length}
+          onPageChange={setPage}
+          onPageSizeChange={(size) => { setPageSize(size); setPage(1); }}
+        />
+        </>
       )}
 
       {/* Agent Builder 创建智能体弹窗 */}

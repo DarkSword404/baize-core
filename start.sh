@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 #
-# Baize (白泽) — 启动脚本 v1.6.0
+# Baize (白泽) — 启动脚本 v1.7.0
 #
 # 启动后端 (FastAPI/uvicorn, 端口 8001) 和前端 (Vite, 端口 5173)。
 # 项目布局：
-#   baize-core-v1.6.0          核心框架（含前端 web/）
+#   baize-core-v1.7.0          核心框架（含前端 web/）
 #   baize-orchestration        流水线编排模块（可选）
 #
 set -euo pipefail
@@ -87,6 +87,8 @@ echo -e "${C_CYAN}============================================${C_RESET}"
 
 if $BACKEND_ALREADY_RUNNING; then
   log "后端此前已在运行，跳过凭证等待。"
+elif [[ -f "$BAIZE_AUTH_DB" ]]; then
+  log "凭证文件已存在，跳过生成 ($BAIZE_AUTH_DB)"
 else
   timeout=30; deadline=$(( $(date +%s) + timeout ))
   while (( $(date +%s) < deadline )); do
@@ -101,5 +103,5 @@ else
     fi
     sleep 0.5
   done
-  log "等待凭证超时，请查看 $BACKEND_LOG"
+  err "等待凭证超时，请查看 $BACKEND_LOG"
 fi

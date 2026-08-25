@@ -23,7 +23,10 @@ from typing import Any, AsyncIterator, Callable, Optional, Protocol
 
 from baize.sdk.client import ChatMessage, CompletionResult, CompletionUsage, LLMClient, estimate_tokens
 from baize.sdk.memory import BaseMemory
-from baize.sdk.session_log import SessionLog
+from baize.sdk.session_log import SessionLog, SessionEvent
+from baize.compressor import CompressorConfig, ToolOutputCompressor
+from baize.services import get as _svc_get
+from baize.sandbox import PermissionLevel
 
 logger = logging.getLogger("baize.agent")
 
@@ -199,12 +202,53 @@ class RunResult:
 class AgentEvent:
     """流式运行事件。"""
 
-    type: str  # "reasoning" | "text" | "tool_call" | "tool_result" | "done"
+    type: str  # "reasoning" | "text" | "tool_call" | "tool_result" | "sandbox_approval" | "done"
     content: str = ""
     tool_name: Optional[str] = None
     tool_args: Optional[dict] = None
     tool_result: Optional[str] = None
     tool_call_id: Optional[str] = None  # 工具调用 ID：用于会话持久化时配对 call/output
+    sandbox_reason: Optional[str] = None  # 沙箱拦截原因
+    sandbox_session_id: Optional[str] = None  # 沙箱审批会话 ID
+
+
+# ── 工具输出图片自动注入 ──
+
+def _inject_tool_images(
+    history: list[ChatMessage],
+    tool_count: int,
+) -> bool:
+    """扫描本轮新增的工具输出消息，提取图片并注入多模态用户消息。
+
+    反向扫描 history 中最近 tool_count 条 tool 消息，收集其中引用的
+    图片文件路径，去重后构造一条多模态用户消息追加到 history 末尾。
+
+    返回 True 表示至少注入了一张图片。
+    """
+    from baize.multimodal import build_tool_image_message
+
+    if tool_count <= 0:
+        return False
+
+    # 收集本轮所有 tool 消息的输出文本
+    tool_outputs: list[str] = []
+    for m in reversed(history):
+        if m.role == "tool" and m.content:
+            tool_outputs.append(m.content)
+            if len(tool_outputs) >= tool_count:
+                break
+
+    if not tool_outputs:
+        return False
+
+    # 合并所有输出，提取图片并构造消息
+    combined = "\n".join(reversed(tool_outputs))
+    img_msg = build_tool_image_message(combined)
+    if img_msg is None:
+        return False
+
+    history.append(img_msg)
+    return True
 
 
 @dataclass
@@ -257,6 +301,8 @@ class Agent:
     hooks: dict[str, Callable] = field(default_factory=dict)
     session_id: Optional[str] = None
     session_log: Optional[SessionLog] = None
+    tool_output_compressor: Optional[ToolOutputCompressor] = None
+    """工具输出语义压缩器（TokenJuice 风格）。None 表示不压缩。"""
 
     # ------------------------------------------------------------------
     # 钩子触发与记忆辅助
@@ -299,7 +345,7 @@ class Agent:
 
     async def _tool_call_chain(
         self, tool_name: str, arguments: str
-    ) -> tuple[bool, str, Optional[str]]:
+    ) -> tuple[bool, str, Optional[str], Optional[str]]:
         """on_tool_call 瀑布式事件链：多个策略插件可叠加执行。
 
         每个处理器可:
@@ -308,11 +354,26 @@ class Agent:
         - 旧式签名 ``(agent, name, arguments)`` 无 next 参数时自动继续。
 
         Returns:
-            (是否放行, 最终参数, 拒绝原因)
+            (是否放行, 最终参数, 拒绝原因, 审批会话ID)
+            第4个值仅在沙箱要求审批时非空，调用方应暂停等待用户审批。
         """
+        # 沙箱边界检查：内置策略，在钩子链之前执行，确保始终生效
+        sandbox = _svc_get("sandbox")
+        session_id = self.session_log.session_id if self.session_log else self.session_id
+        if sandbox is not None and session_id:
+            try:
+                check = sandbox.check(tool_name, str(session_id))
+                if not check.get("allowed"):
+                    if check.get("level") == PermissionLevel.APPROVE:
+                        # 需要审批：返回 session_id 让调用方暂停等待
+                        return False, arguments, check.get("reason", "需要审批"), str(session_id)
+                    return False, arguments, check.get("reason", "沙箱策略拦截"), None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("沙箱检查失败: %s", exc)
+
         handlers = self._hook_handlers("on_tool_call")
         if not handlers:
-            return True, arguments, None
+            return True, arguments, None, None
         current_args = arguments
         index = 0
 
@@ -344,17 +405,32 @@ class Agent:
 
         decision = await run_next()
         if isinstance(decision, dict) and decision.get("deny"):
-            return False, current_args, decision.get("reason", "未说明")
-        return True, current_args, None
+            return False, current_args, decision.get("reason", "未说明"), None
+        return True, current_args, None, None
 
     def _log_event(self, kind: str, **payload: Any) -> None:
         """追加一条会话日志事件（未配置 session_log 时静默跳过）。"""
         if self.session_log is None:
             return
         try:
-            self.session_log.append(kind, **payload)
+            event = self.session_log.append(kind, **payload)
         except Exception as exc:  # noqa: BLE001
             logger.warning("会话日志写入失败 (%s): %s", kind, exc)
+            return
+        # 并行写入结构化数据库（DbRecorder），异常不影响主流程
+        db = _svc_get("db_recorder")
+        if db is not None:
+            try:
+                if kind == "session/start":
+                    db.start_session(self.session_log.session_id, self.name)
+                elif kind == "session/end":
+                    db.end_session(self.session_log.session_id, payload.get("reason", "done"))
+                db.record_event(self.session_log.session_id, event)
+                if kind == "tool/result" and "name" in payload:
+                    duration = payload.get("duration", 0)
+                    db.record_tool_call(self.session_log.session_id, payload["name"], duration)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("DbRecorder 写入失败: %s", exc)
 
     def _ensure_session_started(self) -> None:
         """确保会话日志已记录 session/start（首条事件，可重复调用）。"""
@@ -868,10 +944,34 @@ class Agent:
                         self._log_event("tool/result", name=name, output=output, denied=False, reason="工具未注册")
                     else:
                         # 瀑布式策略链：审计/权限/危险命令拦截可叠加，可短路
-                        allowed, final_args, deny_reason = await self._tool_call_chain(name, arguments)
+                        allowed, final_args, deny_reason, approval_sid = await self._tool_call_chain(name, arguments)
                         if not allowed:
-                            output = f"(工具调用已被策略拦截: {deny_reason or '未说明'})"
-                            self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
+                            if approval_sid is not None:
+                                # 沙箱要求审批：等待用户决定
+                                sandbox = _svc_get("sandbox")
+                                if sandbox is not None:
+                                    approved = await sandbox.request_approval(name, approval_sid)
+                                    if approved:
+                                        # 用户批准：执行工具
+                                        started_at = asyncio.get_running_loop().time()
+                                        try:
+                                            output = await tool.execute(final_args)
+                                        except Exception as exc:  # noqa: BLE001
+                                            output = f"(工具 {name} 执行失败: {type(exc).__name__}: {exc})"
+                                            self._log_event("tool/error", name=name, error=str(exc))
+                                            logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
+                                        duration = asyncio.get_running_loop().time() - started_at
+                                        self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
+                                        sandbox.record_execution(name, approval_sid, True)
+                                    else:
+                                        output = f"(工具调用已被用户拒绝: {deny_reason or '未说明'})"
+                                        self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
+                                else:
+                                    output = f"(工具调用需要审批但沙箱不可用: {deny_reason or '未说明'})"
+                                    self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
+                            else:
+                                output = f"(工具调用已被策略拦截: {deny_reason or '未说明'})"
+                                self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
                         else:
                             started_at = asyncio.get_running_loop().time()
                             try:
@@ -885,6 +985,9 @@ class Agent:
                             duration = asyncio.get_running_loop().time() - started_at
                             self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
                         await self._emit("on_tool_result", self, name, output)
+                    # ── TokenJuice 语义压缩（hooks 拿到原始输出，LLM 拿到压缩版）──
+                    if self.tool_output_compressor and self.tool_output_compressor.should_compress(name, output):
+                        output = await self.tool_output_compressor.compress(name, output)
                     history.append(
                         ChatMessage(
                             role="tool",
@@ -919,6 +1022,40 @@ class Agent:
         self._log_event("turn/end", index=turn_index)
         return "", total
 
+    async def _try_auto_refine(self, client, user_message: str, final_text: str) -> None:
+        """经验自动提炼：回合结束后检测信号，高置信度自动入库。"""
+        store = _svc_get("experience_store")
+        if store is None:
+            return
+        try:
+            from baize.experiences.refine import auto_refine_if_worthy, _AUTO_SAVE_CONFIDENCE
+            tool_events = self._collect_tool_events()
+            result = await auto_refine_if_worthy(
+                client=client,
+                agent_key=self.name,
+                session_id=self.session_log.session_id if self.session_log else self.session_id or "",
+                user_message=user_message,
+                final_text=final_text,
+                tool_events=tool_events,
+                store=store,
+            )
+            if result.get("auto_saved"):
+                logger.info("经验自动入库: %s", result.get("candidate", {}).get("title", ""))
+            elif result.get("confidence", 0) > 0:
+                logger.info("经验提炼完成但未入库: 置信度 %.2f (阈值 %.2f)", result.get("confidence", 0), _AUTO_SAVE_CONFIDENCE)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("经验自动提炼异常: %s", exc)
+
+    def _collect_tool_events(self) -> list[dict]:
+        """从会话日志中收集本轮工具调用事件。"""
+        events: list[dict] = []
+        if self.session_log is None:
+            return events
+        for ev in self.session_log:
+            if ev.kind in ("tool/call", "tool/result"):
+                events.append({"kind": ev.kind, **ev.payload})
+        return events
+
     async def run(
         self,
         user_message: str,
@@ -944,8 +1081,13 @@ class Agent:
             await self._trim_history_async(history, tool_schemas, client)
             content, usage = await self._run_tool_loop(client, history, tool_schemas)
             await self._emit("on_done", self, content)
+
+            # ── 经验自动提炼 (P1) ──
+            await self._try_auto_refine(client, user_message, content)
+
             self._log_event("session/end", reason="done")
             self._save_memory(history, content)
+
             return RunResult(
                 final_output=content,
                 messages=history,
@@ -987,6 +1129,10 @@ class Agent:
                 history = self._build_history(user_message, ctx, prior_history)
                 # 用多模态 user 消息替换末尾的纯文本 user 消息
                 history = history[:-1] + [user_chat_message]
+                logger.info(
+                    "多模态 user_chat_message 已注入: content_parts=%s",
+                    getattr(user_chat_message, "content_parts", None) is not None,
+                )
             else:
                 history = self._build_history(user_message, ctx, prior_history)
             if experience_block:
@@ -1000,6 +1146,14 @@ class Agent:
             # 请求前按预算裁剪（含可选语义摘要）
             await self._trim_history_async(history, tool_schemas, client)
             last_trim_msgs = len(history)
+            # 验证裁剪后最后一条 user 消息的 content_parts 是否保留
+            last_user_msg = history[-1] if history else None
+            if last_user_msg and last_user_msg.role == "user":
+                logger.info(
+                    "裁剪后末条 user 消息: has_content_parts=%s, content_len=%d",
+                    last_user_msg.content_parts is not None,
+                    len(last_user_msg.content or ""),
+                )
             _, max_message_chars, _ = self._context_budget()
             final_text = ""
             tool_call_seq: dict = {}  # 工具调用 ID 序号（模型未给 id 时兜底生成）
@@ -1096,10 +1250,41 @@ class Agent:
                             tool_call_id=tc_id,
                         )
                         # 瀑布式策略链：多个策略插件可叠加，可短路拦截
-                        allowed, final_args, deny_reason = await self._tool_call_chain(name, arguments)
+                        allowed, final_args, deny_reason, approval_sid = await self._tool_call_chain(name, arguments)
                         if not allowed:
-                            output = f"(工具调用已被策略拦截: {deny_reason or '未说明'})"
-                            self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
+                            if approval_sid is not None:
+                                # 沙箱要求审批：通知前端并等待用户决定
+                                yield AgentEvent(
+                                    type="sandbox_approval",
+                                    tool_name=name,
+                                    tool_args=arguments,
+                                    sandbox_reason=deny_reason,
+                                    sandbox_session_id=approval_sid,
+                                )
+                                sandbox = _svc_get("sandbox")
+                                if sandbox is not None:
+                                    approved = await sandbox.request_approval(name, approval_sid)
+                                    if approved:
+                                        # 用户批准：执行工具
+                                        started_at = asyncio.get_running_loop().time()
+                                        try:
+                                            output = await tool.execute(final_args)
+                                        except Exception as exc:  # noqa: BLE001
+                                            output = f"(工具 {name} 执行失败: {type(exc).__name__}: {exc})"
+                                            self._log_event("tool/error", name=name, error=str(exc))
+                                            logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
+                                        duration = asyncio.get_running_loop().time() - started_at
+                                        self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
+                                        sandbox.record_execution(name, approval_sid, True)
+                                    else:
+                                        output = f"(工具调用已被用户拒绝: {deny_reason or '未说明'})"
+                                        self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
+                                else:
+                                    output = f"(工具调用需要审批但沙箱不可用: {deny_reason or '未说明'})"
+                                    self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
+                            else:
+                                output = f"(工具调用已被策略拦截: {deny_reason or '未说明'})"
+                                self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
                         elif tool is None:
                             output = f"(工具 {name} 不存在)"
                             self._log_event("tool/result", name=name, output=output, denied=False, reason="工具未注册")
@@ -1121,6 +1306,15 @@ class Agent:
                             ChatMessage(role="tool", content=output, tool_call_id=tc_id, name=name)
                         )
                     self._log_event("turn/end", index=turn_index)
+                    # ── 工具输出图片自动注入 ──
+                    # 扫描本轮所有工具输出，若发现图片文件路径，自动注入
+                    # 多模态用户消息，让 LLM 能"看到"工具下载/生成的图片。
+                    _injected = _inject_tool_images(history, len(tool_calls))
+                    if _injected:
+                        logger.info(
+                            "工具图片已注入: turn=%d, tool_count=%d",
+                            turn_index, len(tool_calls),
+                        )
                     # 单条超长消息（如超大工具输出）无条件截断，防止超出模型输入长度上限；
                     # 昂贵的语义摘要 / 整轮删除仍由下方防抖逻辑控制。
                     self._truncate_long_messages(history, max_message_chars)
@@ -1176,6 +1370,8 @@ class Agent:
 
             yield AgentEvent(type="done", content=final_text)
             await self._emit("on_done", self, final_text)
+            # ── 经验自动提炼 (P1) ──
+            await self._try_auto_refine(client, user_message, final_text)
             self._log_event("session/end", reason="done")
             self._save_memory(history, final_text)
         except Exception as exc:  # noqa: BLE001

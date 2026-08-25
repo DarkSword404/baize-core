@@ -76,7 +76,7 @@ AGENTS_TOOL_MAP: dict[str, list[str]] = {
 # 某些 agent 的工具不在 extended_tools() 中，需用特殊 import
 NON_STANDARD_TOOLS: dict[str, str] = {
     # Agent Builder 使用 agent_builder 模块的工具
-    "agent_builder": "AGENT_BUILDER_TOOLS",
+    "agent_builder": "[]",
     # Selection Agent 使用 agent_discovery + operational_handoffs 工具
     "selection_agent": "OPERATIONAL_HANDOFF_TOOLS + AGENT_DISCOVERY_TOOLS",
     # Orchestration Agent 使用 approach_contest + agent_discovery 工具
@@ -84,7 +84,7 @@ NON_STANDARD_TOOLS: dict[str, str] = {
 }
 
 NON_STANDARD_IMPORTS: dict[str, str] = {
-    "agent_builder": "from baize.agents.agent_builder import AGENT_BUILDER_TOOLS",
+    "agent_builder": "",
     "selection_agent": (
         "from baize.agents.agent_discovery import AGENT_DISCOVERY_TOOLS\n"
         "from baize.agents.operational_handoffs import OPERATIONAL_HANDOFF_TOOLS"

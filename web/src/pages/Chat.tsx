@@ -656,10 +656,11 @@ export function Chat(): JSX.Element {
     console.log('[Chat] Submitting prompt:', pendingPrompt.prompt_id, 'value:', response);
     setPendingPrompt(null);
     setPromptValue('');
-    // 用户留空提交视为拒绝（不再依赖选项里是否含 Cancel）
-    const rejected = !response;
+    const isSandbox = pendingPrompt.prompt_type === 'sandbox_approval';
+    const rejected = isSandbox ? false : !response;
+    const finalResponse = isSandbox ? 'approve' : response;
     try {
-      await respondToPrompt(activeSessionId, pendingPrompt.prompt_id, response, rejected);
+      await respondToPrompt(activeSessionId, pendingPrompt.prompt_id, finalResponse, rejected);
     } catch (err: any) {
       addToast({ type: 'error', title: '提交失败', message: err.message });
     }
@@ -1216,7 +1217,7 @@ export function Chat(): JSX.Element {
               <div>
                 <h3 className="text-sm font-semibold text-gray-200">{pendingPrompt.title}</h3>
                 <p className="text-xs text-gray-500 mt-0.5">
-                  {pendingPrompt.prompt_type === 'sudo_password' ? '需要密码继续执行命令' : '需要确认才能继续'}
+                  {pendingPrompt.prompt_type === 'sudo_password' ? '需要密码继续执行命令' : pendingPrompt.prompt_type === 'sandbox_approval' ? '危险工具需要审批后才能执行' : '需要确认才能继续'}
                 </p>
               </div>
             </div>
@@ -1254,14 +1255,14 @@ export function Chat(): JSX.Element {
                 onClick={handlePromptCancel}
                 className="px-4 py-2 rounded-lg text-xs font-medium text-gray-400 hover:text-gray-200 hover:bg-gray-800 transition-colors"
               >
-                {pendingPrompt.options.includes('Cancel') ? '取消' : '取消'}
+                {pendingPrompt.prompt_type === 'sandbox_approval' ? '拒绝' : pendingPrompt.options.includes('Cancel') ? '取消' : '取消'}
               </button>
               <button
                 onClick={handlePromptSubmit}
                 disabled={pendingPrompt.is_password && !promptValue.trim()}
                 className="px-4 py-2 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-600 rounded-lg text-xs font-medium transition-colors"
               >
-                {pendingPrompt.options.includes('Submit') ? '提交' : pendingPrompt.options.includes('Allow') ? '允许' : '确认'}
+                {pendingPrompt.prompt_type === 'sandbox_approval' ? '批准' : pendingPrompt.options.includes('Submit') ? '提交' : pendingPrompt.options.includes('Allow') ? '允许' : '确认'}
               </button>
             </div>
           </div>

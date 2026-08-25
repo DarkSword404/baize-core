@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from baize.prompts_util import get_agent_instructions, extract_display_name_and_desc
 from baize.sdk.agent import Agent, AgentTool
-from baize.agents.agent_builder import AGENT_BUILDER_TOOLS
+
+AGENT_BUILDER_TOOLS: list[dict] = []
 
 AGENT_KEY = "agent_builder"
 

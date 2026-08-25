@@ -1,4 +1,4 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useMemo, useState, useRef } from 'react';
 import { useApp } from '../context/AppContext';
 import {
   listAvailableTools,
@@ -11,6 +11,7 @@ import {
   type CustomTool,
 } from '../api/client';
 import type { ReasoningStep } from '../api/client';
+import { Pagination } from '../components/Pagination';
 import type { JSX } from 'react';
 
 const CATEGORY_CN: Record<string, string> = {
@@ -31,6 +32,8 @@ export function Tools(): JSX.Element {
   const [category, setCategory] = useState<string>('all');
   const [builtinTools, setBuiltinTools] = useState<ToolInfo[]>([]);
   const [customTools, setCustomTools] = useState<CustomTool[]>([]);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(12);
   const [selected, setSelected] = useState<CustomTool | ToolInfo | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
@@ -60,6 +63,8 @@ export function Tools(): JSX.Element {
     loadTools();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  useEffect(() => { setPage(1); }, [search, category]);
 
   // 合并：内置工具 + 自定义工具（自定义覆盖内置同名）
   const allTools: Array<{ name: string; description: string; category: string; is_custom: boolean; enabled: boolean; record?: CustomTool }> = [];
@@ -96,6 +101,12 @@ export function Tools(): JSX.Element {
     const s = search.toLowerCase();
     return t.name.toLowerCase().includes(s) || t.description.toLowerCase().includes(s);
   });
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const paginatedItems = useMemo(() => {
+    const start = (page - 1) * pageSize;
+    return filtered.slice(start, start + pageSize);
+  }, [filtered, page, pageSize]);
 
   async function handleDelete(id: string, name: string) {
     if (!confirm(`确定要删除自定义工具「${name}」吗？此操作不可撤销。`)) return;
@@ -254,8 +265,9 @@ export function Tools(): JSX.Element {
           {search || category !== 'all' ? '未找到匹配的工具' : '暂无可用工具'}
         </div>
       ) : (
+        <>
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-          {filtered.map(t => (
+          {paginatedItems.map(t => (
             <div
               key={t.name}
               className={`relative text-left p-5 rounded-2xl border transition-all hover:shadow-xl ${
@@ -326,6 +338,16 @@ export function Tools(): JSX.Element {
             </div>
           ))}
         </div>
+
+        <Pagination
+          currentPage={page}
+          totalPages={totalPages}
+          pageSize={pageSize}
+          totalItems={filtered.length}
+          onPageChange={setPage}
+          onPageSizeChange={(size) => { setPageSize(size); setPage(1); }}
+        />
+        </>
       )}
 
       {/* Tool Builder 创建工具弹窗 */}

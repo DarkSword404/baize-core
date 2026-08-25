@@ -2,8 +2,9 @@ import { useState, useEffect } from 'react';
 import { useApp } from '../context/AppContext';
 import {
   getGuardrails, updateGuardrails, resetGuardrails, testGuardrail,
+  getSandboxPolicy, updateSandboxPolicy,
 } from '../api/client';
-import type { GuardrailConfig, GuardrailRule, GuardrailTestResult, SSRFGuardrailSettings } from '../types';
+import type { GuardrailConfig, GuardrailRule, GuardrailTestResult, SSRFGuardrailSettings, SandboxPolicyConfig } from '../types';
 import type { JSX } from 'react';
 
 const CATEGORY_LABELS: Record<string, string> = {
@@ -45,6 +46,25 @@ const inputCls =
 
 const EMPTY_FORM = { name: '', category: 'input_injection', severity: 'high', description: '', pattern: '' };
 
+// 安全区 / 危险区工具列表（与后端 sandbox.py 保持一致）
+const SAFE_TOOL_LIST = [
+  'shared_browser_snapshot', 'shared_browser_status', 'shared_browser_evaluate',
+  'make_web_search_with_explanation', 'make_google_search', 'shodan_search',
+  'read_file', 'think',
+];
+
+const DANGEROUS_TOOL_LIST = [
+  'generic_linux_command', 'execute_code', 'http_request', 'web_request_framework',
+  'port_scan', 'shared_browser_open', 'shared_browser_click', 'shared_browser_fill',
+  'shared_browser_close', 'deploy_payload', 'exploit', 'run_metasploit',
+];
+
+const PERM_COLORS: Record<string, string> = {
+  allow: 'bg-emerald-600/20 text-emerald-400 border-emerald-600/30',
+  approve: 'bg-amber-600/20 text-amber-400 border-amber-600/30',
+  deny: 'bg-red-600/20 text-red-400 border-red-600/30',
+};
+
 export function Guardrails(): JSX.Element {
   const { addToast } = useApp();
   const [config, setConfig] = useState<GuardrailConfig | null>(null);
@@ -59,6 +79,10 @@ export function Guardrails(): JSX.Element {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<GuardrailTestResult | null>(null);
 
+  // 沙箱策略
+  const [sandboxPolicy, setSandboxPolicy] = useState<SandboxPolicyConfig | null>(null);
+  const [sandboxSaving, setSandboxSaving] = useState(false);
+
   useEffect(() => { load(); }, []);
 
   async function load() {
@@ -66,6 +90,13 @@ export function Guardrails(): JSX.Element {
     try {
       const cfg = await getGuardrails();
       setConfig(cfg);
+      // 同时加载沙箱策略
+      try {
+        const sp = await getSandboxPolicy();
+        setSandboxPolicy(sp);
+      } catch {
+        // 沙箱策略加载失败不影响护栏配置展示
+      }
     } catch (err: any) {
       addToast({ type: 'error', title: '加载失败', message: err.message });
     } finally {
@@ -171,6 +202,39 @@ export function Guardrails(): JSX.Element {
       addToast({ type: 'error', title: '重置失败', message: err.message });
     } finally {
       setSaving(false);
+    }
+  }
+
+  // ---- 沙箱策略 ----
+  function patchSandbox(patch: Partial<SandboxPolicyConfig>) {
+    setSandboxPolicy(sp => (sp ? { ...sp, ...patch } : sp));
+  }
+
+  function setToolPerm(toolName: string, perm: string) {
+    setSandboxPolicy(sp => {
+      if (!sp) return sp;
+      const newPerms = { ...sp.tool_permissions };
+      if (perm === 'approve') {
+        // 审批是默认行为，删除显式配置以使用默认值
+        delete newPerms[toolName];
+      } else {
+        newPerms[toolName] = perm;
+      }
+      return { ...sp, tool_permissions: newPerms };
+    });
+  }
+
+  async function handleSandboxSave() {
+    if (!sandboxPolicy) return;
+    setSandboxSaving(true);
+    try {
+      const saved = await updateSandboxPolicy(sandboxPolicy);
+      setSandboxPolicy(saved);
+      addToast({ type: 'success', title: '已保存', message: '沙箱策略已生效，后续对话即时生效' });
+    } catch (err: any) {
+      addToast({ type: 'error', title: '保存失败', message: err.message });
+    } finally {
+      setSandboxSaving(false);
     }
   }
 
@@ -423,6 +487,146 @@ export function Guardrails(): JSX.Element {
               )}
             </div>
           </section>
+
+          {/* 沙箱边界配置 */}
+          {sandboxPolicy && (
+            <section className="bg-gray-900 border border-gray-800 rounded-2xl p-6 mb-6">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-sm font-semibold flex items-center gap-2">
+                  <span className={`w-2 h-2 rounded-full ${sandboxPolicy.enabled ? 'bg-emerald-400' : 'bg-red-400'}`} />
+                  沙箱边界
+                </h2>
+                <button
+                  onClick={handleSandboxSave}
+                  disabled={sandboxSaving}
+                  className="px-3 py-1.5 text-xs bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 rounded-lg transition-colors"
+                >
+                  {sandboxSaving ? '保存中...' : '保存沙箱配置'}
+                </button>
+              </div>
+              <p className="text-xs text-gray-500 mb-4">
+                控制智能体工具执行权限。安全区工具直接允许，危险区工具需审批。修改即时生效，无需重启。
+              </p>
+
+              {/* 总开关 */}
+              <div className="flex items-center justify-between gap-3 mb-4 pb-4 border-b border-gray-800">
+                <div>
+                  <label className="block text-xs text-gray-400 mb-1">沙箱总开关</label>
+                  <p className="text-[10px] text-gray-600">
+                    关闭后所有工具直接允许执行，不再需要审批。
+                  </p>
+                </div>
+                <button
+                  onClick={() => patchSandbox({ enabled: !sandboxPolicy.enabled })}
+                  className={`shrink-0 w-11 h-6 rounded-full transition-colors ${sandboxPolicy.enabled ? 'bg-emerald-600' : 'bg-red-600'}`}
+                  title={sandboxPolicy.enabled ? '沙箱已开启' : '沙箱已关闭（全放行）'}
+                >
+                  <span className={`block w-4 h-4 rounded-full bg-white transition-transform ${sandboxPolicy.enabled ? 'translate-x-6' : 'translate-x-1'}`} />
+                </button>
+              </div>
+
+              {sandboxPolicy.enabled && (
+                <>
+                  {/* 策略参数 */}
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4 pb-4 border-b border-gray-800">
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">未分类工具默认策略</label>
+                      <select
+                        value={sandboxPolicy.default_permission}
+                        onChange={e => patchSandbox({ default_permission: e.target.value })}
+                        className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 outline-none"
+                      >
+                        <option value="allow">允许</option>
+                        <option value="approve">审批</option>
+                        <option value="deny">禁止</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">自动审批阈值</label>
+                      <input
+                        type="number"
+                        min={0}
+                        max={100}
+                        value={sandboxPolicy.auto_approve_after}
+                        onChange={e => patchSandbox({ auto_approve_after: Number(e.target.value) || 0 })}
+                        className={`${inputCls} w-full`}
+                      />
+                      <p className="text-[10px] text-gray-600 mt-1">同一工具连续通过 N 次后自动放行，0=不自动放行</p>
+                    </div>
+                    <div>
+                      <label className="block text-xs text-gray-400 mb-1">单轮最大危险调用</label>
+                      <input
+                        type="number"
+                        min={1}
+                        max={500}
+                        value={sandboxPolicy.max_dangerous_per_turn}
+                        onChange={e => patchSandbox({ max_dangerous_per_turn: Number(e.target.value) || 10 })}
+                        className={`${inputCls} w-full`}
+                      />
+                      <p className="text-[10px] text-gray-600 mt-1">单轮对话中危险工具最大调用次数</p>
+                    </div>
+                  </div>
+
+                  {/* 工具权限列表 */}
+                  <div>
+                    <p className="text-xs text-gray-400 mb-3">工具权限覆盖（覆盖默认分类）</p>
+
+                    {/* 安全区工具 */}
+                    <details className="mb-3" open>
+                      <summary className="text-xs text-emerald-400 cursor-pointer hover:text-emerald-300 mb-2">
+                        安全区工具（默认直接允许）
+                      </summary>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                        {SAFE_TOOL_LIST.map(toolName => {
+                          const perm = sandboxPolicy.tool_permissions[toolName] || 'allow';
+                          return (
+                            <div key={toolName} className="flex items-center justify-between gap-2 px-3 py-1.5 bg-gray-800/50 rounded-lg">
+                              <code className="text-[11px] text-gray-300">{toolName}</code>
+                              <select
+                                value={perm}
+                                onChange={e => setToolPerm(toolName, e.target.value)}
+                                className={`text-[10px] px-1.5 py-0.5 rounded border ${PERM_COLORS[perm] || ''} bg-gray-800 outline-none`}
+                              >
+                                <option value="allow">允许</option>
+                                <option value="approve">审批</option>
+                                <option value="deny">禁止</option>
+                              </select>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </details>
+
+                    {/* 危险区工具 */}
+                    <details className="mb-3" open>
+                      <summary className="text-xs text-red-400 cursor-pointer hover:text-red-300 mb-2">
+                        危险区工具（默认需要审批）
+                      </summary>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                        {DANGEROUS_TOOL_LIST.map(toolName => {
+                          const perm = sandboxPolicy.tool_permissions[toolName] || 'approve';
+                          return (
+                            <div key={toolName} className="flex items-center justify-between gap-2 px-3 py-1.5 bg-gray-800/50 rounded-lg">
+                              <code className="text-[11px] text-gray-300">{toolName}</code>
+                              <select
+                                value={perm}
+                                onChange={e => setToolPerm(toolName, e.target.value)}
+                                className={`text-[10px] px-1.5 py-0.5 rounded border ${PERM_COLORS[perm] || ''} bg-gray-800 outline-none`}
+                              >
+                                <option value="allow">允许</option>
+                                <option value="approve">审批</option>
+                                <option value="deny">禁止</option>
+                              </select>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </details>
+                  </div>
+                </>
+              )}
+            </section>
+          )}
 
           {/* 规则列表 */}
           <section className="bg-gray-900 border border-gray-800 rounded-2xl p-6 mb-6">

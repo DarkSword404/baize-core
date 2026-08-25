@@ -8,7 +8,7 @@
 
 > 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
 
-[![Version](https://img.shields.io/badge/version-v1.6.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.7.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
@@ -61,7 +61,7 @@
 ### 安装
 
 ```bash
-cd baize-core-v1.6.0
+cd baize-core-v1.7.0
 ./setup.sh    # 创建虚拟环境 + 安装 baize-core + 构建前端
 ```
 
@@ -174,6 +174,22 @@ Web 端「护栏」页可查看、开关各项策略；策略文件位于 `promp
 
 ---
 
+## ⛓️ 沙箱边界（v1.7.0）
+
+在护栏基础上增加**显式沙箱边界**：将工具划分为「安全区」与「危险区」，危险区工具执行前需审批。
+
+- **三级权限**：`allow`（直接允许）/ `approve`（需要审批）/ `deny`（禁止）
+- **审批门控**：危险工具首次调用触发审批，通过后发放审批令牌，会话内后续调用自动放行
+- **会话级状态**：审批结果按会话持久化，重启不丢失
+- **策略可配置**：默认危险工具需审批，支持按工具覆盖权限
+
+```bash
+POST /api/v1/sandbox/check    # 检查工具是否允许执行（返回 allow/approve/deny）
+POST /api/v1/sandbox/approve  # 审批通过危险工具（发放会话级审批令牌）
+```
+
+---
+
 ## 📡 外部接收器（v1.3.0）
 
 打通外部事件源，自动触发智能体响应：
@@ -181,6 +197,40 @@ Web 端「护栏」页可查看、开关各项策略；策略文件位于 `promp
 - **Webhook** — 外部系统通过 `POST /api/v1/hook` 推送事件
 - **Syslog** — 接收网络设备/服务器日志
 - **文件监听** — 监控指定目录新文件自动处理
+
+---
+
+## 🧠 智能增强（v1.7.0）
+
+围绕「更省、更稳、可衡量、会成长」增强核心引擎：
+
+### 🗜️ 工具输出压缩器（TokenJuice 风格）
+
+大体积工具输出（如扫描报告、页面源码）先经 LLM **语义摘要**再进入上下文，保留关键信息的同时 token 压缩 80%+，避免简单截断丢失重要数据；启动时自动注入各 Agent。
+
+### 📼 执行记录存储（DbRecorder）
+
+作为 SessionLog（JSONL）的互补存储，提供：
+
+- **结构化查询** — 按会话 / 工具 / 时间范围检索执行记录
+- **聚合统计** — 工具调用次数、耗时分布、成功率
+- **崩溃恢复** — 断点重放，从记录重建模型历史
+
+### 🎯 评估框架（EvalRunner）
+
+声明式实验定义 + 可复现 benchmark 执行：
+
+- 实验规格：任务集 × 智能体 × 重复次数 → 结果矩阵
+- 评分维度：任务完成度、工具调用效率、时间效率、成功率
+- 结果持久化：JSON 落盘，支持增量运行与历史对比
+
+### 🎓 Skill 闭环学习系统
+
+在经验系统之上引入 **Skill**——可执行的结构化知识单元：
+
+- Agent 完成任务后自动沉淀 Skill（含触发条件、执行步骤）
+- Skill 每次命中后评估效果，更新质量评分，实现**自我改进**
+- 按标签 / 触发词检索，下次任务自动命中复用
 
 ---
 
@@ -245,7 +295,7 @@ success_url_prefix="https://target/console")` → 人工扫码 → AI 复用登�
 | `/api/v1/sessions` | GET/POST/DELETE | 会话管理 |
 | `/api/v1/chat/stream` | POST | SSE 流式对话 |
 | `/api/v1/experiences` | GET/POST/DELETE | 经验系统（v1.3.0） |
-| `/api/v1/guardrails` | GET/PUT | 护栏策略（v1.3.0） |
+| `/api/v1/guardrails` | GET/PUT | 护栏策略，含 SSRF 防护运行时配置（v1.3.0 / v1.6.0） |
 | `/api/v1/hook` | POST | 接收器 Webhook 入口 |
 | `/api/v1/shared-browser/status` | GET | 共享浏览器状态（v1.6.0，含视口信息） |
 | `/api/v1/shared-browser/open` | POST | 在共享浏览器打开 URL（SSRF 校验） |
@@ -258,7 +308,8 @@ success_url_prefix="https://target/console")` → 人工扫码 → AI 复用登�
 | `/api/v1/shared-browser/nav` | POST | 前进 / 后退 / 刷新（v1.6.0） |
 | `/api/v1/shared-browser/close` | POST | 关闭共享浏览器（保留登录态） |
 | `/api/v1/sessions/{id}/browser-collab` | PATCH | 切换会话浏览器协作开关（v1.6.0） |
-| `/api/v1/guardrails` | GET/PUT | 护栏策略，新增 SSRF 防护运行时配置（v1.6.0） |
+| `/api/v1/sandbox/check` | POST | 检查工具是否允许执行（v1.7.0） |
+| `/api/v1/sandbox/approve` | POST | 审批通过危险工具（v1.7.0） |
 
 ---
 
@@ -321,7 +372,8 @@ baize-core/
 - [x] **v1.4** 自定义工具系统 + Agent 稳定性优化
 - [x] **v1.5** 稳定性加固发布（LLM 调用重试、工具超时与异常隔离、空回复兜底）
 - [x] **v1.6** 共享浏览器与对话绑定 + 实时可交互浏览器面板 + SSRF 护栏配置
-- [ ] **v1.7** 多智能体并行协作优化 + 外部威胁情报接入
+- [x] **v1.7** 沙箱边界系统 + 工具输出压缩 + 执行记录存储 + 评估框架 + Skill 闭环学习
+- [ ] **v1.8** 多智能体并行协作优化 + 外部威胁情报接入
 
 ---
 
@@ -361,7 +413,26 @@ baize-core/
 
 ## 📝 更新日志
 
-### v1.6.0（当前）
+### v1.7.0（当前）
+
+- 🖼️ **工具输出图片自动注入**：扫描本轮工具输出中引用的图片文件路径，自动提取并构造多模态用户消息注入 LLM 上下文（单张最大 5MB，data URL 约 1.37x 原始大小），避免工具截图 / 图片结果丢失
+- 🔍 **多模态链路日志增强**：构建用户消息时记录 content_parts / 附件数量 / 文本长度，请求按 role / parts / 图片数输出概要日志，便于排查多模态链路问题
+- 📄 **前端列表分页**：工具 / 智能体 / 经验 页面接入通用分页组件（Pagination），大数据量下列表分页加载
+- ⛓️ **沙箱边界系统**：安全区 / 危险区工具划分，危险工具执行前需审批（`allow` / `approve` / `deny`
+  三级权限），会话级审批令牌与状态持久化；新增 `/api/v1/sandbox/check` / `/approve` 端点
+- 🗜️ **工具输出压缩器**（TokenJuice 风格）：大体积工具输出 LLM 语义摘要，token 压缩 80%+，
+  保留关键信息避免简单截断；启动时自动注入各 Agent
+- 📼 **SQLite 执行记录存储（DbRecorder）**：结构化执行记录（按会话 / 工具 / 时间检索）、
+  聚合统计（调用次数 / 耗时 / 成功率）、崩溃恢复断点重放
+- 🎯 **评估框架（EvalRunner）**：声明式实验定义（任务集 × 智能体 × 重复次数）、
+  多维评分（完成度 / 工具效率 / 时间效率 / 成功率）、JSON 持久化与历史对比
+- 🎓 **Skill 闭环学习系统**：可执行结构化知识单元，任务完成后自动沉淀，命中后自我改进
+  （质量评分更新），按标签 / 触发词检索复用
+- 🧩 **服务注册表**：全局单例服务（DbRecorder / Sandbox / SkillLearner）统一注册与查找，
+  避免修改各 Agent 构造参数
+- 🚀 **升级**：版本号统一为 1.7.0（后端 / 前端 / 脚本 / 文档）
+
+### v1.6.0
 
 - 🎮 **共享浏览器实时可交互面板**：Web「共享浏览器」面板从「截图查看」升级为**可实时操作**
   ——固定视口 1366×768，前端截图轮询 + 透明交互层，点击 / 滚轮 / 键盘输入 / 前进后退刷新
@@ -489,6 +560,6 @@ baize-core/
 
 **白泽·智脑 (Baize)** · 仅供安全研究与授权测试使用
 
-[![Version](https://img.shields.io/badge/version-v1.6.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.7.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
 
 </div>

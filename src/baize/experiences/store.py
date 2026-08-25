@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import threading
@@ -19,8 +20,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+logger = logging.getLogger("baize.experiences")
+
 BAIZE_DIR = Path.home() / ".baize"
 EXPERIENCES_DIR = BAIZE_DIR / "experiences"
+
+
+def _resolve_data_dir() -> Path:
+    import os as _os
+    data_dir = _os.environ.get("BAIZE_DATA_DIR", "")
+    if data_dir:
+        return Path(data_dir)
+    return BAIZE_DIR
 
 GLOBAL_SCOPE = "global"
 AGENT_PREFIX = "agent:"
@@ -86,11 +97,32 @@ class ExperienceStore:
     """经验库：按作用域分文件持久化，提供 CRUD 与检索所需的基础能力。"""
 
     def __init__(self, base_dir: Path | None = None) -> None:
-        self._base_dir = base_dir or EXPERIENCES_DIR
+        self._base_dir = base_dir or (_resolve_data_dir() / "experiences")
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._cache: dict[str, list[ExperienceItem]] = {}
         self._loaded: set[str] = set()
+        # 自动迁移：旧路径有数据但新路径为空时，复制过来
+        self._migrate_from_legacy()
+
+    def _migrate_from_legacy(self) -> None:
+        """从旧路径 (~/.baize/experiences/) 迁移数据到新路径。"""
+        import shutil
+        legacy = Path.home() / ".baize" / "experiences"
+        if not legacy.is_dir():
+            return
+        existing = list(self._base_dir.glob("*.json"))
+        if existing:
+            return  # 新路径已有数据，不覆盖
+        legacy_files = list(legacy.glob("*.json"))
+        if not legacy_files:
+            return
+        for f in legacy_files:
+            try:
+                shutil.copy2(f, self._base_dir / f.name)
+            except Exception:
+                pass
+        logger.info("经验库迁移完成: %s → %s (%d 个文件)", legacy, self._base_dir, len(legacy_files))
 
     # ------------------------------------------------------------------
     # 文件读写

@@ -10,6 +10,7 @@ import {
   reindexExperiences,
 } from '../api/client';
 import type { ExperienceItem, EmbeddingConfigData } from '../types';
+import { Pagination } from '../components/Pagination';
 import type { JSX } from 'react';
 
 const SCOPE_FILTERS = [
@@ -24,6 +25,8 @@ export function Experiences(): JSX.Element {
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [scopeFilter, setScopeFilter] = useState('all');
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(12);
   const [editing, setEditing] = useState<ExperienceItem | 'new' | null>(null);
   const [embedOpen, setEmbedOpen] = useState(false);
   const [embedCfg, setEmbedCfg] = useState<EmbeddingConfigData>({
@@ -32,6 +35,8 @@ export function Experiences(): JSX.Element {
   const [reindexing, setReindexing] = useState(false);
 
   useEffect(() => { load(); }, []);
+
+  useEffect(() => { setPage(1); }, [search, scopeFilter]);
 
   async function load() {
     setLoading(true);
@@ -109,6 +114,12 @@ export function Experiences(): JSX.Element {
     });
   }, [items, scopeFilter, search]);
 
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const paginatedItems = useMemo(() => {
+    const start = (page - 1) * pageSize;
+    return filtered.slice(start, start + pageSize);
+  }, [filtered, page, pageSize]);
+
   function scopeLabel(scope: string): string {
     return scope === 'global' ? '全局' : scope.replace(/^agent:/, '智能体: ');
   }
@@ -170,8 +181,9 @@ export function Experiences(): JSX.Element {
             '暂无经验。完成一次渗透测试复盘后，经验会自动沉淀到这里。'}
         </div>
       ) : (
+        <>
         <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-          {filtered.map(item => (
+          {paginatedItems.map(item => (
             <div key={item.id} className={`rounded-2xl border p-5 transition-colors ${
               item.enabled ? 'border-gray-800 bg-gray-900/40 hover:border-gray-700' : 'border-gray-800/60 bg-gray-900/20 opacity-60'
             }`}>
@@ -225,6 +237,16 @@ export function Experiences(): JSX.Element {
             </div>
           ))}
         </div>
+
+        <Pagination
+          currentPage={page}
+          totalPages={totalPages}
+          pageSize={pageSize}
+          totalItems={filtered.length}
+          onPageChange={setPage}
+          onPageSizeChange={(size) => { setPageSize(size); setPage(1); }}
+        />
+        </>
       )}
 
       {/* Editor Modal */}

@@ -1,18 +1,22 @@
-"""经验提炼：信号检测 + LLM 复盘总结生成。
+"""经验提炼：信号检测 + LLM 复盘总结生成 + 自动入库（Skill 自我改进）。
 
-闭环：
-1. 每轮对话完成时（或新一轮开始前），用纯规则信号判断是否值得提炼；
+闭环（参考 Hermes Agent 的 closed learning loop）：
+1. 每轮对话完成时，用纯规则信号判断是否值得提炼；
 2. 值得提炼时，从会话轨迹中提取"尝试过程"（工具调用 + 最终结论）；
-3. 调用 LLM 生成复盘总结候选（title / content / tags）；
-4. 候选挂到会话，由前端展示卡片，用户确认/编辑后入库（混合模式）。
+3. 调用 LLM 生成复盘总结候选（title / content / tags / confidence）；
+4. 高置信度（≥ 0.7）自动入库，低置信度挂到前端由用户确认（混合模式）。
+5. 入库后自动更新 embedding 向量，使下次检索时即可命中。
 """
 
 from __future__ import annotations
 
 import json
+import logging
 from typing import Optional
 
 from .store import ExperienceItem, new_id, now_iso
+
+logger = logging.getLogger("baize.refine")
 
 # 结论性信号关键词：命中即认为本轮有明确结果，值得沉淀
 CONCLUSION_KEYWORDS = [
@@ -27,6 +31,9 @@ FAILURE_KEYWORDS = [
     "失败", "错误", "无结果", "超时", "拒绝", "无法", "不能", "不通",
     "failed", "error", "timeout", "refused", "denied", "unable", "no result",
 ]
+
+# 自动入库的最低置信度阈值（越高越保守）
+_AUTO_SAVE_CONFIDENCE = 0.70
 
 
 def _has_any(text: str, keywords: list[str]) -> bool:
@@ -188,3 +195,109 @@ def candidate_to_item(candidate: dict, agent_key: str, session_id: str) -> Exper
         created_at=now_iso(),
         updated_at=now_iso(),
     )
+
+
+# ---- 自动提炼（Skill 自我改进）-----------------------------------------------
+
+_REFINE_CONFIDENCE_PROMPT = (
+    "你是一名资深渗透测试专家。请评估以下经验提炼候选的质量。\n"
+    "候选标题：{title}\n候选内容：{content}\n候选标签：{tags}\n\n"
+    "评分标准：\n"
+    "- 0.9-1.0：可复用性强，步骤清晰，适用条件明确，tags 准确\n"
+    "- 0.7-0.89：有参考价值，但步骤或条件不够清晰\n"
+    "- 0.5-0.69：有部分参考价值，信息不够完整\n"
+    "- 0.0-0.49：价值低或内容混乱\n\n"
+    "只输出一个 0.0 到 1.0 之间的置信度数字，如 0.85"
+)
+
+
+async def _score_confidence(client, candidate: dict) -> float:
+    """用 LLM 评估候选经验的质量置信度。"""
+    try:
+        from baize.sdk.client import ChatMessage
+
+        prompt = _REFINE_CONFIDENCE_PROMPT.format(
+            title=candidate.get("title", ""),
+            content=candidate.get("content", ""),
+            tags=candidate.get("tags", []),
+        )
+        result = await client.complete(
+            [ChatMessage(role="user", content=prompt)],
+            tools=None,
+        )
+        text = (result.content or "").strip()
+        # 提取浮点数
+        import re as _re
+        match = _re.search(r"([01](?:\.\d+)?)", text)
+        if match:
+            return float(match.group(1))
+        return 0.5
+    except Exception:
+        return 0.5
+
+
+async def auto_refine_if_worthy(
+    client,
+    agent_key: str,
+    session_id: str,
+    user_message: str,
+    final_text: str,
+    tool_events: list[dict],
+    prior_history: list[dict] | None = None,
+    scope: str = "auto",
+    store=None,
+) -> dict:
+    """自动提炼经验：信号检测 → LLM 提炼 → 置信度评分 → 高置信度自动入库。
+
+    返回:
+        {
+            "auto_saved": bool,      # 是否已自动入库
+            "candidate": dict,        # 提炼候选
+            "confidence": float,      # 置信度
+            "item_id": str | None,    # 入库后的条目 ID
+        }
+
+    参考 Hermes Agent 的 closed learning loop：任务完成后自动创建 Skill，
+    高置信度直接入库，无须人工确认。
+    """
+    # 1. 信号检测
+    signals = detect_turn_signals(tool_events, final_text, "", user_message)
+    if not signals["should_refine"]:
+        return {"auto_saved": False, "candidate": {}, "confidence": 0.0, "item_id": None}
+
+    # 2. LLM 提炼
+    candidate = await refine_experience(
+        client, agent_key, session_id, user_message, final_text, tool_events,
+        prior_history, scope,
+    )
+    if not candidate.get("title") or not candidate.get("content"):
+        return {"auto_saved": False, "candidate": candidate, "confidence": 0.0, "item_id": None}
+
+    # 3. 置信度评分
+    confidence = await _score_confidence(client, candidate)
+
+    # 4. 高置信度自动入库
+    if confidence >= _AUTO_SAVE_CONFIDENCE:
+        item = candidate_to_item(candidate, agent_key, session_id)
+        if store:
+            try:
+                store.create(item.to_dict())
+                logger.info(
+                    "经验自动入库: %s (置信度 %.2f, agent=%s, session=%s)",
+                    item.title, confidence, agent_key, session_id,
+                )
+                return {
+                    "auto_saved": True,
+                    "candidate": candidate,
+                    "confidence": confidence,
+                    "item_id": item.id,
+                }
+            except Exception as exc:
+                logger.warning("经验自动入库失败: %s", exc)
+
+    return {
+        "auto_saved": False,
+        "candidate": candidate,
+        "confidence": confidence,
+        "item_id": None,
+    }

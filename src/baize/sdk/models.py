@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import abc
+import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
@@ -107,6 +108,13 @@ class OpenAICompatibleModel(BaseChatModel):
             item: dict[str, Any] = {"role": m.role}
             if m.content_parts:
                 item["content"] = m.content_parts
+                # 调试：打印多模态内容块概要
+                part_types = [p.get("type") for p in m.content_parts]
+                image_count = sum(1 for p in m.content_parts if p.get("type") == "image_url")
+                logger.info(
+                    "多模态消息: role=%s, parts=%s, images=%d",
+                    m.role, part_types, image_count,
+                )
             elif m.content:
                 item["content"] = m.content
             if m.tool_calls:
@@ -168,13 +176,22 @@ class OpenAICompatibleModel(BaseChatModel):
         tools: Optional[list[dict]] = None,
         temperature: float = 0.7,
     ) -> AsyncIterator[CompletionResult]:
-        stream = await self._client.chat.completions.create(
-            model=self.model,
-            messages=self._messages(history),
-            tools=tools,
-            temperature=temperature,
-            stream=True,
+        msgs = self._messages(history)
+        logger.info(
+            "模型请求: model=%s, base_url=%s, msg_count=%d",
+            self.model, self.base_url, len(msgs),
         )
+        try:
+            stream = await self._client.chat.completions.create(
+                model=self.model,
+                messages=msgs,
+                tools=tools,
+                temperature=temperature,
+                stream=True,
+            )
+        except Exception as e:
+            logger.error("模型 API 请求失败: %s", e)
+            raise
         async for chunk in stream:
             delta = chunk.choices[0].delta if chunk.choices else None
             content = delta.content if delta else ""
