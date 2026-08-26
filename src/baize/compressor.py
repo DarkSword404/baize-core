@@ -144,9 +144,21 @@ class ToolOutputCompressor:
         model_provider: Optional[str],
     ) -> Optional[str]:
         """调用 LLM 执行语义压缩。"""
-        from baize.sdk.client import LLMClient
+        from baize.sdk.client import LLMClient, SingleModelConfig, resolve_model_config, ChatMessage
 
-        client = LLMClient(model=model, model_provider=model_provider)
+        # 如果指定了独立模型，构建对应配置；否则复用全局模型配置
+        if model:
+            base_config = resolve_model_config()
+            config = SingleModelConfig(
+                base_url=base_config.base_url,
+                api_key=base_config.api_key,
+                model=model,
+                context_window=base_config.context_window,
+            )
+            client = LLMClient(config=config)
+        else:
+            # 复用主模型配置
+            client = LLMClient()
 
         prompt = _COMPRESS_TEMPLATE.format(
             tool_name=tool_name,
@@ -155,8 +167,8 @@ class ToolOutputCompressor:
         )
 
         messages = [
-            {"role": "system", "content": _COMPRESS_SYSTEM},
-            {"role": "user", "content": prompt},
+            ChatMessage(role="system", content=_COMPRESS_SYSTEM),
+            ChatMessage(role="user", content=prompt),
         ]
 
         result = await client.complete(messages, tools=None)

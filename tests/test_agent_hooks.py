@@ -15,10 +15,11 @@ def _make_agent(**hooks) -> Agent:
 @pytest.mark.asyncio
 async def test_no_handlers_passthrough() -> None:
     agent = _make_agent()
-    allowed, final_args, reason = await agent._tool_call_chain("nmap_scan", '{"host": "x"}')
+    allowed, final_args, reason, approval_id = await agent._tool_call_chain("nmap_scan", '{"host": "x"}')
     assert allowed is True
     assert final_args == '{"host": "x"}'
     assert reason is None
+    assert approval_id is None
 
 
 @pytest.mark.asyncio
@@ -30,7 +31,7 @@ async def test_legacy_handler_auto_continue() -> None:
         calls.append(f"legacy:{name}")
 
     agent = _make_agent(on_tool_call=legacy)
-    allowed, final_args, reason = await agent._tool_call_chain("dns_lookup", "{}")
+    allowed, final_args, reason, _ = await agent._tool_call_chain("dns_lookup", "{}")
     assert allowed is True
     assert calls == ["legacy:dns_lookup"]
 
@@ -49,7 +50,7 @@ async def test_waterfall_multiple_handlers_in_order() -> None:
         return await next()
 
     agent = _make_agent(on_tool_call=[h1, h2])
-    allowed, final_args, reason = await agent._tool_call_chain("tool_x", "{}")
+    allowed, final_args, reason, _ = await agent._tool_call_chain("tool_x", "{}")
     assert allowed is True
     assert order == ["h1", 'h2:{"a": 1}']
     assert final_args == '{"a": 1}'
@@ -69,7 +70,7 @@ async def test_deny_short_circuits() -> None:
         return await next()
 
     agent = _make_agent(on_tool_call=[blocker, unreachable])
-    allowed, final_args, reason = await agent._tool_call_chain("nmap_scan", "{}")
+    allowed, final_args, reason, _ = await agent._tool_call_chain("nmap_scan", "{}")
     assert allowed is False
     assert reason == "目标在内网"
     assert order == ["blocker"]  # 短路，后续不执行
@@ -81,7 +82,7 @@ async def test_deny_reason_default() -> None:
         return {"deny": True}
 
     agent = _make_agent(on_tool_call=blocker)
-    allowed, final_args, reason = await agent._tool_call_chain("x", "{}")
+    allowed, final_args, reason, _ = await agent._tool_call_chain("x", "{}")
     assert allowed is False
     assert reason == "未说明"
 
@@ -99,7 +100,7 @@ async def test_mixed_legacy_and_waterfall() -> None:
         return {"deny": True, "reason": "no"}
 
     agent = _make_agent(on_tool_call=[legacy, blocker])
-    allowed, _, reason = await agent._tool_call_chain("x", "{}")
+    allowed, _, reason, _ = await agent._tool_call_chain("x", "{}")
     assert allowed is False
     assert order == ["legacy", "blocker"]
 

@@ -28,8 +28,14 @@ CONCLUSION_KEYWORDS = [
 
 # 失败信号关键词
 FAILURE_KEYWORDS = [
-    "失败", "错误", "无结果", "超时", "拒绝", "无法", "不能", "不通",
-    "failed", "error", "timeout", "refused", "denied", "unable", "no result",
+    "失败", "错误", "无结果", "超时", "无法", "不能", "不通",
+    "failed", "error", "timeout", "unable", "no result",
+]
+
+# 沙箱审批相关输出（属于正常流程，不应被判定为失败）
+SANDBOX_APPROVAL_PATTERNS = [
+    "需要审批", "已被用户拒绝", "沙箱策略拦截", "沙箱", "审批",
+    "sandbox", "approval", "denied by user",
 ]
 
 # 自动入库的最低置信度阈值（越高越保守）
@@ -39,6 +45,18 @@ _AUTO_SAVE_CONFIDENCE = 0.70
 def _has_any(text: str, keywords: list[str]) -> bool:
     low = text.lower()
     return any(k.lower() in low for k in keywords)
+
+
+def _remove_sandbox_patterns(text: str) -> str:
+    """从文本中移除沙箱审批相关的关键词，避免误判为失败。
+
+    沙箱审批是正常的安全流程，不是工具执行失败，
+    不应触发「工具链出现错误后最终走通」的经验信号。
+    """
+    clean = text
+    for pattern in SANDBOX_APPROVAL_PATTERNS:
+        clean = clean.replace(pattern, "")
+    return clean
 
 
 def detect_turn_signals(
@@ -61,7 +79,11 @@ def detect_turn_signals(
         f"{ev.get('name', '')} {ev.get('arguments', '')} {ev.get('output', '')}"
         for ev in tool_events
     )
-    failed_once = _has_any(tool_text, FAILURE_KEYWORDS) or _has_any(final_text, FAILURE_KEYWORDS)
+    # 排除沙箱审批相关输出（属于正常流程，不是工具执行失败）
+    tool_text_clean = _remove_sandbox_patterns(tool_text)
+    final_text_clean = _remove_sandbox_patterns(final_text)
+
+    failed_once = _has_any(tool_text_clean, FAILURE_KEYWORDS) or _has_any(final_text_clean, FAILURE_KEYWORDS)
     concluded = _has_any(final_text, CONCLUSION_KEYWORDS)
 
     if failed_once and concluded:
