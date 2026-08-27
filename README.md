@@ -115,6 +115,26 @@ cd baize-core-v1.7.0
   **Chromium**（playwright，浏览器工具所需）
 - 幂等：已安装的工具自动跳过；单个失败不中断整体；结束输出安装结果验证清单
 
+#### 内网 / 离线部署（--make-offline / --offline）
+
+无法访问外网（无 apt 源 / GitHub / PyPI）的内网环境，先用**能联网且与目标机同发行版、
+同架构**的机器打一个离线工具包，拷贝进内网后离线安装，全程不联网：
+
+```bash
+# ① 联网机器上打包（示例：Ubuntu 22.04 amd64 上给同配置内网机打包）
+./install-tools.sh --make-offline baize-tools-offline.tar.gz
+
+# ② 把包拷贝到内网目标机，离线安装
+./install-tools.sh --offline baize-tools-offline.tar.gz
+```
+
+- 包内收集：全部系统工具包**及其依赖树**（apt 自动收集，解压后 apt 本地安装）+ 静态
+  Go 二进制（nuclei/httpx/gobuster/ffuf，装入 `/usr/local/bin`）+ wafw00f 的 pip wheel
+- **浏览器（playwright/chromium）与 Metasploit 体积过大未包含**，内网如需浏览器工具
+  请单独处理；Metasploit 需离线 deb 源
+- 注意：包与目标机必须**发行版一致、架构一致**（如都是 Ubuntu 22.04 x86_64），
+  否则 apt 依赖解析会失败
+
 ### 环境自检（baize doctor）
 
 部署后可用 `baize doctor` 一键体检，输出每项依赖的就绪/缺失状态与修复命令：
@@ -485,6 +505,9 @@ baize-core/
 - 🔁 **流式对话断连自动恢复**：识别 openai SDK 3.x 底层 `httpx2` 包的传输层异常（`RemoteProtocolError` 等，与顶层 `httpx` 异常类不互通导致重试失效），按名称动态收集两包异常；重试次数 2→4（共 5 次尝试，退避 1s→2s→4s→8s）；流中断前已产出部分内容时先发 `stream_reset` 标记清空半截缓冲再重试，前端同步清空思考区重新渲染，断流静默恢复、用户无感知
 - 🛠️ **工具调用示例修正**：11 个 prompt 文件 91 处 `generic_linux_command` 示例统一为单 `command` 字符串，删除 schema 中不存在的 `interactive=` / `session_id=` / 双位置参数等误导形态；`_run_shell` 容忍 schema 外多余字段，避免 TypeError
 - 🔗 **base_url 规范化**：自动去除误填的 `/chat/completions`、`/completions` 端点后缀，仅保留服务根地址，避免路径重复导致 404
+- 📦 **内网离线部署**：`install-tools.sh` 支持 `--make-offline` 离线打包与 `--offline` 离线安装，
+  一次打包（工具包 + 依赖树 + 静态二进制 + pip wheel）拷贝进内网即可装完，解决无外网环境
+  无法安装工具的问题；同时修正 apt 系 `dnsutils` → `bind9-dnsutils` 包名
 - 🚀 **升级**：版本号统一为 1.7.2（后端 / 前端 / 脚本 / 文档）
 
 ### v1.7.0
