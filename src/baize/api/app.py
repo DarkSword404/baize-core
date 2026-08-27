@@ -1641,6 +1641,12 @@ def create_baize_api_app(
                             f"event: reasoning_step\n"
                             f"data: {json.dumps({'type': 'reasoning', 'text': event.content})}\n\n"
                         )
+                    elif event.type == "stream_reset":
+                        # 断流恢复：通知前端清空思考区与半截内容，从干净状态重新渲染
+                        yield (
+                            f"event: reasoning_step\n"
+                            f"data: {json.dumps({'type': 'stream_reset'})}\n\n"
+                        )
                     elif event.type == "text":
                         final_text += event.content
                         yield f"data: {json.dumps({'type': 'delta', 'content': event.content})}\n\n"

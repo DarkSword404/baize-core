@@ -39,18 +39,18 @@ Forensic Shell Session Management:
 
 You can create and manage interactive shell sessions for forensic tools like tcpdump, tshark, and log parsing utilities.
 - To start a new session: Use generic_linux_command with commands like tcpdump -i eth0, tshark -r capture.pcap, etc.
-- To list active sessions: generic_linux_command("session", "list")
-- To get output from a session: generic_linux_command("session", "output <session_id>")
-- To send input to a session: generic_linux_command("<command>", "<args>", session_id="<session_id>")
-- To terminate a session: generic_linux_command("session", "kill <session_id>")
+- To list active sessions: generic_linux_command("session list")
+- To get output from a session: generic_linux_command("session output <session_id>")
+- To send input to a session: generic_linux_command("<command> <args>")
+- To terminate a session: generic_linux_command("session kill <session_id>")
 
 Example workflows:
 1.	Analyze network traffic from a pcap:
-- Start analysis: generic_linux_command("tshark", "-r network.pcap") → Returns session ID
-- Filter HTTP traffic: generic_linux_command("tshark", "-r network.pcap -Y http")
-- Extract IPs: generic_linux_command("awk", "'{print $3}'", session_id="<session_id>")
-- Kill session when done: generic_linux_command("session", "kill <session_id>")
+- Start analysis: generic_linux_command("tshark -r network.pcap") → Returns session ID
+- Filter HTTP traffic: generic_linux_command("tshark -r network.pcap -Y http")
+- Extract IPs: generic_linux_command("awk '{print $3}'")
+- Kill session when done: generic_linux_command("session kill <session_id>")
 2.	Investigate memory dump:
-- Identify running processes: generic_linux_command("volatility", "-f memdump.raw pslist")
-- Extract suspicious process memory: generic_linux_command("volatility", "-f memdump.raw memdump -p 1234")
-- Kill session when done: generic_linux_command("session", "kill <session_id>")
+- Identify running processes: generic_linux_command("volatility -f memdump.raw pslist")
+- Extract suspicious process memory: generic_linux_command("volatility -f memdump.raw memdump -p 1234")
+- Kill session when done: generic_linux_command("session kill <session_id>")

@@ -68,6 +68,7 @@ class CompletionResult:
     tool_calls_delta: Optional[list[Any]] = None  # 流式工具调用增量
     tool_calls: Optional[list[Any]] = None  # 完整工具调用列表（非流式）
     reasoning: str = ""  # 模型思考过程（如 deepseek 的 reasoning_content 增量）
+    reset: bool = False  # 断流恢复标记：上游已产出部分内容后断连，重试前先重置缓冲
 
 
 def get_active_model_config() -> SingleModelConfig | None:

@@ -74,17 +74,17 @@ Document all findings and progress
 ## Memory Analysis Workflow
 
 1. Attach to target process:  
-   `generic_linux_command("gdb", "-p <PID> -batch -ex 'info proc mappings' -ex 'quit'")`
+   `generic_linux_command("gdb -p <PID> -batch -ex 'info proc mappings' -ex 'quit'")`
 
 2. Scan memory for pattern:  
-   `generic_linux_command("scanmem", "--pid=<PID> --command='option scan_data_type int32; 0x12345678'")`
+   `generic_linux_command("scanmem --pid=<PID> --command='option scan_data_type int32; 0x12345678'")`
 
 3. Dump memory region:  
-   `generic_linux_command("dd", "if=/proc/<PID>/mem bs=1 skip=<ADDR> count=<SIZE> | hexdump -C")`
+   `generic_linux_command("dd if=/proc/<PID>/mem bs=1 skip=<ADDR> count=<SIZE> | hexdump -C")`
 
 4. Inject code with Frida:  
    ```
-   generic_linux_command("frida", "--no-pause -l inject.js -p <PID>")
+   generic_linux_command("frida --no-pause -l inject.js -p <PID>")
    ```
    Where inject.js contains:
    ```javascript
@@ -99,10 +99,10 @@ Document all findings and progress
    ```
 
 5. Set hardware breakpoint in GDB:  
-   `generic_linux_command("gdb", "-p <PID> -batch -ex 'hbreak *<ADDR>' -ex 'continue'")`
+   `generic_linux_command("gdb -p <PID> -batch -ex 'hbreak *<ADDR>' -ex 'continue'")`
 
 6. Modify memory value:  
-   `generic_linux_command("gdb", "-p <PID> -batch -ex 'set {int}<ADDR>=<VALUE>' -ex 'quit'")`
+   `generic_linux_command("gdb -p <PID> -batch -ex 'set {int}<ADDR>=<VALUE>' -ex 'quit'")`
 
 ## Script Generation
 You can generate Python scripts to automate memory analysis:

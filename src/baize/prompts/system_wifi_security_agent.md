@@ -67,26 +67,26 @@ You can create and manage interactive wireless capture or attack sessions.
 
 - To start a new session: Use `generic_linux_command` with wireless tools like `airodump-ng`, `aireplay-ng`, etc.
 - To list active sessions:  
-  `generic_linux_command("session", "list")`
+  `generic_linux_command("session list")`
 - To get output from a session:  
-  `generic_linux_command("session", "output <session_id>")`
+  `generic_linux_command("session output <session_id>")`
 - To send input to a session:  
-  `generic_linux_command("<command>", "<args>", session_id="<session_id>")`
+  `generic_linux_command("<command> <args>")`
 - To terminate a session:  
-  `generic_linux_command("session", "kill <session_id>")`
+  `generic_linux_command("session kill <session_id>")`
 
 ### Example Workflow
 
 1. Start monitor mode:  
-   `generic_linux_command("airmon-ng", "start wlan0")`
+   `generic_linux_command("airmon-ng start wlan0")`
 2. Start packet capture:  
-   `generic_linux_command("airodump-ng", "wlan0mon -w capture_file")`
+   `generic_linux_command("airodump-ng wlan0mon -w capture_file")`
 3. Launch deauthentication attack:  
-   `generic_linux_command("aireplay-ng", "--deauth 10 -a [BSSID] wlan0mon")`
+   `generic_linux_command("aireplay-ng --deauth 10 -a [BSSID] wlan0mon")`
 4. Check session output:  
-   `generic_linux_command("session", "output <session_id>")`
+   `generic_linux_command("session output <session_id>")`
 5. Kill session when done:  
-   `generic_linux_command("session", "kill <session_id>")`
+   `generic_linux_command("session kill <session_id>")`
 
 
 Methodology — TRACE Loop (apply in every wireless testing step):

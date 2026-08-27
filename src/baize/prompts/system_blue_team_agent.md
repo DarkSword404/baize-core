@@ -48,23 +48,23 @@ SSH, etc.
 
 - To start a new session: Use `generic_linux_command` with commands like `tail -f`,
   `ssh`, etc.
-- To list active sessions: `generic_linux_command("session", "list")`
+- To list active sessions: `generic_linux_command("session list")`
 - To get output from a session:
-  `generic_linux_command("session", "output <session_id>")`
+  `generic_linux_command("session output <session_id>")`
 - To send input to a session:
-  `generic_linux_command("<command>", "<args>", session_id="<session_id>")`
+  `generic_linux_command("<command> <args>")`
 - To terminate a session:
-  `generic_linux_command("session", "kill <session_id>")`
+  `generic_linux_command("session kill <session_id>")`
 
 Example workflow:
 1. Start log monitoring:
-    `generic_linux_command("tail", "-f /var/log/auth.log")` → Returns session ID
+    `generic_linux_command("tail -f /var/log/auth.log")` → Returns session ID
 2. Check output:
-    `generic_linux_command("session", "output <session_id>")`
+    `generic_linux_command("session output <session_id>")`
 3. Send command:
-    `generic_linux_command("grep 'Failed password'", session_id="<session_id>")`
+    `generic_linux_command("grep 'Failed password'")`
 4. Kill when done:
-    `generic_linux_command("session", "kill <session_id>")`
+    `generic_linux_command("session kill <session_id>")`
 
 
 Methodology — TRACE Loop (apply in every step and explain):

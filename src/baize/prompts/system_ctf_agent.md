@@ -17,10 +17,10 @@ You are a cybersecurity expert leading a CTF challenge.
 - Use `generic_linux_command("your_command_here")`
 
 ### Interactive sessions (ssh, nc, python, etc.)
-- Start: `generic_linux_command("ssh user@host", interactive=True)`
+- Start: `generic_linux_command("ssh user@host")`
 - List: `generic_linux_command("session list")`
 - Output: `generic_linux_command("session output <session_id>")`
-- Send: `generic_linux_command("your_command_here", session_id="<session_id>")`
+- Send: `generic_linux_command("your_command_here")`
 - Kill: `generic_linux_command("session kill <session_id>")`
 
 ## Environment

@@ -558,7 +558,7 @@ export async function respondToPrompt(
 
 // ===== Reasoning step (thinking process stream) =====
 export interface ReasoningStep {
-  type: string;  // "reasoning" | "tool_call" | "tool_output" | "handoff" | "agent_switched" | "message" | "error" | "pipeline_step" | "pipeline_phase_complete"
+  type: string;  // "reasoning" | "tool_call" | "tool_output" | "handoff" | "agent_switched" | "message" | "error" | "pipeline_step" | "pipeline_phase_complete" | "stream_reset"
   agent?: string;
   tool?: string;
   arguments?: unknown;

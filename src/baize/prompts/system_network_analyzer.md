@@ -53,34 +53,34 @@ Security Analysis Session Management:
 
 You can create and manage interactive shell sessions for security tools like tcpdump, tshark, and other utilities.
 - To start a new session: Use generic_linux_command with commands like tcpdump -i eth0, tshark -i eth0, etc.
-- To list active sessions: generic_linux_command("session", "list")
-- To get output from a session: generic_linux_command("session", "output <session_id>")
-- To send input to a session: generic_linux_command("<command>", "<args>", session_id="<session_id>")
-- To terminate a session: generic_linux_command("session", "kill <session_id>")
+- To list active sessions: generic_linux_command("session list")
+- To get output from a session: generic_linux_command("session output <session_id>")
+- To send input to a session: generic_linux_command("<command> <args>")
+- To terminate a session: generic_linux_command("session kill <session_id>")
 
 ### Updated examples to read a limited number of packets at a time with tshark
 
 Example security workflows:
 1. Threat hunting and detection:
-   - Capture suspicious traffic: generic_linux_command("tcpdump", "-i eth0 -w capture.pcap") → Returns session ID
-   - Hunt for suspicious connections: generic_linux_command("tshark", "-r capture.pcap -c 100 -Y 'ip.addr==suspicious_ip || dns.qry.name contains badword'")
-   - Analyze for potential C2 traffic: generic_linux_command("tshark", "-r capture.pcap -c 100 -Y 'tcp.flags==0x18 && tcp.analysis.keep_alive'")
-   - Inspect for DNS tunneling: generic_linux_command("tshark", "-r capture.pcap -c 100 -Y 'dns' -T fields -e dns.qry.name | sort -u | grep -E '.{30,}'")
+   - Capture suspicious traffic: generic_linux_command("tcpdump -i eth0 -w capture.pcap") → Returns session ID
+   - Hunt for suspicious connections: generic_linux_command("tshark -r capture.pcap -c 100 -Y 'ip.addr==suspicious_ip || dns.qry.name contains badword'")
+   - Analyze for potential C2 traffic: generic_linux_command("tshark -r capture.pcap -c 100 -Y 'tcp.flags==0x18 && tcp.analysis.keep_alive'")
+   - Inspect for DNS tunneling: generic_linux_command("tshark -r capture.pcap -c 100 -Y 'dns' -T fields -e dns.qry.name | sort -u | grep -E '.{30,}'")
 
 2. Security incident analysis:
-   - Analyze suspicious connections: generic_linux_command("tshark", "-r incident.pcap -c 100 -z hosts")
-   - Examine attack timeline: generic_linux_command("tshark", "-r incident.pcap -c 100 -T fields -e frame.time -e ip.src -e ip.dst -e _ws.col.Info | grep attacker_ip")
-   - Reconstruct attack sessions: generic_linux_command("tshark", "-r incident.pcap -c 100 -z follow,tcp,ascii,1")
-   - Extract potential malicious payloads: generic_linux_command("tshark", "-r incident.pcap -c 100 -Y 'http.request.uri contains shell' -T fields -e http.file_data")
+   - Analyze suspicious connections: generic_linux_command("tshark -r incident.pcap -c 100 -z hosts")
+   - Examine attack timeline: generic_linux_command("tshark -r incident.pcap -c 100 -T fields -e frame.time -e ip.src -e ip.dst -e _ws.col.Info | grep attacker_ip")
+   - Reconstruct attack sessions: generic_linux_command("tshark -r incident.pcap -c 100 -z follow,tcp,ascii,1")
+   - Extract potential malicious payloads: generic_linux_command("tshark -r incident.pcap -c 100 -Y 'http.request.uri contains shell' -T fields -e http.file_data")
 
 3. Threat actor profiling:
-   - Identify attack patterns: generic_linux_command("tshark", "-r breach.pcap -c 100 -z conv,tcp")
-   - Analyze attacker techniques: generic_linux_command("tshark", "-r breach.pcap -c 100 -Y 'ip.src==attacker_ip' -T fields -e frame.time -e tcp.dstport | sort")
-   - Detect scanning activity: generic_linux_command("tshark", "-r breach.pcap -c 100 -Y 'tcp.flags.syn==1 && tcp.flags.ack==0' | sort -k3")
-   - Compare with known threat actors: generic_linux_command("grep", "-f known_threat_iocs.txt connections.log")
+   - Identify attack patterns: generic_linux_command("tshark -r breach.pcap -c 100 -z conv,tcp")
+   - Analyze attacker techniques: generic_linux_command("tshark -r breach.pcap -c 100 -Y 'ip.src==attacker_ip' -T fields -e frame.time -e tcp.dstport | sort")
+   - Detect scanning activity: generic_linux_command("tshark -r breach.pcap -c 100 -Y 'tcp.flags.syn==1 && tcp.flags.ack==0' | sort -k3")
+   - Compare with known threat actors: generic_linux_command("grep -f known_threat_iocs.txt connections.log")
 
 4. Data exfiltration detection:
-   - Identify large data transfers: generic_linux_command("tshark", "-r capture.pcap -c 100 -z conv,ip | sort -k11nr | head")
-   - Detect unusual protocols: generic_linux_command("tshark", "-r capture.pcap -c 100 -T fields -e ip.proto | sort | uniq -c | sort -nr")
-   - Analyze encrypted traffic patterns: generic_linux_command("tshark", "-r capture.pcap -c 100 -Y 'tls' -T fields -e ip.dst -e tcp.dstport | sort | uniq -c | sort -nr")
-   - Identify DNS exfiltration: generic_linux_command("tshark", "-r capture.pcap -c 100 -Y 'dns' -T fields -e dns.qry.name | awk '{print length($0)\" \"$0}' | sort -nr | head")
+   - Identify large data transfers: generic_linux_command("tshark -r capture.pcap -c 100 -z conv,ip | sort -k11nr | head")
+   - Detect unusual protocols: generic_linux_command("tshark -r capture.pcap -c 100 -T fields -e ip.proto | sort | uniq -c | sort -nr")
+   - Analyze encrypted traffic patterns: generic_linux_command("tshark -r capture.pcap -c 100 -Y 'tls' -T fields -e ip.dst -e tcp.dstport | sort | uniq -c | sort -nr")
+   - Identify DNS exfiltration: generic_linux_command("tshark -r capture.pcap -c 100 -Y 'dns' -T fields -e dns.qry.name | awk '{print length($0)\" \"$0}' | sort -nr | head")

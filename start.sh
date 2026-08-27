@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Baize (白泽) — 启动脚本 v1.7.0
+# Baize (白泽) — 启动脚本 v1.7.2
 #
 # 启动后端 (FastAPI/uvicorn, 端口 8001) 和前端 (Vite, 端口 5173)。
 # 项目布局：

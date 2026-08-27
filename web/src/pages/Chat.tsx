@@ -389,6 +389,17 @@ export function Chat(): JSX.Element {
         setTimeout(() => promptInputRef.current?.focus(), 100);
       },
       (step: ReasoningStep) => {
+        if (step.type === 'stream_reset') {
+          // 断流恢复：清空已渲染的思考内容，重试内容从干净状态重新渲染
+          setMessages(prev => prev.map((m: ChatMessageType) => {
+            if (m.id !== assistantId) return m;
+            return {
+              ...m,
+              intermediates: (m.intermediates || []).filter(s => s.itemType !== 'reasoning'),
+            };
+          }));
+          return;
+        }
         let intermediate: IntermediateData | null = null;
         if (step.type === 'reasoning' && step.text) {
           // 累积模型实时思考内容到 assistant 消息的一个 reasoning 中间产物

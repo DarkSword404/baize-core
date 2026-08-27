@@ -61,8 +61,8 @@ _CONCLUDE_HINT_TOOL_TURNS = 5
 # LLM 调用重试：临时性故障（网络抖动/超时/限流/5xx）做指数退避重试；
 # 配置类错误（404/401/400 等）不重试，直接抛出交由上层诊断，
 # 避免配置损坏时反复无效请求、拖垮整轮对话。
-_LLM_RETRY_ATTEMPTS = 2        # 额外重试次数（总尝试 = 1 + 2 = 3 次）
-_LLM_RETRY_BACKOFF_BASE = 1.0  # 指数退避基础秒数（1s -> 2s）
+_LLM_RETRY_ATTEMPTS = 4        # 额外重试次数（总尝试 = 1 + 4 = 5 次，退避 1s→2s→4s→8s，覆盖约 15 秒抖动窗口）
+_LLM_RETRY_BACKOFF_BASE = 1.0  # 指数退避基础秒数（1s -> 2s -> 4s -> 8s）
 
 # 工具执行超时：单次工具调用（含同步 handler 的线程池执行）超过该秒数
 # 即中止等待并返回超时错误文本给模型，防止工具挂起（网络卡住/subprocess
@@ -99,23 +99,46 @@ def _tool_missing_hint(name: str, exc: Exception) -> str:
     return f"(工具 {name} 执行失败: {type(exc).__name__}: {msg})"
 
 
+def _httpx_transport_exc_types() -> tuple[type[Exception], ...]:
+    """动态收集 httpx 与 httpx2（openai SDK 3.x 底层）两包的传输层异常。
+
+    openai SDK 3.x 内部使用独立的 httpx2 包，其异常类与顶层 httpx 不互通，
+    仅靠 ``isinstance(exc, httpx.xxx)`` 判定会漏掉 httpx2 抛出的同类异常
+    （例如 ``httpx2.RemoteProtocolError``）。按名称动态导入，某包未安装时
+    自动跳过对应类。
+    """
+    names = (
+        "ConnectError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "WriteTimeout",
+        "PoolTimeout",
+        "ReadError",
+        "RemoteProtocolError",
+        "NetworkError",
+        "CloseError",
+    )
+    exc_types: list[type[Exception]] = []
+    for module_name in ("httpx", "httpx2"):
+        try:
+            module = __import__(module_name)
+        except ImportError:
+            continue
+        for name in names:
+            cls = getattr(module, name, None)
+            if cls is not None:
+                exc_types.append(cls)
+    return tuple(exc_types)
+
+
 def _is_retryable_llm_error(exc: Exception) -> bool:
     """判断 LLM 调用异常是否属于值得重试的临时性故障。
 
-    可重试：httpx 网络层异常、openai 超时/连接错误/限流/HTTP 5xx。
+    可重试：httpx / httpx2 网络层异常、openai 超时/连接错误/限流/HTTP 5xx。
     不可重试：404/401/400/403 等配置类 4xx —— 重试无意义，
     直接抛出交由上层诊断（例如 base_url 失效导致的 NotFoundError）。
     """
-    retryable_httpx = (
-        httpx.ConnectError,
-        httpx.ConnectTimeout,
-        httpx.ReadTimeout,
-        httpx.WriteTimeout,
-        httpx.PoolTimeout,
-        httpx.ReadError,
-        httpx.RemoteProtocolError,
-    )
-    if isinstance(exc, retryable_httpx):
+    if isinstance(exc, _httpx_transport_exc_types()):
         return True
     if isinstance(exc, (openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError)):
         return True
@@ -214,7 +237,7 @@ class RunResult:
 class AgentEvent:
     """流式运行事件。"""
 
-    type: str  # "reasoning" | "text" | "tool_call" | "tool_result" | "sandbox_approval" | "done"
+    type: str  # "reasoning" | "text" | "tool_call" | "tool_result" | "sandbox_approval" | "stream_reset" | "done"
     content: str = ""
     tool_name: Optional[str] = None
     tool_args: Optional[dict] = None
@@ -826,12 +849,17 @@ class Agent:
             await self._summarize_old_turns(history, tool_schemas, max_ctx_tokens, client)
         return self._trim_history_to_budget(history, max_ctx_tokens, tool_schemas)
 
-    async def _maybe_retry_llm(self, exc: Exception, attempt: int, *, stream: bool = False) -> bool:
+    async def _maybe_retry_llm(
+        self, exc: Exception, attempt: int, *, stream: bool = False, produced: bool = False
+    ) -> bool:
         """LLM 调用异常后判断是否退避重试。
 
         仅对临时性故障（网络抖动/超时/限流/5xx）重试，配置类错误
         （404/401/400/403 等）不重试。返回 True 表示已等待退避、应重试；
         返回 False 表示应直接抛出原异常。
+
+        produced: 流式场景下断连时是否已产出过部分内容（用于诊断日志，
+            区分「连接阶段失败」与「流中断(已产出内容)」）。
         """
         if not _is_retryable_llm_error(exc) or attempt > _LLM_RETRY_ATTEMPTS:
             return False
@@ -841,12 +869,14 @@ class Agent:
             attempt=attempt,
             error=type(exc).__name__,
             stream=stream,
+            produced=produced,
             retry_in=round(delay, 2),
         )
         logger.warning(
-            "LLM 调用失败（%s%s），%.1fs 后重试（第 %d/%d 次）",
+            "LLM 调用失败（%s%s%s），%.1fs 后重试（第 %d/%d 次）",
             type(exc).__name__,
             "，连接阶段" if stream else "",
+            "，流中断(已产出内容)" if produced else "",
             delay,
             attempt,
             _LLM_RETRY_ATTEMPTS,
@@ -883,9 +913,10 @@ class Agent:
     ) -> AsyncIterator[CompletionResult]:
         """流式请求模型，带异常捕获与退避重试。
 
-        仅当连接建立阶段（尚未产出任何数据块）失败时才能安全重试；
-        一旦流中已产出过数据（reasoning/content/工具增量）再中断，
-        重放会产生重复内容，因此直接抛出交由上层诊断。
+        连接建立阶段（尚未产出任何数据块）失败：安全退避重试；
+        流中已产出部分内容（reasoning/content/工具增量）后断连：先产出
+        ``CompletionResult(reset=True)`` 标记，由调用方清空本回合已缓冲的
+        半截内容，再退避重试重新生成，避免内容重复渲染。
         """
         attempt = 0
         while True:
@@ -897,7 +928,23 @@ class Agent:
                     yield result
                 return
             except Exception as exc:  # noqa: BLE001
-                if produced or not await self._maybe_retry_llm(exc, attempt, stream=True):
+                model_name = getattr(client, "model", None) or type(client).__name__
+                logger.warning(
+                    "LLM 流式请求失败: type=%s phase=%s model=%s messages=%d attempt=%d/%d",
+                    type(exc).__name__,
+                    "stream(produced)" if produced else "connect",
+                    model_name,
+                    len(history),
+                    attempt,
+                    _LLM_RETRY_ATTEMPTS,
+                )
+                if produced:
+                    # 已产出部分内容后断连：先发 reset 标记清空半截缓冲，再退避重试
+                    if await self._maybe_retry_llm(exc, attempt, stream=True, produced=True):
+                        yield CompletionResult(content="", reset=True)
+                        continue
+                    raise
+                if not await self._maybe_retry_llm(exc, attempt, stream=True):
                     raise
 
     async def _run_tool_loop(
@@ -1189,6 +1236,13 @@ class Agent:
 
                 # 流式请求模型（连接阶段失败自动退避重试，中途断流直接抛出）
                 async for result in self._stream_llm_with_retry(client, history, tool_schemas):
+                    if result.reset:
+                        # 断流恢复：清空本回合已缓冲的半截内容，通知前端从干净状态重新渲染
+                        text_parts.clear()
+                        tool_accum.clear()
+                        tool_calls = []
+                        yield AgentEvent(type="stream_reset")
+                        continue
                     if result.reasoning:
                         # 实时思考过程
                         yield AgentEvent(type="reasoning", content=result.reasoning)

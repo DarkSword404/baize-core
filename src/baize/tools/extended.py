@@ -18,8 +18,13 @@ import httpx
 from baize.sdk.agent import AgentTool
 
 
-def _run_shell(command: str, timeout: int = 120) -> str:
-    """执行 shell 命令并返回输出。"""
+def _run_shell(command: str, timeout: int = 120, **kwargs: Any) -> str:
+    """执行 shell 命令并返回输出。
+
+    注意：``**kwargs`` 用于容忍模型偶尔产出的 schema 外多余字段
+    （如 ``interactive=True``、``session_id="..."``），避免 TypeError
+    导致工具直接报「执行失败」。
+    """
     try:
         proc = subprocess.run(
             ["/bin/bash", "-c", command],

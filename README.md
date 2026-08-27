@@ -8,7 +8,7 @@
 
 > 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
 
-[![Version](https://img.shields.io/badge/version-v1.7.1-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.7.2-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
@@ -480,7 +480,14 @@ baize-core/
 
 ## 📝 更新日志
 
-### v1.7.0（当前）
+### v1.7.2（当前）
+
+- 🔁 **流式对话断连自动恢复**：识别 openai SDK 3.x 底层 `httpx2` 包的传输层异常（`RemoteProtocolError` 等，与顶层 `httpx` 异常类不互通导致重试失效），按名称动态收集两包异常；重试次数 2→4（共 5 次尝试，退避 1s→2s→4s→8s）；流中断前已产出部分内容时先发 `stream_reset` 标记清空半截缓冲再重试，前端同步清空思考区重新渲染，断流静默恢复、用户无感知
+- 🛠️ **工具调用示例修正**：11 个 prompt 文件 91 处 `generic_linux_command` 示例统一为单 `command` 字符串，删除 schema 中不存在的 `interactive=` / `session_id=` / 双位置参数等误导形态；`_run_shell` 容忍 schema 外多余字段，避免 TypeError
+- 🔗 **base_url 规范化**：自动去除误填的 `/chat/completions`、`/completions` 端点后缀，仅保留服务根地址，避免路径重复导致 404
+- 🚀 **升级**：版本号统一为 1.7.2（后端 / 前端 / 脚本 / 文档）
+
+### v1.7.0
 
 - 🖼️ **工具输出图片自动注入**：扫描本轮工具输出中引用的图片文件路径，自动提取并构造多模态用户消息注入 LLM 上下文（单张最大 5MB，data URL 约 1.37x 原始大小），避免工具截图 / 图片结果丢失
 - 🔍 **多模态链路日志增强**：构建用户消息时记录 content_parts / 附件数量 / 文本长度，请求按 role / parts / 图片数输出概要日志，便于排查多模态链路问题

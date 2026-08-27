@@ -200,7 +200,7 @@ def cmd_serve(argv: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Baize 命令行入口。"""
     parser = argparse.ArgumentParser(prog="baize", description="白泽·智脑 (Baize) 命令行")
-    parser.add_argument("--version", action="version", version="baize 1.7.1")
+    parser.add_argument("--version", action="version", version="baize 1.7.2")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("serve", help="启动 Web API 服务（默认）")
     sub.add_parser("doctor", help="环境自检：系统工具/模型/向量/浏览器依赖")

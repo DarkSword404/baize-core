@@ -33,6 +33,23 @@ def _opt_int(value) -> int | None:
         return None
 
 
+_BASE_URL_ENDPOINT_SUFFIXES = ("/chat/completions", "/completions")
+
+
+def _normalize_base_url(url: str) -> str:
+    """规范化 base_url：只保留服务根地址。
+
+    用户可能误填完整端点（如 ``https://host/v1/chat/completions``），
+    内部请求会再拼接 ``/chat/completions`` 导致路径重复 404。
+    自动去除 ``/chat/completions``、``/completions`` 后缀，保留根地址。
+    """
+    url = (url or "").strip().rstrip("/")
+    for suffix in _BASE_URL_ENDPOINT_SUFFIXES:
+        if url.endswith(suffix):
+            return url[: -len(suffix)].rstrip("/")
+    return url
+
+
 @dataclass
 class SingleModelConfig:
     """单一模型配置。
@@ -81,7 +98,7 @@ class ModelConfigStore:
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             cfg = SingleModelConfig(
-                base_url=str(data.get("base_url", "")),
+                base_url=_normalize_base_url(str(data.get("base_url", ""))),
                 api_key=str(data.get("api_key", "")),
                 model=str(data.get("model", "")),
                 context_max_turns=int(data.get("context_max_turns", 0) or 0),
@@ -97,7 +114,9 @@ class ModelConfigStore:
     def save(self, cfg: SingleModelConfig) -> SingleModelConfig:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(asdict(cfg), indent=2, ensure_ascii=False), encoding="utf-8")
+        data = asdict(cfg)
+        data["base_url"] = _normalize_base_url(data.get("base_url", ""))
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(self._path)
         return cfg
 

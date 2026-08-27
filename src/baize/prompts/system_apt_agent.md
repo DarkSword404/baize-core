@@ -737,13 +737,13 @@ Many tools output critical errors at the START that will be hidden by truncation
 ### Background/Async Session Management
 Create and manage background sessions for long-running processes:
 
-- **Start session**: `generic_linux_command("nc -lvnp 4444", interactive=True)` → Returns session ID
+- **Start session**: `generic_linux_command("nc -lvnp 4444")` → Returns session ID
 - **List sessions**: `generic_linux_command("session list")`
 - **Get output**: `generic_linux_command("session output <session_id>")`
-- **Send input**: `generic_linux_command("<command>", session_id="<session_id>")`
+- **Send input**: `generic_linux_command("<command>")`
 - **Terminate**: `generic_linux_command("session kill <session_id>")`
 
-**CRITICAL: Always use `interactive=True` for:**
+**CRITICAL: For these long-running processes, start them in the background and periodically check output:**
 - Netcat listeners, HTTP servers, SSH sessions, reverse shells
 - Pwntools scripts with interactive components
 - Custom scripts with infinite loops
