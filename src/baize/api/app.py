@@ -394,6 +394,86 @@ def _rebuild_prior_history(history_messages: list[dict]) -> list[ChatMessage]:
     return prior_history
 
 
+def _model_config_hint() -> str:
+    """返回当前模型配置概要（供报错上下文），不可用时返回空串。"""
+    try:
+        from baize.sdk.client import get_active_model_config
+
+        cfg = get_active_model_config()
+        if cfg is not None and getattr(cfg, "base_url", ""):
+            return f"(base_url={cfg.base_url})"
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def _format_detailed_error(exc: Exception, phase: str = "对话处理") -> str:
+    """将异常转换为详细、可运维的报错文案（通过 SSE error 事件回显给前端）。
+
+    相比旧的「服务器内部错误，请查看服务端日志」，这里输出异常类型、
+    关键上下文与可操作排查建议，便于运维直接定位问题，无需翻阅服务端日志。
+    """
+    exc_type = type(exc).__name__
+
+    if isinstance(exc, ModelNotConfiguredError):
+        return f"{phase}失败: {exc}"
+
+    from httpx import (
+        ConnectError,
+        ConnectTimeout,
+        HTTPStatusError,
+        ReadError,
+        ReadTimeout,
+        RemoteProtocolError,
+    )
+
+    # OpenAI/httpx 客户端常把底层网络错误包在 __cause__/__context__ 里
+    cause = exc.__cause__ or exc.__context__
+    net_types = (ConnectError, ConnectTimeout, ReadError, ReadTimeout, RemoteProtocolError, ConnectionError, TimeoutError)
+    target = cause if isinstance(cause, net_types) else exc
+
+    if isinstance(target, net_types):
+        reason = str(cause if isinstance(cause, net_types) else exc)
+        base = _model_config_hint() or "（未获取到 base_url，请检查模型配置）"
+        return (
+            f"{phase}失败: LLM API 连接异常 [{exc_type}] {reason}\n"
+            f"当前模型配置: {base}\n"
+            f"排查建议: ① 用 curl -v {base} 检查 LLM 端点连通性；② 确认 api_key/model 正确；"
+            f"③ 确认 LLM 服务已启动、端口未被防火墙拦截；④ 检查网络代理/环境变量是否影响请求。"
+        )
+
+    if isinstance(target, HTTPStatusError):
+        resp = getattr(target, "response", None)
+        status_code = getattr(resp, "status_code", "?")
+        body = (getattr(resp, "text", "") or "")[:300]
+        base = _model_config_hint()
+        return (
+            f"{phase}失败: LLM API 返回 HTTP {status_code}{base}\n"
+            f"响应内容: {body or '(空)'}\n"
+            f"排查建议: 401→检查 api_key；403→检查账户权限/配额；429→触发限流，稍后重试或降低并发；"
+            f"400→检查请求参数/模型名；5xx→LLM 服务端故障，检查其日志。"
+        )
+
+    try:
+        from openai import AuthenticationError, PermissionDeniedError, RateLimitError
+
+        if isinstance(target, AuthenticationError):
+            return f"{phase}失败: LLM API 认证失败 (401){_model_config_hint()}，请检查 api_key 是否正确有效。"
+        if isinstance(target, PermissionDeniedError):
+            return f"{phase}失败: LLM API 权限不足 (403){_model_config_hint()}，请检查账户权限/额度。"
+        if isinstance(target, RateLimitError):
+            return f"{phase}失败: LLM API 触发限流 (429){_model_config_hint()}，请稍后重试或降低请求频率。"
+    except ImportError:  # 未安装 openai 时跳过精细化分类
+        pass
+
+    # 兜底：输出异常类型 + 消息 + 排查入口
+    detail = str(exc).replace("\n", " ")[:400]
+    return (
+        f"{phase}失败 [{exc_type}]: {detail or '(无详细信息)'}\n"
+        f"排查入口: ① 查看服务端日志 logs/backend.log（含完整 traceback）；② 运行 baize doctor 检查环境/工具/模型配置。"
+    )
+
+
 async def _with_sse_heartbeat(agen, interval: float = 15.0):
     """包装异步生成器，静默期定期产出心跳，防止长时工具执行导致连接超时断开。
 
@@ -1529,7 +1609,7 @@ def create_baize_api_app(
                     return
                 except Exception as e:  # noqa: BLE001
                     logger.exception("流水线会话处理失败: %s", e)
-                    yield f"data: {json.dumps({'type': 'error', 'error': '流水线执行失败，请查看服务端日志'})}\n\n"
+                    yield f"data: {json.dumps({'type': 'error', 'error': _format_detailed_error(e, '流水线对话')})}\n\n"
                     yield "data: [DONE]\n\n"
                     return
 
@@ -1623,9 +1703,10 @@ def create_baize_api_app(
             except ModelNotConfiguredError as e:
                 yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
             except Exception as e:  # noqa: BLE001
-                # 不向客户端回显内部异常细节，仅记录到服务端日志
+                # 向客户端回显详细原因（异常类型/上下文/排查建议），便于运维快速定位；
+                # 完整 traceback 仍记录到服务端日志
                 logger.exception("对话请求处理失败: %s", e)
-                yield f"data: {json.dumps({'type': 'error', 'error': '服务器内部错误，请查看服务端日志'})}\n\n"
+                yield f"data: {json.dumps({'type': 'error', 'error': _format_detailed_error(e, '对话')})}\n\n"
             finally:
                 # 关键：无论正常完成、连接断开（GeneratorExit/CancelledError）、还是异常，
                 # 只要本轮产生了内容，就持久化，避免切换页面/刷新后对话丢失。

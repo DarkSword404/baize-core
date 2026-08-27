@@ -87,6 +87,18 @@ def _missing_required_params(handler: Callable[..., Any], args: dict[str, Any]) 
     return missing
 
 
+def _tool_missing_hint(name: str, exc: Exception) -> str:
+    """工具执行因系统二进制缺失失败时，附加可安装指引（便于模型/用户直接定位）。"""
+    msg = str(exc)
+    if any(k in msg for k in ("command not found", "not found", "No such file or directory")):
+        return (
+            f"(工具 {name} 执行失败: {type(exc).__name__}: {msg}。"
+            f"可能原因: 该系统依赖的二进制未安装。请在项目目录运行 ./install-tools.sh 预装工具，"
+            f"或手动安装对应命令后重试。)"
+        )
+    return f"(工具 {name} 执行失败: {type(exc).__name__}: {msg})"
+
+
 def _is_retryable_llm_error(exc: Exception) -> bool:
     """判断 LLM 调用异常是否属于值得重试的临时性故障。
 
@@ -957,7 +969,7 @@ class Agent:
                                         try:
                                             output = await tool.execute(final_args)
                                         except Exception as exc:  # noqa: BLE001
-                                            output = f"(工具 {name} 执行失败: {type(exc).__name__}: {exc})"
+                                            output = _tool_missing_hint(name, exc)
                                             self._log_event("tool/error", name=name, error=str(exc))
                                             logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
                                         duration = asyncio.get_running_loop().time() - started_at
@@ -979,7 +991,7 @@ class Agent:
                             except Exception as exc:  # noqa: BLE001
                                 # 工具异常隔离：工具自身抛出的异常不中断整轮对话，
                                 # 转为 tool 结果消息返回给模型，由模型决定重试或改道。
-                                output = f"(工具 {name} 执行失败: {type(exc).__name__}: {exc})"
+                                output = _tool_missing_hint(name, exc)
                                 self._log_event("tool/error", name=name, error=str(exc))
                                 logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
                             duration = asyncio.get_running_loop().time() - started_at
@@ -1270,7 +1282,7 @@ class Agent:
                                         try:
                                             output = await tool.execute(final_args)
                                         except Exception as exc:  # noqa: BLE001
-                                            output = f"(工具 {name} 执行失败: {type(exc).__name__}: {exc})"
+                                            output = _tool_missing_hint(name, exc)
                                             self._log_event("tool/error", name=name, error=str(exc))
                                             logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
                                         duration = asyncio.get_running_loop().time() - started_at
@@ -1295,7 +1307,7 @@ class Agent:
                             except Exception as exc:  # noqa: BLE001
                                 # 工具异常隔离：工具自身抛出的异常不中断整轮对话，
                                 # 转为 tool 结果消息返回给模型，由模型决定重试或改道。
-                                output = f"(工具 {name} 执行失败: {type(exc).__name__}: {exc})"
+                                output = _tool_missing_hint(name, exc)
                                 self._log_event("tool/error", name=name, error=str(exc))
                                 logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
                             duration = asyncio.get_running_loop().time() - started_at

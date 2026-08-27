@@ -8,7 +8,7 @@
 
 > 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
 
-[![Version](https://img.shields.io/badge/version-v1.7.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.7.1-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
@@ -67,7 +67,13 @@
 ```bash
 cd baize-core-v1.7.0
 ./setup.sh    # 创建虚拟环境 + 安装 baize-core + 构建前端
+./setup.sh --with-tools   # 推荐：安装时一并预装全部工具依赖（见下节）
 ```
+
+> **最小化系统（如 Ubuntu Server）提示**：白泽的 50+ 渗透/信息收集工具依赖大量系统二进制
+> （nmap / sqlmap / nuclei / hydra 等）。请务必在安装时执行 `./setup.sh --with-tools`，
+> 或单独运行 `./install-tools.sh --yes` 一键预装，否则相关工具在被调用时会报
+> `command not found`，无法使用。
 
 ### 配置模型
 
@@ -92,6 +98,45 @@ cd baize-core-v1.7.0
 
 - **Web 界面**：<http://localhost:5173>
 - **健康检查**：<http://localhost:8001/api/v1/health>
+
+### 工具依赖预装（install-tools.sh）
+
+```bash
+./install-tools.sh                 # 全量安装（core/recon/web/password/forensic/wireless + 浏览器）
+./install-tools.sh --yes           # 免交互（CI / 无人值守）
+./install-tools.sh --skip-browser  # 跳过浏览器依赖（无 GUI 服务器）
+./install-tools.sh --with-metasploit  # 额外安装 Metasploit（重量级）
+```
+
+- 自动检测发行版：apt（Debian/Ubuntu/Kali）、dnf/yum（RHEL 系）、pacman（Arch）
+- 覆盖工具：nmap、masscan、arp-scan、tshark、sqlmap、nikto、hydra、john、hashcat、
+  aircrack-ng、binwalk、exiftool、dig、whois、traceroute、bubblewrap 等，以及
+  ProjectDiscovery 渠道的 **nuclei / httpx**、**gobuster / ffuf**、**wafw00f**（pip）与
+  **Chromium**（playwright，浏览器工具所需）
+- 幂等：已安装的工具自动跳过；单个失败不中断整体；结束输出安装结果验证清单
+
+### 环境自检（baize doctor）
+
+部署后可用 `baize doctor` 一键体检，输出每项依赖的就绪/缺失状态与修复命令：
+
+```bash
+.venv/bin/baize doctor
+# 系统工具 / 运行时 / LLM 模型配置 / 经验向量化配置 / 浏览器依赖
+```
+
+### 排障：报错信息说明
+
+对话/流水线出错时，Web 界面会直接显示**详细原因**（异常类型、LLM 端点、HTTP 状态码、
+响应内容与排查建议），不再只是"服务器内部错误，请查看服务端日志"；完整 traceback
+仍记录在 `logs/backend.log`。常见类型：
+
+| 报错特征 | 含义 | 处理 |
+| --- | --- | --- |
+| `LLM API 连接异常 [ConnectError]` | 连不上模型端点 | 检查 base_url 连通性、防火墙/代理 |
+| `LLM API 返回 HTTP 401/403` | api_key 无效/权限不足 | Web「设置」页核对 api_key |
+| `LLM API 返回 HTTP 429` | 触发限流 | 稍后重试或降低并发 |
+| `LLM API 返回 HTTP 5xx` | LLM 服务端故障 | 检查 LLM 服务日志 |
+| `工具 xxx 执行失败 ... not found` | 系统二进制缺失 | 运行 `./install-tools.sh --yes` 预装 |
 
 ---
 
@@ -576,6 +621,6 @@ baize-core/
 
 **白泽·智脑 (Baize)** · 仅供安全研究与授权测试使用
 
-[![Version](https://img.shields.io/badge/version-v1.7.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.7.1-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
 
 </div>
