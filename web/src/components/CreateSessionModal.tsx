@@ -87,8 +87,10 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
       const patternLabel = mode === 'pipeline' ? ` · 人工流水线` : mode === 'swarm' ? ` · Swarm 协作` : '';
       const agentDisplay = session.agent ? (agentNameCN[session.agent] || session.agent) : '';
       addToast({ type: 'success', title: '会话已创建', message: `智能体: ${agentDisplay}${patternLabel}` });
-      onCreated(session.id);
+      // 先关闭创建窗口再切换会话：保证窗口必然关闭，切换过程中的异步
+      // 请求失败不会导致创建窗口残留。
       onClose();
+      onCreated(session.id);
     } catch (err: any) {
       addToast({ type: 'error', title: '创建失败', message: err.message });
     } finally {

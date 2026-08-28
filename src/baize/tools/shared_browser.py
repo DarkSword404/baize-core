@@ -85,6 +85,7 @@ class SharedBrowserManager:
         self._stream_handler: Any = None
         self._stream_mode: Optional[str] = None
         self._stream_task: Any = None
+        self._viewport_actual: Optional[dict[str, int]] = None
 
     # ---- 单例 -----------------------------------------------------------
     @classmethod
@@ -118,6 +119,9 @@ class SharedBrowserManager:
                 headless=self._headless,
                 args=["--no-sandbox", "--disable-gpu"],
                 viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+                # 锁定 DPR=1：保证 screencast 帧尺寸 = CSS 视口尺寸（1 帧像素 = 1 CSS 像素），
+                # 前端帧坐标即可直接作为 CDP Input.dispatchMouseEvent 的视口坐标，避免高分屏点击偏移。
+                device_scale_factor=1,
             )
             logger.info(
                 "共享浏览器已启动（headless=%s, profile=%s）",
@@ -330,7 +334,10 @@ class SharedBrowserManager:
             "url": url,
             "profile": str(self._profile),
             "confirm_pending": self._confirm_event.is_set(),
-            "viewport": {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
+            # 优先上报启动时读取的真实视口尺寸；未读取到时回退固定值
+            "viewport": self._viewport_actual or {
+                "width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT,
+            },
         }
 
     # ---- CDP 实时串流 + 输入注入 ----------------------------------------
@@ -363,6 +370,17 @@ class SharedBrowserManager:
         cdp = await self.get_cdp_session()
         self._stream_cdp = cdp
 
+        # 记录页面真实视口尺寸，供 status 上报与 screencast 参数使用
+        try:
+            page = self._page_or_raise()
+            vs = await page.viewport_size
+            if vs:
+                self._viewport_actual = {
+                    "width": int(vs["width"]), "height": int(vs["height"]),
+                }
+        except Exception:  # noqa: BLE001
+            pass
+
         async def _on_frame(params: dict) -> None:
             try:
                 data = base64.b64decode(params.get("data", ""))
@@ -386,13 +404,16 @@ class SharedBrowserManager:
         self._stream_handler = _handler
         cdp.on("Page.screencastFrame", _handler)
         try:
+            vp = self._viewport_actual or {
+                "width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT,
+            }
             await cdp.send(
                 "Page.startScreencast",
                 {
                     "format": "jpeg",
                     "quality": 70,
-                    "maxWidth": VIEWPORT_WIDTH,
-                    "maxHeight": VIEWPORT_HEIGHT,
+                    "maxWidth": vp["width"],
+                    "maxHeight": vp["height"],
                     "everyNthFrame": 1,
                 },
             )

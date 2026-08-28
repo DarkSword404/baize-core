@@ -54,6 +54,9 @@ export function BrowserPanel({ open, onClose }: BrowserPanelProps): JSX.Element 
   // 点击/拖拽状态
   const mouseDownRef = useRef<{ x: number; y: number; button: string; time: number } | null>(null);
   const lastClickRef = useRef<{ x: number; y: number; button: string; time: number } | null>(null);
+  // 最近一帧的实际尺寸：坐标映射的基准。帧 = 视口渲染（后端 DPR=1），
+  // 用帧实际 w/h 而非 status.viewport，可避免实际视口与上报不一致时点击偏移。
+  const frameRef = useRef({ w: DEFAULT_VW, h: DEFAULT_VH });
 
   const VW = status?.viewport?.width ?? DEFAULT_VW;
   const VH = status?.viewport?.height ?? DEFAULT_VH;
@@ -82,6 +85,7 @@ export function BrowserPanel({ open, onClose }: BrowserPanelProps): JSX.Element 
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         const blob = new Blob([bytes], { type: 'image/jpeg' });
         const bmp = await createImageBitmap(blob);
+        if (w > 0 && h > 0) frameRef.current = { w, h };
         if (canvas.width !== w) canvas.width = w;
         if (canvas.height !== h) canvas.height = h;
         const ctx = canvas.getContext('2d');
@@ -131,6 +135,14 @@ export function BrowserPanel({ open, onClose }: BrowserPanelProps): JSX.Element 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
+  // 浏览器运行后自动聚焦键盘捕获层：用户可直接输入（无需先点击画面）
+  useEffect(() => {
+    if (open && running && !addressFocusedRef.current) {
+      const t = window.setTimeout(() => textareaRef.current?.focus(), 120);
+      return () => window.clearTimeout(t);
+    }
+  }, [open, running]);
+
   // ---- 地址栏 / 导航 ----------------------------------------------------
   function handleOpenUrl(raw?: string) {
     let url = (raw ?? addressInput).trim();
@@ -165,9 +177,13 @@ export function BrowserPanel({ open, onClose }: BrowserPanelProps): JSX.Element 
     if (!el) return null;
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return null;
-    const x = ((clientX - rect.left) / rect.width) * VW;
-    const y = ((clientY - rect.top) / rect.height) * VH;
-    return { x: Math.max(0, Math.min(VW, x)), y: Math.max(0, Math.min(VH, y)) };
+    // 基准 = 最近一帧实际尺寸（帧 = 视口渲染，后端已锁定 DPR=1，
+    // 帧像素即 CDP 视口坐标）。不用 VW/VH 常量，避免实际视口与上报不一致时偏移。
+    const fw = frameRef.current.w;
+    const fh = frameRef.current.h;
+    const x = ((clientX - rect.left) / rect.width) * fw;
+    const y = ((clientY - rect.top) / rect.height) * fh;
+    return { x: Math.max(0, Math.min(fw, x)), y: Math.max(0, Math.min(fh, y)) };
   }
 
   function onCanvasMouseMove(e: React.MouseEvent) {
@@ -453,8 +469,8 @@ export function BrowserPanel({ open, onClose }: BrowserPanelProps): JSX.Element 
             <div
               className="absolute pointer-events-none"
               style={{
-                left: `${(hoverPos.x / VW) * 100}%`,
-                top: `${(hoverPos.y / VH) * 100}%`,
+                left: `${(hoverPos.x / frameRef.current.w) * 100}%`,
+                top: `${(hoverPos.y / frameRef.current.h) * 100}%`,
               }}
             >
               <svg width="18" height="18" viewBox="0 0 18 18" fill="white" stroke="black" strokeWidth="1">
