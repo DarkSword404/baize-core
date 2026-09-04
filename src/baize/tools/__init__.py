@@ -49,6 +49,9 @@ from baize.tools import shared_browser as _shared_browser  # noqa: F401
 # 发现已安装的工具插件（baize.tools entry point）
 registry.discover_entry_points()
 
+# MCP 客户端桥接（可选依赖 mcp；惰性导入，不影响未安装场景）
+from baize.tools import mcp_bridge  # noqa: E402,F401
+
 
 def extended_tools() -> list[AgentTool]:
     """返回扩展工具的完整集合（内置 + 插件注册的全部工具）。"""

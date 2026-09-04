@@ -38,6 +38,10 @@ _SESSION_EVENT_KINDS = {
     "agent/response",
     "tool/call",
     "tool/result",
+    # 工具执行异常与 LLM 重试：此前未登记，_log_event 会静默丢弃，
+    # 导致审计日志里看不到工具报错。补上以保证可观测性。
+    "tool/error",
+    "agent/retry",
     "turn/start",
     "turn/end",
     "session/end",
@@ -80,11 +84,22 @@ class SessionLog:
         messages = log.derive_messages()   # 从日志投影模型历史
         for line in log.replay():          # 人类可读审计重放
             print(line)
+
+    ``origin`` / ``goal`` 为会话级元数据（任务来源与目标），会在
+    ``session/start`` 事件中自动携带，供审计与回放理解会话意图。
     """
 
-    def __init__(self, session_id: Optional[str] = None, path: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        session_id: Optional[str] = None,
+        path: Optional[str] = None,
+        origin: Optional[str] = None,
+        goal: Optional[str] = None,
+    ) -> None:
         self.session_id = session_id or uuid.uuid4().hex
         self.path = path
+        self.origin = origin
+        self.goal = goal
         self._events: list[SessionEvent] = []
         self._seq = 0
         if path and os.path.exists(path):
@@ -97,6 +112,12 @@ class SessionLog:
     def append(self, kind: str, **payload: Any) -> SessionEvent:
         if kind not in _SESSION_EVENT_KINDS:
             raise ValueError(f"未知事件类型: {kind!r}，允许: {sorted(_SESSION_EVENT_KINDS)}")
+        if kind == "session/start":
+            # 会话级元数据在开始事件上沉淀，保证审计回放可还原 origin/goal
+            if self.origin is not None:
+                payload.setdefault("origin", self.origin)
+            if self.goal is not None:
+                payload.setdefault("goal", self.goal)
         event = SessionEvent(seq=self._seq, kind=kind, payload=payload)
         self._seq += 1
         self._events.append(event)
@@ -198,17 +219,28 @@ class SessionLog:
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ev.ts))
             p = ev.payload
             if ev.kind == "session/start":
-                lines.append(f"[{ts}] 会话开始 {self.session_id}")
+                meta = " ".join(
+                    f"{k}={p[k]}" for k in ("origin", "goal") if p.get(k)
+                )
+                suffix = f" ({meta})" if meta else ""
+                lines.append(f"[{ts}] 会话开始 {self.session_id}{suffix}")
             elif ev.kind == "user/message":
                 lines.append(f"[{ts}] 用户: {p.get('content', '')}")
             elif ev.kind == "agent/request":
                 lines.append(f"[{ts}] 模型请求: {p.get('model', '')} messages={p.get('message_count', len(p.get('messages', [])))}")
             elif ev.kind == "agent/response":
                 lines.append(f"[{ts}] 模型回复: {p.get('content', '') or '(tool calls)'}")
+            elif ev.kind == "agent/retry":
+                lines.append(f"[{ts}] 模型请求重试: attempt={p.get('attempt', '?')} reason={p.get('reason', '')}")
             elif ev.kind == "tool/call":
                 lines.append(f"[{ts}] 工具调用: {p.get('name')}({p.get('arguments', {})})")
+            elif ev.kind == "tool/error":
+                lines.append(f"[{ts}] 工具出错[{p.get('name')}]: {p.get('error', '')}")
             elif ev.kind == "tool/result":
-                lines.append(f"[{ts}] 工具结果[{p.get('name')}] ({p.get('duration', 0):.2f}s): {p.get('output', '')}")
+                if p.get("denied"):
+                    lines.append(f"[{ts}] 工具被拒[{p.get('name')}]: {p.get('output', '')}")
+                else:
+                    lines.append(f"[{ts}] 工具结果[{p.get('name')}] ({p.get('duration', 0):.2f}s): {p.get('output', '')}")
             elif ev.kind == "turn/start":
                 lines.append(f"[{ts}] --- 回合开始 #{p.get('index', '?')} ---")
             elif ev.kind == "turn/end":

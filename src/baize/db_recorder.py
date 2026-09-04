@@ -108,12 +108,17 @@ class DbRecorder:
     # ---- 会话管理 ------------------------------------------------------------
 
     def start_session(self, session_id: str, agent: str = "") -> None:
+        """记录/激活一个会话。幂等：已存在时只更新 agent 与活动时间，
+        保留首次 created_at（多轮对话复用同一会话时不被重置）。"""
         now = time.time()
         with self._lock:
             conn = self._get_conn()
             conn.execute(
-                "INSERT OR REPLACE INTO sessions(id, agent, created_at, updated_at, status) VALUES(?,?,?,?,?)",
-                (session_id, agent, now, now, "active"),
+                """INSERT INTO sessions(id, agent, created_at, updated_at, status)
+                   VALUES(?,?,?,?,'active')
+                   ON CONFLICT(id) DO UPDATE SET
+                     agent=excluded.agent, updated_at=excluded.updated_at, status='active'""",
+                (session_id, agent, now, now),
             )
             conn.commit()
 

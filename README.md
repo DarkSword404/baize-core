@@ -8,7 +8,7 @@
 
 > 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
 
-[![Version](https://img.shields.io/badge/version-v1.7.2-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.8.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
@@ -34,7 +34,7 @@
 | 🧩 | **Agent 扩展（v1.4.0）** | `state` 运行时状态、`memory` 记忆注入、`hooks` 瀑布式事件链 |
 | 🖥️ | **执行环境抽象（v1.4.0）** | 统一执行器接口 + 沙箱隔离，工具可无缝切换 local / docker / ssh 后端 |
 | 📋 | **会话日志（v1.4.0）** | append-only 审计日志，模型历史可重建、攻击链可重放（DFIR 取证） |
-| 💾 | **长期记忆（v1.3.0）** | 会话经验自动向量化入库，新问题自动检索命中，越用越聪明 |
+| 💾 | **记忆库（v1.8.0）** | 长期记忆升级为结构化记忆库：经验 / 任务轨迹 / 事实 / 实体分层沉淀，知识图谱关联，混合检索自动命中 |
 | 🛡️ | **护栏 Guardrails（v1.3.0）** | 文件化可配置的输入/输出策略，注入防护、敏感信息保护与 SSRF 运行时配置 |
 | 📡 | **外部接收器（v1.3.0）** | Webhook / Syslog / 文件监听，打通外部事件源 |
 | ⚡ | **实时交互** | SSE 流式输出、会话持久化、美观的暗色 UI |
@@ -65,7 +65,7 @@
 ### 安装
 
 ```bash
-cd baize-core-v1.7.0
+cd baize-core-v1.8.0
 ./setup.sh    # 创建虚拟环境 + 安装 baize-core + 构建前端
 ./setup.sh --with-tools   # 推荐：安装时一并预装全部工具依赖（见下节）
 ```
@@ -500,7 +500,25 @@ baize-core/
 
 ## 📝 更新日志
 
-### v1.7.2（当前）
+### v1.8.0（当前）
+
+- 🧠 **经验系统重构为「记忆库」子系统**：新增 `src/baize/memory/`（存储 / 自动沉淀 / 轨迹 / 演进 / 知识图谱 / 检索），
+  数据按 **经验 / 任务轨迹 / 事实 / 实体** 分层组织；Web「记忆」页重构为四视图：
+  经验库、任务轨迹、混合检索、知识图谱
+- 🔀 **任务轨迹（Episodes）**：会话过程自动沉淀为结构化轨迹，可逐段回看目标、执行过程与结果
+- 🗂️ **经验全生命周期**：经验支持 新建 / 更新 / 作废 / 合并演进，记录置信度、证据与历史版本
+  （`supersedes` / `replaced_by` / `history`），已作废或已演进的经验不再参与检索命中
+- 🕸️ **事实 / 实体 / 知识图谱**：从会话中抽取关键事实与实体并建立关联，跨会话关系可视化，
+  前端新增知识图谱视图
+- 🔍 **混合检索**：语义向量 + 关键词统一检索入口，Agent 每回合自动沉淀与检索，越用越聪明
+- 🔌 **API 更新**：经验 / 轨迹 / 检索 / 图谱统一收敛为 `/api/v1/memory/*` REST 接口；
+  移除旧 `experience_signal` SSE 事件，前端同步简化
+- 📦 **大附件与内存镜像支持**：单文件上传上限由 20MB 提升至默认 500MB（环境变量
+  `BAIZE_MAX_UPLOAD_MB` 可调），新增常见内存 / 磁盘镜像扩展名（`.raw` / `.img` / `.dmp` /
+  `.mem` / `.iso` 等）；上传失败时前端透出服务端具体原因而非笼统 400
+- 🚀 **升级**：版本号统一为 1.8.0（后端 / 前端 / 脚本 / 文档）
+
+### v1.7.2
 
 - 🔁 **流式对话断连自动恢复**：识别 openai SDK 3.x 底层 `httpx2` 包的传输层异常（`RemoteProtocolError` 等，与顶层 `httpx` 异常类不互通导致重试失效），按名称动态收集两包异常；重试次数 2→4（共 5 次尝试，退避 1s→2s→4s→8s）；流中断前已产出部分内容时先发 `stream_reset` 标记清空半截缓冲再重试，前端同步清空思考区重新渲染，断流静默恢复、用户无感知
 - 🛠️ **工具调用示例修正**：11 个 prompt 文件 91 处 `generic_linux_command` 示例统一为单 `command` 字符串，删除 schema 中不存在的 `interactive=` / `session_id=` / 双位置参数等误导形态；`_run_shell` 容忍 schema 外多余字段，避免 TypeError
@@ -651,6 +669,6 @@ baize-core/
 
 **白泽·智脑 (Baize)** · 仅供安全研究与授权测试使用
 
-[![Version](https://img.shields.io/badge/version-v1.7.1-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v1.8.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
 
 </div>

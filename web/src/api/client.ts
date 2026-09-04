@@ -1,4 +1,4 @@
-/*/* ===== 白泽·智脑(Baize) API Client ===== */
+/** ===== 白泽·智脑(Baize) API Client ===== */
 
 import type {
   HealthResponse,
@@ -18,10 +18,19 @@ import type {
   InterruptResponse,
   AuthLoginRequest,
   AuthLoginResponse,
-  ExperiencesResponse,
-  ExperienceItem,
-  RefineResponse,
-  EmbeddingConfigData,
+  MemoryStats,
+  MemoryExperience,
+  MemoryExperiencesResponse,
+  MemoryEpisodeBrief,
+  MemoryEpisodeDetail,
+  MemoryFactsResponse,
+  MemoryEntitiesResponse,
+  MemoryGraphSnapshot,
+  MemorySearchResult,
+  MemoryExperienceCreateInput,
+  MemoryExperienceUpdateInput,
+  MemoryExperienceStatusInput,
+  MemoryFeedbackInput,
   GuardrailConfig,
   GuardrailTestResult,
   SandboxPolicyConfig,
@@ -377,13 +386,6 @@ export async function sendMessage(id: string, data: InferenceRequest): Promise<I
   return request(`/sessions/${id}/messages`, { method: 'POST', body: JSON.stringify(data) });
 }
 
-export interface ExperienceSignal {
-  type: 'experience_signal';
-  reasons: string[];
-  session_id: string;
-  agent: string;
-}
-
 export function streamMessage(
   id: string,
   data: InferenceRequest,
@@ -392,7 +394,6 @@ export function streamMessage(
   onError: (err: Error) => void,
   onPrompt?: (prompt: PromptRequest) => void,
   onStep?: (step: ReasoningStep) => void,
-  onExperienceSignal?: (signal: ExperienceSignal) => void,
 ): AbortController {
   const controller = new AbortController();
 
@@ -454,12 +455,6 @@ export function streamMessage(
               // data.type is the step kind: tool_call | tool_output | handoff | agent_switched | message
               if (currentEvent === 'reasoning_step' && onStep) {
                 onStep(parsed as ReasoningStep);
-                currentEvent = '';
-                continue;
-              }
-              // 长期记忆：检测到可提炼经验信号
-              if (currentEvent === 'experience_signal' && onExperienceSignal) {
-                onExperienceSignal(parsed as ExperienceSignal);
                 currentEvent = '';
                 continue;
               }
@@ -629,8 +624,13 @@ export async function uploadAttachment(sessionId: string, file: File): Promise<A
     body: form,
   });
   if (!res.ok) {
-    const body = await res.text();
-    throw new Error(body ? `上传失败 [${res.status}]` : `上传失败 [${res.status}]`);
+    // 优先透出服务端 detail（如体积超限的具体上限），否则给出通用错误
+    let detail = `上传失败 [${res.status}]`;
+    try {
+      const j = JSON.parse(await res.text());
+      if (j && typeof j.detail === 'string') detail = j.detail;
+    } catch { /* 非 JSON 错误体，忽略 */ }
+    throw new Error(detail);
   }
   const data = await res.json();
   return data.attachment;
@@ -1100,72 +1100,99 @@ export function sharedBrowserStreamUrl(): string {
   return token ? `${url}?token=${encodeURIComponent(token)}` : url;
 }
 
-// ===== 长期记忆：经验库 =====
-export interface ExperienceInput {
-  title: string;
-  content: string;
-  scope: string;
-  tags?: string[];
-  source_session_id?: string;
-  source_agent?: string;
-  enabled?: boolean;
-  importance?: number;
+// ===== 长期记忆：memory 子系统（Episode / 经验 / 语义事实 / 知识图谱）=====
+/** 记忆总览统计 */
+export async function getMemoryStats(): Promise<MemoryStats> {
+  return request('/memory/stats');
 }
 
-export async function listExperiences(params?: {
+/** 经验列表（可筛选状态 / 作用域；superseded 默认隐藏） */
+export async function listMemoryExperiences(params?: {
+  status?: string;
   scope?: string;
-  agent?: string;
-  include_disabled?: boolean;
-}): Promise<ExperiencesResponse> {
+  include_superseded?: boolean;
+}): Promise<MemoryExperiencesResponse> {
   const qs = new URLSearchParams();
+  if (params?.status) qs.set('status', params.status);
   if (params?.scope) qs.set('scope', params.scope);
-  if (params?.agent) qs.set('agent', params.agent);
-  if (params?.include_disabled !== undefined) qs.set('include_disabled', String(params.include_disabled));
+  if (params?.include_superseded !== undefined) qs.set('include_superseded', String(params.include_superseded));
   const query = qs.toString() ? `?${qs.toString()}` : '';
-  return request(`/experiences${query}`);
+  return request(`/memory/experiences${query}`);
 }
 
-export async function getExperience(id: string): Promise<{ experience: ExperienceItem }> {
-  return request(`/experiences/${id}`);
+export async function getMemoryExperience(id: string): Promise<{ experience: MemoryExperience }> {
+  return request(`/memory/experiences/${encodeURIComponent(id)}`);
 }
 
-export async function createExperience(data: ExperienceInput): Promise<{ experience: ExperienceItem }> {
-  return request('/experiences', { method: 'POST', body: JSON.stringify(data) });
+/** 人工新增一条经验（直接 active） */
+export async function createMemoryExperience(data: MemoryExperienceCreateInput): Promise<{ experience: MemoryExperience; action: string }> {
+  return request('/memory/experiences', { method: 'POST', body: JSON.stringify(data) });
 }
 
-export async function updateExperience(id: string, data: Partial<ExperienceInput>): Promise<{ experience: ExperienceItem }> {
-  return request(`/experiences/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+/** 修订经验内容（REVISE，全程留痕；note 为变更理由） */
+export async function updateMemoryExperience(id: string, data: MemoryExperienceUpdateInput): Promise<{ experience: MemoryExperience }> {
+  return request(`/memory/experiences/${encodeURIComponent(id)}`, { method: 'PUT', body: JSON.stringify(data) });
 }
 
-export async function deleteExperience(id: string): Promise<{ ok: boolean }> {
-  return request(`/experiences/${id}`, { method: 'DELETE' });
+/** 状态演进：draft→active / active→invalidated 等 */
+export async function setMemoryExperienceStatus(id: string, data: MemoryExperienceStatusInput): Promise<{ experience: MemoryExperience }> {
+  return request(`/memory/experiences/${encodeURIComponent(id)}/status`, { method: 'PUT', body: JSON.stringify(data) });
 }
 
-/** 对会话做 LLM 复盘提炼，返回候选条目（不入库，用户确认后调用 createExperience） */
-export async function refineSessionExperience(sessionId: string, data: {
-  session_id: string;
-  agent: string;
-  scope?: string;
-}): Promise<RefineResponse> {
-  return request(`/sessions/${sessionId}/experience/refine`, {
-    method: 'POST',
-    body: JSON.stringify(data),
-  });
+/** 对经验打分：有用提升后续检索权重；连续被判无用会自动降级为草稿 */
+export async function feedbackMemoryExperience(id: string, data: MemoryFeedbackInput): Promise<{ experience: MemoryExperience }> {
+  return request(`/memory/experiences/${encodeURIComponent(id)}/feedback`, { method: 'POST', body: JSON.stringify(data) });
 }
 
-/** 获取 embedding 配置 */
-export async function getEmbeddingConfig(): Promise<{ config: EmbeddingConfigData }> {
-  return request('/experiences/embedding-config');
+/** 软删除：INVALIDATE（保留谱系，不物理删除） */
+export async function invalidateMemoryExperience(id: string): Promise<{ ok: boolean }> {
+  return request(`/memory/experiences/${encodeURIComponent(id)}`, { method: 'DELETE' });
 }
 
-/** 保存 embedding 配置 */
-export async function saveEmbeddingConfig(data: EmbeddingConfigData): Promise<{ ok: boolean; config: EmbeddingConfigData }> {
-  return request('/experiences/embedding-config', { method: 'PUT', body: JSON.stringify(data) });
+/** 合并一组同主题经验为更泛化的新经验（默认 draft，autoCommit=true 才取代旧条目） */
+export async function consolidateMemoryExperiences(ids: string[], autoCommit: boolean = false): Promise<{ result: Record<string, unknown> }> {
+  return request('/memory/consolidate', { method: 'POST', body: JSON.stringify({ ids, auto_commit: autoCommit }) });
 }
 
-/** 为经验条目批量补齐向量索引 */
-export async function reindexExperiences(): Promise<{ ok: boolean; indexed: number; total: number }> {
-  return request('/experiences/reindex', { method: 'POST' });
+/** Episode（任务轨迹）列表：steps 为步数（不含完整内容） */
+export async function listMemoryEpisodes(params?: { limit?: number; session_id?: string }): Promise<{ total: number; episodes: MemoryEpisodeBrief[] }> {
+  const qs = new URLSearchParams();
+  if (params?.limit !== undefined) qs.set('limit', String(params.limit));
+  if (params?.session_id) qs.set('session_id', params.session_id);
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return request(`/memory/episodes${query}`);
+}
+
+/** Episode 详情（含完整 steps 证据链） */
+export async function getMemoryEpisode(id: string): Promise<{ episode: MemoryEpisodeDetail }> {
+  return request(`/memory/episodes/${encodeURIComponent(id)}`);
+}
+
+/** 跨类型语义检索（经验/事实/实体/图邻域/可选 Episode） */
+export async function searchMemory(q: string, includeEpisodes: boolean = false): Promise<MemorySearchResult> {
+  const qs = new URLSearchParams({ q });
+  if (includeEpisodes) qs.set('include_episodes', 'true');
+  return request(`/memory/search?${qs.toString()}`);
+}
+
+/** 语义事实列表 */
+export async function listMemoryFacts(status?: string): Promise<MemoryFactsResponse> {
+  const qs = status ? `?status=${encodeURIComponent(status)}` : '';
+  return request(`/memory/facts${qs}`);
+}
+
+/** 实体索引列表 */
+export async function listMemoryEntities(params?: { limit?: number; kind?: string }): Promise<MemoryEntitiesResponse> {
+  const qs = new URLSearchParams();
+  if (params?.limit !== undefined) qs.set('limit', String(params.limit));
+  if (params?.kind) qs.set('kind', params.kind);
+  const query = qs.toString() ? `?${qs.toString()}` : '';
+  return request(`/memory/entities${query}`);
+}
+
+/** 时间知识图谱 + 内容节点快照 */
+export async function getMemoryGraph(): Promise<MemoryGraphSnapshot> {
+  return request('/memory/graph');
 }
 
 // ===== Sandbox =====
@@ -1175,4 +1202,4 @@ export async function sandboxDeny(toolName: string, sessionId: string): Promise<
   return request('/sandbox/deny', { method: 'POST', body: JSON.stringify({ tool_name: toolName, session_id: sessionId }) });
 }
 
-// ===== Experiences =====
+

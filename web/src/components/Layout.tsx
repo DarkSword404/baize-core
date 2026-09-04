@@ -1,14 +1,21 @@
-import { Outlet } from 'react-router-dom';
+import { Outlet, useLocation } from 'react-router-dom';
 import { Sidebar } from './Sidebar';
 import { ToastContainer } from './Toast';
 import { useApp } from '../context/AppContext';
 import { useTheme } from '../context/ThemeContext';
 import { SettingsModal } from './SettingsModal';
+import { Chat } from '../pages/Chat';
 import type { JSX } from 'react';
 
 export function Layout(): JSX.Element {
   const { toasts } = useApp();
   const { toggleTheme, isDark } = useTheme();
+  const location = useLocation();
+  // Chat 常驻挂载：切到其他页面时只隐藏（display:none）而不卸载。
+  // 若随路由卸载，会 (1) 中断进行中的 SSE 流式连接；(2) 切回时重新挂载，
+  // 其 mount useEffect 会用后端历史覆盖 AppContext 中的消息，而流式过程中
+  // 的内容尚未落库，进行中的对话就"消失"了，必须等结束后刷新才看得到。
+  const isChat = location.pathname.startsWith('/chat');
 
   return (
     <div className={`flex h-screen overflow-hidden ${isDark ? 'bg-gray-950 text-gray-100' : 'bg-gray-50 text-gray-900'}`}>
@@ -36,7 +43,11 @@ export function Layout(): JSX.Element {
           </button>
         </div>
         <div className="flex-1 overflow-hidden">
-          <Outlet />
+          {/* Chat 常驻挂载，非聊天页时隐藏以保持流式状态 */}
+          <div className={`h-full ${isChat ? 'block' : 'hidden'}`}>
+            <Chat />
+          </div>
+          {!isChat && <Outlet />}
         </div>
       </div>
 

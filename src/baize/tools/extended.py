@@ -19,22 +19,39 @@ from baize.sdk.agent import AgentTool
 
 
 def _run_shell(command: str, timeout: int = 120, **kwargs: Any) -> str:
-    """执行 shell 命令并返回输出。
+    """执行 shell 命令并返回输出（经统一执行器抽象）。
 
     注意：``**kwargs`` 用于容忍模型偶尔产出的 schema 外多余字段
     （如 ``interactive=True``、``session_id="..."``），避免 TypeError
     导致工具直接报「执行失败」。
+
+    **执行器抽象**：走 ``baize.executors`` 的统一后端，不再裸调
+    ``subprocess.run``。因此 generic_linux_command 也能享受:
+    - ``BAIZE_EXEC_BACKEND=tmux`` 的长任务会话（超时不丢结果）；
+    - 进程组级清理（超时/取消时子孙进程不泄漏成孤儿）；
+    - 按 ``BAIZE_EXEC_*`` 环境变量可配置的隔离/远程后端。
+
+    注意 ``timeout<=0`` 表示不限制，交由执行器/Agent 兜底超时管理。
     """
     try:
-        proc = subprocess.run(
-            ["/bin/bash", "-c", command],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        return ((proc.stdout or "") + (proc.stderr or "")).strip() or f"(exit {proc.returncode})"
-    except subprocess.TimeoutExpired:
-        return f"(超时 {timeout}s)"
+        from baize.executors import ExecutorConfig, build_executor
+
+        cfg = ExecutorConfig.from_env()
+        executor = build_executor(cfg)
+        result = asyncio.run(executor.run(command, timeout=timeout if timeout and timeout > 0 else 0))
+        text = result.text
+        if result.session:
+            # 长任务仍在后台 tmux 会话中运行，把会话名与输出文件带给模型，
+            # 便于稍后用 generic_linux_command 取回完整结果或确认结束。
+            log_path = f"/tmp/baize-tmux/{result.session}/output.log"
+            text = (
+                f"{text}\n[长任务] 命令超过单次执行时限后仍在后台 tmux 会话 "
+                f"`{result.session}` 中运行（不会被杀死）。"
+                f"输出实时写入 {log_path}；可稍后用 generic_linux_command "
+                f"执行 `tail -n 50 {log_path}` 取回结果，或 `tmux kill-session -t "
+                f"{result.session}` 终止。命令完成时该会话自动结束。"
+            )
+        return text
     except Exception as e:  # noqa: BLE001
         return f"(错误: {e})"
 

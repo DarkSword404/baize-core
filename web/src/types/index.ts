@@ -204,48 +204,217 @@ export interface SharedBrowserStatus {
   viewport?: { width: number; height: number };
 }
 
-// ===== 长期记忆：经验条目 =====
-export interface ExperienceItem {
+// ===== 长期记忆：memory 子系统（Episode / 经验 / 语义事实 / 知识图谱）=====
+export type MemoryExperienceStatus = 'draft' | 'active' | 'superseded' | 'invalidated';
+export type MemoryExperienceKind = 'method' | 'lesson' | 'intel';
+
+/** 证据引用：定位到 Episode 内具体步骤（ref 如 "t:3"），可回溯原始轨迹 */
+export interface MemoryEvidenceRef {
+  episode_id: string;
+  kind: string;
+  ref: string;
+  excerpt: string;
+  at: string;
+}
+
+export interface MemoryExperience {
   id: string;
-  scope: string;          // "global" | "agent:{agent_key}"
   title: string;
-  content: string;        // 复盘总结文本
+  content: string;         // 自然语言经验（核心存储单位）
   tags: string[];
+  kind: MemoryExperienceKind;
+  status: MemoryExperienceStatus;
+  confidence: number;      // 0-1，自动沉淀置信度（≥0.7 才 active）
+  importance: number;      // 0-5
+  scope: string;           // "global" | "agent:<key>"
+  agent_key: string;
   source_session_id: string;
-  source_agent: string;
+  episode_id: string;
+  evidence: MemoryEvidenceRef[];
+  supersedes: string[];    // 本条目取代的历史 id（谱系）
+  replaced_by: string;     // 本条目被谁取代（'' 表示仍有效）
+  history: Array<{ action: string; at: string; actor: string; [k: string]: unknown }>;
   created_at: string;
   updated_at: string;
-  enabled: boolean;
-  importance: number;     // 0-5
-  hit_count: number;
-  embedding?: number[] | null;
-  embedding_model?: string;
+  source: string;
+  /** 评价闭环：被注入上下文次数 / 被采纳次数 / 被判无用次数 */
+  hit_count?: number;
+  useful_count?: number;
+  noise_count?: number;
+  last_hit_at?: string;
+  /** 检索命中的附加得分 */
+  score?: number;
 }
 
-export interface ExperiencesResponse {
-  experiences: ExperienceItem[];
+export interface MemoryExperiencesResponse {
+  total: number;
+  experiences: MemoryExperience[];
 }
 
-export interface RefineCandidate {
+export type MemoryEpisodeStatus = 'success' | 'failed' | 'in_progress';
+
+export interface MemoryEpisodeBrief {
+  id: string;
+  task: string;            // 用户给 Agent 的任务（一次任务 = 一个 Episode）
+  target: string;
+  agent_key: string;
+  session_id: string;
+  status: MemoryEpisodeStatus | string;
+  start_at: string;
+  end_at?: string;
+  error?: string;
+  result_text?: string;
+  summary?: string;
+  steps: number;           // 列表接口：步数（完整内容请取详情）
+  entity_keys: string[];
+  messages_count: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface MemoryEpisodeStep {
+  no: number;
+  type: 'decision' | 'observation' | 'tool_call';
+  role?: string;
+  text?: string;           // decision / observation 内容
+  name?: string;           // tool_call 工具名
+  arguments?: string;      // tool_call 参数（原始文本）
+  output?: string;         // tool_call 返回（可能被截断）
+  status?: string;         // ok | error | denied
+  ts?: string;
+}
+
+export interface MemoryEpisodeDetail extends Omit<MemoryEpisodeBrief, 'steps'> {
+  steps: MemoryEpisodeStep[];
+}
+
+export type MemoryFactStatus = 'active' | 'invalidated';
+
+export interface MemoryFact {
+  id: string;
+  statement: string;
+  subject: string;
+  rel_type: string;
+  object: string;
+  status: MemoryFactStatus;
+  confidence: number;
+  valid_from?: string;
+  invalid_at?: string;
+  sources?: Array<{ kind?: string; id: string }>;
+  agent_key?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface MemoryFactsResponse {
+  total: number;
+  facts: MemoryFact[];
+}
+
+export interface MemoryEntity {
+  key: string;
+  label: string;
+  kind: string;
+  aliases?: string[];
+  first_seen?: string;
+  last_seen?: string;
+  mention_count?: number;
+  properties?: Record<string, unknown>;
+  [k: string]: unknown;
+}
+
+export interface MemoryEntitiesResponse {
+  total: number;
+  entities: MemoryEntity[];
+}
+
+export interface MemoryRelation {
+  id: string;
+  type: string;            // MENTIONS / SUPPORTS / BEFORE / ...
+  source: string;
+  target: string;
+  status?: string;
+  valid_from?: string;
+  invalid_at?: string;
+  provenance?: string;
+  occurrences?: number;
+  [k: string]: unknown;
+}
+
+export interface MemoryStats {
+  episodes: number;
+  experiences: number;
+  experiences_active: number;
+  experiences_draft: number;
+  facts: number;
+  entities: number;
+  relations: number;
+}
+
+export interface MemoryGraphNode {
+  id: string;
+  label: string;
+  kind: 'entity' | 'experience' | 'episode' | 'fact';
+  group?: string;          // entity 类别（ip/domain/port/...）
+  status?: string;
+  confidence?: number;
+  tags?: string[];
+  mentions?: number;
+  [k: string]: unknown;
+}
+
+export interface MemoryGraphEdge {
+  source: string;
+  target: string;
+  type: string;
+  valid_from?: string;
+  invalid_at?: string;
+}
+
+export interface MemoryGraphSnapshot {
+  stats: MemoryStats;
+  nodes: MemoryGraphNode[];
+  edges: MemoryGraphEdge[];
+}
+
+export interface MemorySearchResult {
+  query: string;
+  experiences: MemoryExperience[];
+  facts: MemoryFact[];
+  entities: MemoryEntity[];
+  neighbors: { entities: MemoryEntity[]; relations: MemoryRelation[] };
+  episodes: MemoryEpisodeBrief[];
+}
+
+// ---- 请求载荷 --------------------------------------------------------------
+export interface MemoryExperienceCreateInput {
   title: string;
   content: string;
-  tags: string[];
-  scope: string;
-  _raw?: string;
+  tags?: string[];
+  kind?: MemoryExperienceKind;
+  scope?: string;
+  agent_key?: string;
+  source_session_id?: string;
+  importance?: number;
 }
 
-export interface RefineResponse {
-  candidate: RefineCandidate;
-  session_id: string;
-  agent: string;
+export interface MemoryExperienceUpdateInput {
+  title?: string;
+  content?: string;
+  tags?: string[];
+  kind?: MemoryExperienceKind;
+  importance?: number;
+  note?: string;
 }
 
-export interface EmbeddingConfigData {
-  provider: 'none' | 'openai' | 'local';
-  base_url: string;
-  api_key: string;
-  model: string;
-  dimensions: number;
+export interface MemoryExperienceStatusInput {
+  status: MemoryExperienceStatus;
+  note?: string;
+}
+
+export interface MemoryFeedbackInput {
+  useful: boolean;   // true=有用（采纳），false=无用
+  note?: string;
 }
 
 // ===== 安全护栏 =====
@@ -298,3 +467,5 @@ export interface SandboxPolicyConfig {
   auto_approve_after: number;
   max_dangerous_per_turn: number;
 }
+
+

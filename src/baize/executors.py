@@ -26,8 +26,14 @@ import logging
 import os
 import shlex
 import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Optional
 
 logger = logging.getLogger("baize.executors")
@@ -127,6 +133,8 @@ class ExecResult:
     enforcement: str = EnforcementLevel.NONE.value
     # 错误分类：None | "sandbox_denied" | "runner_failure" | "timeout"
     error_kind: Optional[str] = None
+    # 长任务（tmux）后台会话名；非空时命令可能仍在后台运行，可用会话名取回结果
+    session: Optional[str] = None
 
     @property
     def text(self) -> str:
@@ -197,6 +205,7 @@ def _finish_result(
     stderr: Any = b"",
     returncode: int = -1,
     timed_out: bool = False,
+    session: Optional[str] = None,
 ) -> ExecResult:
     """统一构造 ExecResult（含错误分类）。"""
     stdout_s = stdout.decode("utf-8", errors="replace") if isinstance(stdout, bytes) else stdout
@@ -213,6 +222,7 @@ def _finish_result(
         enforcement=enforcement.value,
         # 同时检查 stdout/stderr（shell 常把错误经 2>&1 混入 stdout）
         error_kind=classify_exec_error(f"{stderr_s}\n{stdout_s}", returncode, timed_out),
+        session=session,
     )
 
 
@@ -262,28 +272,46 @@ class LocalExecutor(BaseExecutor):
         sandbox, _ = _resolve_sandbox(kwargs)
         self.check_sandbox(sandbox)
         started = asyncio.get_event_loop().time()
+        proc = None
         try:
             if sandbox == SandboxMode.DANGER_FULL_ACCESS:
                 argv = [self.shell, "-c", command]
             else:
                 argv = self._wrap_bwrap(command, sandbox)
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **(self.env or {})},
-            )
+            # start_new_session: 让命令进入独立进程组，超时/取消时整组杀除，
+            # 避免 ``/bin/bash -c "cmd1 | cmd2"`` 的子孙进程泄漏成孤儿（长任务场景会放大）。
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env={**os.environ, **(self.env or {})},
+                    start_new_session=True,
+                )
+            except TypeError:  # pragma: no cover - 极老版本 asyncio 不支持该参数
+                proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env={**os.environ, **(self.env or {})},
+                )
+            # timeout<=0 表示不限制（wait_for 传 None）
+            wait_timeout = timeout if timeout and timeout > 0 else None
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=wait_timeout)
                 returncode = proc.returncode
                 timed_out = False
             except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
+                await self._terminate_tree(proc)
                 stdout, stderr = b"", "timeout".encode()
                 returncode = -1
                 timed_out = True
         except SandboxUnavailableError:
+            raise
+        except asyncio.CancelledError:
+            # 外层取消（如 AgentTool 兜底超时）：同样要杀进程组，避免后台残留
+            if proc is not None:
+                await self._terminate_tree(proc)
             raise
         except Exception as exc:  # noqa: BLE001
             logger.debug("本地执行失败: %s", exc)
@@ -294,6 +322,27 @@ class LocalExecutor(BaseExecutor):
             started, command, self.name, sandbox, enforcement,
             stdout, stderr, returncode, timed_out,
         )
+
+    @staticmethod
+    async def _terminate_tree(proc: Any) -> None:
+        """终止进程及其整棵进程组（SIGKILL 整个 group）。"""
+        if proc.returncode is not None:
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:  # pragma: no cover
+                pass
+        except (ProcessLookupError, PermissionError, OSError):  # pragma: no cover
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await proc.wait()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class DockerExecutor(BaseExecutor):
@@ -350,8 +399,10 @@ class DockerExecutor(BaseExecutor):
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ},
             )
+            # timeout<=0 表示不限制（wait_for 传 None）
+            wait_timeout = timeout if timeout and timeout > 0 else None
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=wait_timeout)
                 returncode = proc.returncode
                 timed_out = False
             except asyncio.TimeoutError:
@@ -435,8 +486,10 @@ class SSHExecutor(BaseExecutor):
                 stderr=asyncio.subprocess.PIPE,
                 env={**os.environ},
             )
+            # timeout<=0 表示不限制（wait_for 传 None）
+            wait_timeout = timeout if timeout and timeout > 0 else None
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=wait_timeout)
                 returncode = proc.returncode
                 timed_out = False
             except asyncio.TimeoutError:
@@ -454,14 +507,203 @@ class SSHExecutor(BaseExecutor):
         )
 
 
+class TmuxExecutor(BaseExecutor):
+    """tmux 执行器 —— 长任务在独立 tmux 会话中运行，可跨超时存活。
+
+    LocalExecutor 的硬顶超时（默认 300s，见 ``BAIZE_TOOL_EXEC_TIMEOUT``）
+    会让 hashcat/john/全端口扫描这类长任务在超时后被整组杀死、结果丢失。
+    ``TmuxExecutor`` 把命令放进一个 detached tmux 会话执行：
+    - 输出实时落盘，超时返回时**会话继续在后台运行**，后续可取回结果；
+    - 支持进程组语义：清理时 ``kill-session`` 连子孙进程一起杀掉；
+    - 同一实例可管理多个命名会话（长任务之间互不干扰）。
+
+    用法::
+
+        ex = TmuxExecutor()
+        r = await ex.run("hashcat -a 3 hash.txt", timeout=60)
+        # 超时后:
+        if r.timed_out and r.payload.get("session"):
+            ...   # 会话仍在后台跑，稍后取结果
+        r2 = await ex.run("cat /tmp/out", timeout=10, session=r.payload["session"])
+        # 或主动清理
+        await ex.stop(session_name)
+    """
+
+    name = "tmux"
+    default_enforcement = EnforcementLevel.NONE
+    # run() 超时时是否保留后台会话（长任务语义：保留，方便取回结果）
+    keep_on_timeout = True
+
+    def __init__(self, shell: str = "/bin/bash", tmux_cmd: str = "tmux") -> None:
+        self.shell = shell
+        self.tmux_cmd = tmux_cmd
+        self._tmp_root = Path(tempfile.gettempdir()) / "baize-tmux"
+        self._tmp_root.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # 会话管理工具
+    # ------------------------------------------------------------------
+
+    def _session_dir(self, session: str) -> Path:
+        return self._tmp_root / session
+
+    @staticmethod
+    def _quote_single(value: str) -> str:
+        return "'" + value.replace("'", "'\\''") + "'"
+
+    def check_available(self) -> bool:
+        """tmux 是否可用（缺失时所有执行 fail-closed）。"""
+        return shutil.which(self.tmux_cmd) is not None
+
+    def has_session(self, session: str) -> bool:
+        """判断命名会话是否仍在运行。"""
+        if not session:
+            return False
+        try:
+            proc = subprocess.run(
+                [self.tmux_cmd, "has-session", "-t", session],
+                capture_output=True, timeout=10,
+            )
+            return proc.returncode == 0
+        except (OSError, subprocess.SubprocessError):  # noqa: BLE001
+            return False
+
+    async def _run_tmux(self, args: list[str]) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            self.tmux_cmd, *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return -1, "tmux 命令超时"
+        text = (stdout or b"").decode("utf-8", "replace") + (stderr or b"").decode("utf-8", "replace")
+        return proc.returncode, text.strip()
+
+    def _ensure_running_script(self, session: str, command: str) -> Path:
+        """为会话生成 runner 脚本（输出/退出码落盘，便于轮询与超时后取回）。"""
+        sdir = self._session_dir(session)
+        sdir.mkdir(parents=True, exist_ok=True)
+        out_path = sdir / "output.log"
+        rc_path = sdir / "exitcode"
+        # 清理历史残留
+        for p in (out_path, rc_path):
+            if p.exists():
+                p.unlink()
+        script = sdir / "run.sh"
+        script.write_text(
+            "#!/bin/bash\n"
+            f"exec >> {self._quote_single(str(out_path))} 2>&1\n"
+            "trap 'echo 130 > "
+            f"{self._quote_single(str(rc_path))}"
+            "' INT TERM\n"
+            f"{command}\n"
+            f"echo $? > {self._quote_single(str(rc_path))}\n",
+            encoding="utf-8",
+        )
+        os.chmod(script, 0o755)
+        return script
+
+    async def run(self, command: str, timeout: int = 120, **kwargs: Any) -> ExecResult:
+        """在 detached tmux 会话中运行命令。
+
+        kwargs 额外支持:
+        - ``session``: 复用指定会话名（默认自动生成 ``baize-<hex>``）。
+        - ``sandbox``: 本后端不提供隔离；非 danger 请求将 fail-closed。
+        """
+        sandbox, _ = _resolve_sandbox(kwargs)
+        self.check_sandbox(sandbox)
+        if not self.check_available():
+            return ExecResult(
+                command=command, stderr="tmux 命令不可用，长任务执行器不可用", returncode=127,
+                executor=self.name, error_kind="runner_failure",
+            )
+        session = kwargs.get("session") or f"baize-{uuid.uuid4().hex[:8]}"
+        # 复用会话时不重复创建
+        if not self.has_session(session):
+            script = self._ensure_running_script(session, command)
+            code, err = await self._run_tmux(
+                ["new-session", "-d", "-s", session, "bash", str(script)]
+            )
+            if code != 0:
+                return ExecResult(
+                    command=command, stderr=err or "创建 tmux 会话失败",
+                    returncode=code or -1, executor=self.name, error_kind="runner_failure",
+                )
+
+        started = asyncio.get_event_loop().time()
+        out_path = self._session_dir(session) / "output.log"
+        rc_path = self._session_dir(session) / "exitcode"
+        # 轮询：等待会话结束 / 退出码文件出现
+        while True:
+            done = rc_path.exists() or not self.has_session(session)
+            if done:
+                break
+            if timeout > 0 and (asyncio.get_event_loop().time() - started) >= timeout:
+                break
+            await asyncio.sleep(0.5)
+
+        stdout = out_path.read_text(encoding="utf-8", errors="replace") if out_path.exists() else ""
+        timed_out = not (rc_path.exists() or not self.has_session(session))
+        returncode = -1
+        if rc_path.exists():
+            try:
+                returncode = int(rc_path.read_text(encoding="utf-8").strip() or "-1")
+            except ValueError:
+                returncode = -1
+
+        if not timed_out:
+            # 正常完成：清理会话与临时目录
+            if self.has_session(session):
+                await self._run_tmux(["kill-session", "-t", session])
+            try:
+                import shutil as _shutil
+
+                _shutil.rmtree(self._session_dir(session), ignore_errors=True)
+            except Exception:  # noqa: BLE001
+                pass
+            session = None  # 已完成，不再暴露后台会话
+
+        return _finish_result(
+            started, command, self.name, sandbox, EnforcementLevel.NONE,
+            stdout.encode("utf-8", "replace") if stdout else b"",
+            b"",
+            returncode,
+            timed_out,
+            session=session if timed_out else None,
+        )
+
+    async def stop(self, session: str) -> None:
+        """终止指定会话（进程组连带子孙一起清理）。"""
+        if session and self.has_session(session):
+            await self._run_tmux(["kill-session", "-t", session])
+
+    async def poll(self, session: str) -> dict[str, Any]:
+        """查询后台会话状态：{running, returncode, output}。"""
+        out_path = self._session_dir(session) / "output.log"
+        rc_path = self._session_dir(session) / "exitcode"
+        running = self.has_session(session)
+        stdout = out_path.read_text(encoding="utf-8", errors="replace") if out_path.exists() else ""
+        returncode = -1
+        if rc_path.exists():
+            try:
+                returncode = int(rc_path.read_text(encoding="utf-8").strip() or "-1")
+            except ValueError:
+                returncode = -1
+        return {"session": session, "running": running, "returncode": returncode, "output": stdout}
+
+
 # ---------------------------------------------------------------------------
 # 执行器注册表与工厂
 # ---------------------------------------------------------------------------
-
 _EXECUTORS: dict[str, type[BaseExecutor]] = {
     "local": LocalExecutor,
     "docker": DockerExecutor,
     "ssh": SSHExecutor,
+    "tmux": TmuxExecutor,
 }
 
 
@@ -470,7 +712,7 @@ class ExecutorConfig:
     """执行器配置（通过环境变量 / 配置覆盖）。
 
     Attributes:
-        backend: 后端类型（local/docker/ssh）。
+        backend: 后端类型（local/docker/ssh/tmux）。
         image: Docker 镜像名。
         host/username/port/key_path: SSH 连接参数。
         sandbox: 默认请求的隔离等级（read_only/workspace_write/danger_full_access）。
@@ -535,6 +777,12 @@ def build_executor(config: Optional[ExecutorConfig] = None, **kwargs: Any) -> Ba
             key_path=kwargs.pop("key_path", config.key_path),
             **kwargs,
         )
+    if backend == "tmux":
+        return TmuxExecutor(
+            shell=kwargs.pop("shell", "/bin/bash"),
+            tmux_cmd=kwargs.pop("tmux_cmd", "tmux"),
+            **kwargs,
+        )
     return LocalExecutor(**kwargs)
 
 
@@ -562,6 +810,7 @@ __all__ = [
     "LocalExecutor",
     "DockerExecutor",
     "SSHExecutor",
+    "TmuxExecutor",
     "ExecutorConfig",
     "build_executor",
     "run_shell",

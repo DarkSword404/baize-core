@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import json
 import logging
 import os
 import sys
+from dataclasses import replace as _dataclass_replace
 from importlib.metadata import entry_points
 from typing import Any, Optional
 
@@ -46,24 +48,17 @@ from baize.agents.guardrails import (
     test_guardrail,
     validate_guardrail_config,
 )
-from baize.config import ModelConfigStore, SingleModelConfig, get_server_config
+from baize.config import DEFAULT_BAIZE_DIR, ModelConfigStore, SingleModelConfig, get_server_config
+from baize.db_recorder import DbRecorder
 from baize.multimodal import build_user_message
 from baize.receivers.manager import ReceiverManager
 from baize.receivers.webhook import handle_webhook
 from baize.sdk.client import LLMClient, ModelNotConfiguredError, ChatMessage
+from baize.sdk.session_log import SessionLog
 from baize.tools.custom_tools import CustomToolStore, test_custom_tool
 from baize.tools.extended import _check_url_allowed
 from baize.tools.shared_browser import get_shared_browser
-from baize.experiences import (
-    GLOBAL_SCOPE,
-    EmbeddingConfig,
-    EmbeddingConfigStore,
-    ExperienceRetriever,
-    ExperienceStore,
-    detect_turn_signals,
-    refine_experience,
-    resolve_embedding,
-)
+from baize.memory import MemoryService
 
 
 # ----------------------------------------------------------------------
@@ -112,38 +107,40 @@ class MessageRequest(BaseModel):
     attachments: list[str] = Field(default_factory=list)
 
 
-class ExperienceRequest(BaseModel):
+# ---- 长期记忆（全新 memory 子系统）请求模型 --------------------------------
+class MemoryExperienceCreate(BaseModel):
     title: str
     content: str
-    scope: str = GLOBAL_SCOPE  # "global" | "agent:{agent_key}"
     tags: list[str] = Field(default_factory=list)
+    kind: str = "method"        # method | lesson | intel
+    scope: str = "global"       # global | agent:<key>
+    agent_key: str = ""
     source_session_id: str = ""
-    source_agent: str = ""
-    enabled: bool = True
-    importance: int = 0
+    importance: int = 3
 
 
-class ExperienceUpdateRequest(BaseModel):
+class MemoryExperienceUpdate(BaseModel):
     title: Optional[str] = None
     content: Optional[str] = None
-    scope: Optional[str] = None
     tags: Optional[list[str]] = None
-    enabled: Optional[bool] = None
+    kind: Optional[str] = None
     importance: Optional[int] = None
+    note: str = ""
 
 
-class RefineRequest(BaseModel):
-    session_id: str
-    agent: str
-    scope: str = "auto"  # "global" | "agent:{key}" | "auto"
+class MemoryStatusRequest(BaseModel):
+    status: str = "active"      # draft | active | superseded | invalidated
+    note: str = ""
 
 
-class EmbeddingConfigRequest(BaseModel):
-    provider: str = "none"  # none | openai | local
-    base_url: str = ""
-    api_key: str = ""
-    model: str = ""
-    dimensions: int = 0
+class MemoryFeedbackRequest(BaseModel):
+    useful: bool = True         # True=采纳/有用，False=无用（连续无用会自动降级为草稿）
+    note: str = ""
+
+
+class MemoryConsolidateRequest(BaseModel):
+    ids: list[str] = Field(default_factory=list)
+    auto_commit: bool = False   # True 时直接取代旧条目
 
 
 class AuthResponse(BaseModel):
@@ -520,6 +517,43 @@ async def _with_sse_heartbeat(agen, interval: float = 15.0):
 
 
 # ----------------------------------------------------------------------
+# 会话审计日志：SessionLog 生产接线辅助
+# ----------------------------------------------------------------------
+def _get_or_create_session_log(app: FastAPI, session_id: str) -> SessionLog:
+    """取（或建）会话级 SessionLog，JSONL 落盘 ~/.baize/sessions/<id>.audit.jsonl。
+
+    同一会话的多轮消息共享同一日志（进程内缓存 + 磁盘续写），
+    提供 append-only 审计事实源；删除会话时由 delete_session 同步清理。
+    """
+    logs: dict[str, SessionLog] = app.state.session_logs
+    log = logs.get(session_id)
+    if log is None:
+        path = os.path.join(app.state.session_log_dir, f"{session_id}.audit.jsonl")
+        log = SessionLog(session_id=session_id, path=path, origin="api")
+        logs[session_id] = log
+    return log
+
+
+def _clone_agent_for_session(agent: Any, session_id: str, session_log: SessionLog) -> Any:
+    """克隆 agent 运行副本并绑定会话级 session_id / session_log。
+
+    注册表内的 agent 是全局共享单例，直接写字段会污染并发请求
+    （session 互相串台）。通过 dataclasses.replace 产生浅拷贝副本，
+    仅替换会话相关字段，其余（tools/memory/hooks 等）仍共享定义。
+    """
+    try:
+        return _dataclass_replace(
+            agent, session_id=session_id, session_log=session_log
+        )
+    except TypeError:
+        # 非 dataclass 的兜底 agent：浅拷贝后绑定（保持单例不被修改）
+        copied = copy.copy(agent)
+        copied.session_id = session_id
+        copied.session_log = session_log
+        return copied
+
+
+# ----------------------------------------------------------------------
 # 应用工厂
 # ----------------------------------------------------------------------
 def create_baize_api_app(
@@ -559,17 +593,22 @@ def create_baize_api_app(
     app.state.attachment_store = AttachmentStore()
     app.state.require_auth = cfg.require_auth
     app.state.loaded_modules: dict[str, dict] = {}  # 已加载模块注册表
-    # 长期记忆：经验库 + 可插拔 embedding Provider + 检索器
-    app.state.experience_store = ExperienceStore()
-    app.state.embedding_config_store = EmbeddingConfigStore()
-    app.state.embedding = resolve_embedding()
-    app.state.experience_retriever = ExperienceRetriever(
-        app.state.experience_store, app.state.embedding
-    )
+    # ── 长期记忆：memory 子系统（Episode/经验/语义事实/时间知识图谱）──
+    # 全新实现（baize.memory），取代历史上所有经验引擎。Agent 每回合结束自动
+    # 学习（见 sdk.agent._try_auto_refine），此处只负责注册全局服务。
+    app.state.memory_service = MemoryService()
+
+    # ── 会话审计日志：SessionLog JSONL 落盘目录 + 进程内缓存 ──
+    app.state.session_log_dir = os.path.join(str(DEFAULT_BAIZE_DIR), "sessions")
+    app.state.session_logs: dict[str, SessionLog] = {}
+    # DbRecorder（SQLite 结构化镜像）注册为全局服务，
+    # Agent._log_event 会把每条会话事件并行写入 runtime.sqlite
+    app.state.db_recorder = DbRecorder()
+    services.register("db_recorder", app.state.db_recorder)
 
     # 注册到全局服务表，供 Agent 运行时查找
     services.register("sandbox", app.state.sandbox)
-    services.register("experience_store", app.state.experience_store)
+    services.register("memory_service", app.state.memory_service)
 
     # ------------------------------------------------------------------
     # 启动凭证输出
@@ -1203,8 +1242,12 @@ def create_baize_api_app(
             raise HTTPException(status_code=404, detail="会话不存在")
         # 修复：删除会话时同步清理该会话的附件、解压文件与索引
         app.state.attachment_store.delete_session(session_id)
+        # 会话删除：释放进程内 SessionLog 缓存（JSONL 审计文件保留，
+        # 作为 append-only 事实源；SQLite 镜像 events 亦保留可回溯）
+        app.state.session_logs.pop(session_id, None)
         # 统计该会话衍生的经验条目数（经验是长期资产，不随会话删除，仅供前端提示）
-        derived = app.state.experience_store.get_by_source_session(session_id)
+        derived = [e for e in app.state.memory_service.list_experiences()
+                   if e.get("source_session_id") == session_id]
         return {"ok": True, "derived_experiences": len(derived)}
 
     @app.post(
@@ -1389,6 +1432,13 @@ def create_baize_api_app(
             from baize.compressor import CompressorConfig, ToolOutputCompressor
             agent.tool_output_compressor = ToolOutputCompressor(CompressorConfig(enabled=True))
 
+        # ── 会话审计日志：取（或建）会话级 SessionLog，并克隆 agent 绑定 ──
+        # SessionLog 每会话一份（JSONL 落盘 ~/.baize/sessions/<id>.audit.jsonl），
+        # 多轮消息共享续写；agent 通过 dataclasses.replace 克隆运行副本，
+        # 避免直接把 session_id/session_log 写到注册表全局单例上串台。
+        session_log = _get_or_create_session_log(app, session_id)
+        agent = _clone_agent_for_session(agent, session_id, session_log)
+
         # ── pattern 流水线会话：会话绑定了流水线时，走流水线事件源 ──
         pipeline_def = None
         if getattr(session, "pattern", None):
@@ -1453,19 +1503,19 @@ def create_baize_api_app(
             else:
                 user_chat_message.content += _hint
 
-        # ── 长期记忆：检索相关历史经验并注入 agent 上下文 ──
+        # ── 长期记忆：混合检索相关既往经验/知识并注入 agent 上下文 ──
+        # memory 子系统（baize.memory）：纯本地混合召回，不依赖任何旧经验引擎。
         experience_block = ""
-        exp_agent_key = getattr(agent, "name", None) or agent_name or "default"
+        injected_exp_ids: list[str] = []
         try:
-            retrieved = await app.state.experience_retriever.search(
-                payload.input, exp_agent_key, top_k=3
-            )
-            if retrieved:
-                experience_block = app.state.experience_retriever.build_block(retrieved)
-                for item in retrieved:
-                    app.state.experience_store.increment_hit(item.id)
+            recalled = app.state.memory_service.recall(payload.input)
+            injected_exp_ids = recalled.get("ids", [])
+            if injected_exp_ids:
+                app.state.memory_service.record_hits(injected_exp_ids)
+            if (recalled.get("block") or "").strip():
+                experience_block = recalled["block"]
         except Exception:  # noqa: BLE001
-            logger.warning("经验检索失败", exc_info=True)
+            logger.warning("记忆检索注入失败", exc_info=True)
 
         async def event_source():
             sm = app.state.session_manager
@@ -1614,8 +1664,7 @@ def create_baize_api_app(
                     return
 
             try:
-                # 设置会话 ID，使沙箱审批能识别当前会话
-                agent.session_id = session_id
+                # 会话 ID 已在克隆副本上绑定（沙箱审批 / 记忆 / 审计日志均可识别当前会话）
                 # 流式对话（传入历史上下文 + 多模态 user 消息 + 附件工具 + 历史经验）
                 # 包一层 SSE 心跳：工具执行等静默期定期发送注释行保活，防止连接超时断开
                 async for kind, event in _with_sse_heartbeat(
@@ -1686,25 +1735,18 @@ def create_baize_api_app(
                             f"data: {json.dumps({'prompt_id': prompt_id, 'prompt_type': 'sandbox_approval', 'title': '工具执行审批', 'message': f'工具 `{event.tool_name}` 需要审批: {reason}', 'command': '', 'options': ['approve', 'deny'], 'is_password': False})}\n\n"
                         )
                     elif event.type == "done":
-                        # 正常完成：保存完整内容
+                        # 正常完成：保存完整内容；记忆已由 agent 在回合结束前自动学习
                         final_text = event.content or final_text
                         _flush_to_session()
-                        # 长期记忆：纯规则信号检测（不调 LLM），命中则提示前端可提炼经验
-                        try:
-                            prior_turns_text = " ".join(
-                                f"{m.get('role')}: {m.get('content', '')}"
-                                for m in history_messages
-                            )
-                            signals = detect_turn_signals(
-                                tool_events, final_text, prior_turns_text, payload.input
-                            )
-                            if signals["should_refine"]:
-                                yield (
-                                    "event: experience_signal\n"
-                                    f"data: {json.dumps({'type': 'experience_signal', 'reasons': signals['reasons'], 'session_id': session_id, 'agent': exp_agent_key})}\n\n"
-                                )
-                        except Exception:  # noqa: BLE001
-                            logger.warning("经验信号检测失败", exc_info=True)
+                        # 评价闭环：本回合有结论 → 被注入的经验记为「有用」（提升后续排序）
+                        if injected_exp_ids and (final_text or "").strip():
+                            for _eid in injected_exp_ids:
+                                try:
+                                    app.state.memory_service.record_feedback(
+                                        _eid, True, actor="agent",
+                                        note="注入后本回合产出结论")
+                                except Exception:  # noqa: BLE001
+                                    pass
                         yield f"data: {json.dumps({'type': 'done', 'content': event.content})}\n\n"
             except ModelNotConfiguredError as e:
                 yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
@@ -1833,216 +1875,209 @@ def create_baize_api_app(
             "max_dangerous_per_turn": sandbox.policy.max_dangerous_per_turn,
         }
 
-    # ------------------------------------------------------------------
-    # 长期记忆：经验库管理（CRUD + 提炼 + embedding 配置）
-    # ------------------------------------------------------------------
-    @app.get(
-        "/api/v1/experiences",
-        response_model=dict,
-        dependencies=[Depends(_require_api_key)],
-    )
-    def experiences_list(
-        scope: Optional[str] = None,
-        agent: Optional[str] = None,
-        include_disabled: bool = True,
-    ) -> dict:
-        items = app.state.experience_store.list_items(
-            scope=scope, agent_key=agent, include_disabled=include_disabled
-        )
-        return {"experiences": [i.to_dict() for i in items]}
+    # ==================================================================
+    # 长期记忆：memory 子系统 REST（取代历史上所有经验引擎端点）
+    # 全新实现 baize.memory：Episode / 经验 / 语义事实 / 时间知识图谱 /
+    # 证据链 / 演进操作（REVISE/SUPERSEDE/INVALIDATE/Consolidation）
+    # ==================================================================
+
+    def _memory() -> MemoryService:
+        """访问全局 memory 子系统（长期记忆门面）。"""
+        return app.state.memory_service
 
     @app.get(
-        "/api/v1/experiences/embedding-config",
+        "/api/v1/memory/stats",
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    def embedding_config_get() -> dict:
-        cfg = app.state.embedding_config_store.load()
-        data = {
-            "provider": cfg.provider,
-            "base_url": cfg.base_url,
-            "api_key": cfg.api_key or "",
-            "model": cfg.model,
-            "dimensions": cfg.dimensions,
-        }
-        return {"config": data}
+    def memory_stats() -> dict:
+        return _memory().stats()
 
-    @app.put(
-        "/api/v1/experiences/embedding-config",
+    # ---- 经验（Experience） -------------------------------------------------
+    @app.get(
+        "/api/v1/memory/experiences",
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    def embedding_config_put(payload: EmbeddingConfigRequest) -> dict:
-        cfg = EmbeddingConfig(
-            provider=payload.provider,
-            base_url=payload.base_url.strip(),
-            api_key=payload.api_key.strip(),
-            model=payload.model.strip(),
-            dimensions=payload.dimensions,
-        )
-        if cfg.provider not in ("none", "openai", "local"):
-            raise HTTPException(status_code=400, detail="provider 必须是 none/openai/local")
-        app.state.embedding_config_store.save(cfg)
-        # 重建 Provider 与检索器，下次检索立即生效
-        app.state.embedding = resolve_embedding(cfg)
-        app.state.experience_retriever = ExperienceRetriever(
-            app.state.experience_store, app.state.embedding
-        )
-        return {"ok": True, "config": {
-            "provider": cfg.provider,
-            "base_url": cfg.base_url,
-            "api_key": cfg.api_key or "",
-            "model": cfg.model,
-            "dimensions": cfg.dimensions,
-        }}
-
-    @app.post(
-        "/api/v1/experiences/reindex",
-        response_model=dict,
-        dependencies=[Depends(_require_api_key)],
-    )
-    async def experiences_reindex() -> dict:
-        """为缺失/过期向量的经验条目批量补齐 embedding（配置向量 Provider 后调用）。"""
-        embedding = app.state.embedding
-        if not embedding.is_available():
-            raise HTTPException(
-                status_code=400,
-                detail="未配置可用的向量 Provider，请先在设置中配置 embedding（openai/local）",
-            )
-        model = embedding.model_name
-        store = app.state.experience_store
-        missing = store.items_missing_embedding(model)
-        if not missing:
-            return {"ok": True, "indexed": 0, "total": 0}
-        texts = [f"{i.title}\n{i.content}\n{' '.join(i.tags)}" for i in missing]
-        try:
-            vectors = await embedding.embed(texts)
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(
-                status_code=400,
-                detail=f"向量生成失败：{type(exc).__name__}: {exc}",
-            ) from exc
-        for item, vec in zip(missing, vectors):
-            if vec:
-                store.set_embedding(item.id, vec, model)
-        return {"ok": True, "indexed": len(missing), "total": len(missing)}
+    def memory_experiences(status: Optional[str] = None,
+                           scope: Optional[str] = None,
+                           include_superseded: bool = False) -> dict:
+        rows = _memory().list_experiences(status=status, scope=scope,
+                                          include_superseded=include_superseded)
+        return {"total": len(rows), "experiences": rows}
 
     @app.get(
-        "/api/v1/experiences/{experience_id}",
+        "/api/v1/memory/experiences/{experience_id}",
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    def experiences_get(experience_id: str) -> dict:
-        item = app.state.experience_store.get_item(experience_id)
-        if item is None:
+    def memory_experience_get(experience_id: str) -> dict:
+        rec = _memory().get_experience(experience_id)
+        if rec is None:
             raise HTTPException(status_code=404, detail="经验不存在")
-        return {"experience": item.to_dict()}
+        return {"experience": rec}
 
     @app.post(
-        "/api/v1/experiences",
+        "/api/v1/memory/experiences",
         response_model=dict,
         status_code=201,
         dependencies=[Depends(_require_api_key)],
     )
-    async def experiences_create(payload: ExperienceRequest) -> dict:
-        item = app.state.experience_store.create(payload.model_dump())
-        # 配置了向量 Provider 时自动生成 embedding，避免依赖手动 reindex
-        embedding = app.state.embedding
-        if embedding.is_available():
-            try:
-                text = f"{item.title}\n{item.content}\n{' '.join(item.tags)}"
-                vecs = await embedding.embed([text])
-                if vecs and vecs[0]:
-                    app.state.experience_store.set_embedding(
-                        item.id, vecs[0], embedding.model_name
-                    )
-                    refreshed = app.state.experience_store.get_item(item.id)
-                    if refreshed is not None:
-                        item = refreshed
-            except Exception:  # noqa: BLE001
-                logger.warning("经验向量自动生成失败", exc_info=True)
-        return {"experience": item.to_dict()}
+    def memory_experience_create(payload: MemoryExperienceCreate) -> dict:
+        rec = _memory().create_experience(
+            title=payload.title, content=payload.content, tags=payload.tags,
+            kind=payload.kind, scope=payload.scope, agent_key=payload.agent_key,
+            source_session_id=payload.source_session_id,
+            importance=payload.importance,
+        )
+        return {"experience": rec, "action": "created"}
 
     @app.put(
-        "/api/v1/experiences/{experience_id}",
+        "/api/v1/memory/experiences/{experience_id}",
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    def experiences_update(experience_id: str, payload: ExperienceUpdateRequest) -> dict:
-        item = app.state.experience_store.update(
-            experience_id, payload.model_dump(exclude_none=True)
-        )
-        if item is None:
+    def memory_experience_update(experience_id: str,
+                                 payload: MemoryExperienceUpdate) -> dict:
+        fields = payload.model_dump(exclude_none=True, exclude={"note"})
+        rec = _memory().revise(experience_id, actor="user",
+                               note=payload.note or "", fields=fields)
+        if rec is None:
             raise HTTPException(status_code=404, detail="经验不存在")
-        return {"experience": item.to_dict()}
+        return {"experience": rec}
 
-    @app.delete(
-        "/api/v1/experiences/{experience_id}",
+    @app.put(
+        "/api/v1/memory/experiences/{experience_id}/status",
+        response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    def experiences_delete(experience_id: str) -> dict:
-        ok = app.state.experience_store.delete(experience_id)
-        if not ok:
+    def memory_experience_status(experience_id: str,
+                                 payload: MemoryStatusRequest) -> dict:
+        rec = _memory().set_status(experience_id, payload.status,
+                                   actor="user", note=payload.note)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="记录不存在")
+        return {"experience": rec}
+
+    @app.post(
+        "/api/v1/memory/experiences/{experience_id}/feedback",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def memory_experience_feedback(experience_id: str,
+                                   payload: MemoryFeedbackRequest) -> dict:
+        """对经验打分（评价闭环）：有用提升检索权重；连续无用自动降级为 draft。"""
+        rec = _memory().record_feedback(experience_id, payload.useful,
+                                        actor="user", note=payload.note)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="经验不存在")
+        return {"experience": rec}
+
+    @app.delete(
+        "/api/v1/memory/experiences/{experience_id}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def memory_experience_delete(experience_id: str) -> dict:
+        """记忆不可物理删除：软失效（INVALIDATE），保留谱系与审计。"""
+        rec = _memory().set_status(experience_id, "invalidated",
+                                   actor="user", note="user 软删除（INVALIDATE）")
+        if rec is None:
             raise HTTPException(status_code=404, detail="经验不存在")
         return {"ok": True}
 
     @app.post(
-        "/api/v1/sessions/{session_id}/experience/refine",
+        "/api/v1/memory/consolidate",
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    async def session_experience_refine(
-        session_id: str, payload: RefineRequest
-    ) -> dict:
-        """对整段会话（或最近几轮）做 LLM 复盘提炼，返回候选条目（不入库）。"""
-        session = app.state.session_manager.get_session(session_id)
-        if session is None:
-            raise HTTPException(status_code=404, detail="会话不存在")
-        messages = app.state.session_manager.get_messages(session_id)
-        agent_key = payload.agent or getattr(session, "agent", "") or "default"
+    async def memory_consolidate(payload: MemoryConsolidateRequest) -> dict:
+        """把一组同主题经验合并为一条更泛化的新经验（默认 draft，需确认生效）。"""
+        if len(payload.ids) < 2:
+            raise HTTPException(status_code=400, detail="合并至少需要 2 条经验")
+        try:
+            out = await _memory().consolidate(
+                payload.ids, actor="user", auto_commit=payload.auto_commit)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("经验合并失败: %s", exc)
+            raise HTTPException(status_code=400, detail=f"合并失败：{exc}")
+        if out is None:
+            raise HTTPException(status_code=400, detail="没有可合并的 active/draft 经验")
+        return {"result": out}
 
-        # 收集最近几轮：user / assistant 正文 + 工具调用/结果
-        user_msgs = [m for m in messages if m.get("role") == "user" and not m.get("type")]
-        if not user_msgs:
-            raise HTTPException(status_code=400, detail="会话没有可提炼的对话")
-        last_user = user_msgs[-1]
-        last_user_text = str(last_user.get("content", ""))
-        tool_events: list[dict] = []
-        final_text = ""
-        # 最近一轮的 assistant 结论与工具轨迹
-        for m in messages[-40:]:
-            extra = m.get("extra") or {}
-            if m.get("role") == "intermediate" and extra.get("type") == "function_call":
-                tool_events.append(
-                    {
-                        "type": "function_call",
-                        "name": extra.get("name", ""),
-                        "arguments": extra.get("arguments", ""),
-                    }
-                )
-            elif m.get("role") == "intermediate" and extra.get("type") == "function_call_output":
-                tool_events.append(
-                    {
-                        "type": "function_call_output",
-                        "name": extra.get("name", ""),
-                        "output": extra.get("output", ""),
-                    }
-                )
-            elif m.get("role") == "assistant" and m.get("content"):
-                final_text = str(m.get("content", ""))
+    # ---- Episode（任务轨迹） -------------------------------------------------
+    @app.get(
+        "/api/v1/memory/episodes",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def memory_episodes(limit: int = 100, session_id: str = "") -> dict:
+        svc = _memory()
+        rows = svc.list_episodes(limit=limit)
+        if session_id:
+            rows = [r for r in rows if r.get("session_id") == session_id]
+        # 列表省去完整 steps（大块工具输出），仅保留概览
+        slim = []
+        for r in rows:
+            item = dict(r)
+            item["steps"] = len(item.get("steps", []))
+            slim.append(item)
+        return {"total": len(slim), "episodes": slim}
 
-        client = LLMClient()
-        candidate = await refine_experience(
-            client,
-            agent_key=agent_key,
-            session_id=session_id,
-            user_message=last_user_text,
-            final_text=final_text,
-            tool_events=tool_events,
-            prior_history=messages,
-            scope=payload.scope,
-        )
-        return {"candidate": candidate, "session_id": session_id, "agent": agent_key}
+    @app.get(
+        "/api/v1/memory/episodes/{episode_id}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def memory_episode_get(episode_id: str) -> dict:
+        ep = _memory().get_episode(episode_id)
+        if ep is None:
+            raise HTTPException(status_code=404, detail="Episode 不存在")
+        return {"episode": ep}
+
+    # ---- 混合检索 -----------------------------------------------------------
+    @app.get(
+        "/api/v1/memory/search",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def memory_search(q: str = "", include_episodes: bool = False) -> dict:
+        if not q.strip():
+            return {"query": q, "experiences": [], "facts": [],
+                    "entities": [], "neighbors": {"entities": [], "relations": []},
+                    "episodes": []}
+        return _memory().search(q.strip(), include_episodes=include_episodes)
+
+    # ---- 语义事实 / 知识图谱 ------------------------------------------------
+    @app.get(
+        "/api/v1/memory/facts",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def memory_facts(status: str = "active") -> dict:
+        svc = _memory()
+        rows = svc.list_facts(status=status or None)
+        return {"total": len(rows), "facts": rows}
+
+    @app.get(
+        "/api/v1/memory/entities",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def memory_entities(limit: int = 100, kind: str = "") -> dict:
+        rows = _memory().list_entities(limit=max(1, min(limit, 2000)))
+        if kind:
+            rows = [e for e in rows if e.get("kind") == kind]
+        return {"total": len(rows), "entities": rows}
+
+    @app.get(
+        "/api/v1/memory/graph",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def memory_graph() -> dict:
+        """时间知识图谱 + 内容节点快照（供记忆可视化）。"""
+        return _memory().graph_snapshot()
 
     # ------------------------------------------------------------------
     # 模型列表（单模型模式：返回当前配置的模型）

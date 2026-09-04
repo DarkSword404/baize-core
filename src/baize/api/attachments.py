@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import re
 import secrets
 import shutil
@@ -54,16 +55,45 @@ DOCUMENT_EXTS = {".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"}
 ARCHIVE_EXTS = {".zip", ".tar", ".gz", ".tar.gz", ".tgz", ".bz2", ".tar.bz2", ".7z"}
 
 # 安全：上传文件类型白名单（其它一律拒绝）
-ALLOWED_EXTS = IMAGE_EXTS | CODE_EXTS | DOCUMENT_EXTS | ARCHIVE_EXTS | {".bin", ".elf", ".pcap", ".cap"}
+# 含常见内存/磁盘镜像扩展名（.raw/.img/.dmp/.mem/.vmem/.lime/.iso/.dd/.qcow2/.vmdk/.vhd/.001/.dump）
+# 这些按 "other" 类型存储，供内存取证/磁盘分析工具按路径调用。
+MEMORY_IMAGE_EXTS = {
+    ".raw", ".img", ".dmp", ".mem", ".vmem", ".lime", ".iso",
+    ".dd", ".qcow2", ".vmdk", ".vhd", ".001", ".dump",
+}
+ALLOWED_EXTS = (
+    IMAGE_EXTS | CODE_EXTS | DOCUMENT_EXTS | ARCHIVE_EXTS
+    | MEMORY_IMAGE_EXTS | {".bin", ".elf", ".pcap", ".cap"}
+)
 
-# 单文件大小上限（默认 20MB）
-DEFAULT_MAX_SIZE = 20 * 1024 * 1024
-# 压缩包解压后最大总大小（防 zip 炸弹）
-MAX_EXTRACT_TOTAL = 100 * 1024 * 1024
-# 压缩包内最大文件数
-MAX_EXTRACT_FILES = 200
+# 单文件上传上限 / 压缩包解压预算（均可通过环境变量覆盖，单位 MB）：
+#   BAIZE_MAX_UPLOAD_MB         单文件上传大小上限（默认 256MB）
+#   BAIZE_MAX_EXTRACT_TOTAL_MB  解压后总大小上限，防 zip 炸弹（默认 1024MB）
+#   BAIZE_MAX_EXTRACT_FILES     压缩包内最大文件数（默认 1000）
+_DEFAULT_MAX_UPLOAD_MB = 500
+_DEFAULT_MAX_EXTRACT_TOTAL_MB = 1024
+_DEFAULT_MAX_EXTRACT_FILES = 1000
 # 单文件文本读取上限（避免撑爆上下文，单位字节）
 MAX_TEXT_READ = 512 * 1024
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def max_upload_bytes() -> int:
+    return _env_int("BAIZE_MAX_UPLOAD_MB", _DEFAULT_MAX_UPLOAD_MB) * 1024 * 1024
+
+
+def max_extract_total_bytes() -> int:
+    return _env_int("BAIZE_MAX_EXTRACT_TOTAL_MB", _DEFAULT_MAX_EXTRACT_TOTAL_MB) * 1024 * 1024
+
+
+def max_extract_files() -> int:
+    return _env_int("BAIZE_MAX_EXTRACT_FILES", _DEFAULT_MAX_EXTRACT_FILES)
 
 
 def detect_file_type(filename: str) -> str:
@@ -155,8 +185,9 @@ class AttachmentStore:
         data: bytes,
     ) -> Attachment:
         """保存上传的附件并登记到会话索引。"""
-        if len(data) > DEFAULT_MAX_SIZE:
-            raise ValueError(f"附件超过大小限制（{DEFAULT_MAX_SIZE // 1024 // 1024}MB）")
+        if len(data) > max_upload_bytes():
+            raise ValueError(f"附件超过大小限制（{max_upload_bytes() // 1024 // 1024}MB，"
+                             f"可通过环境变量 BAIZE_MAX_UPLOAD_MB 调大）")
         if not is_allowed(filename):
             raise ValueError(f"不支持的文件类型: {filename}")
 
@@ -314,11 +345,11 @@ class AttachmentStore:
                         if info.is_dir():
                             continue
                         count += 1
-                        if count > MAX_EXTRACT_FILES:
+                        if count > max_extract_files():
                             break
                         # 防护：解压总大小限制
                         total_size += info.file_size
-                        if total_size > MAX_EXTRACT_TOTAL:
+                        if total_size > max_extract_total_bytes():
                             return {"ok": False, "error": "压缩包过大，已中止", "entries": entries}
                         safe_path = _safe_join(extract_dir, info.filename)
                         if safe_path is None:
@@ -336,10 +367,10 @@ class AttachmentStore:
                         if not member.isfile():
                             continue
                         count += 1
-                        if count > MAX_EXTRACT_FILES:
+                        if count > max_extract_files():
                             break
                         total_size += member.size
-                        if total_size > MAX_EXTRACT_TOTAL:
+                        if total_size > max_extract_total_bytes():
                             return {"ok": False, "error": "压缩包过大，已中止", "entries": entries}
                         safe_path = _safe_join(extract_dir, member.name)
                         if safe_path is None:

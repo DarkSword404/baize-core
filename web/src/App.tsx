@@ -4,7 +4,6 @@ import { ThemeProvider } from './context/ThemeContext';
 import { AuthGuard } from './components/AuthGuard';
 import { Layout } from './components/Layout';
 import { Dashboard } from './pages/Dashboard';
-import { Chat } from './pages/Chat';
 import { Agents } from './pages/Agents';
 import { Tools } from './pages/Tools';
 import PipelineEditor from './pages/PipelineEditor';
@@ -33,7 +32,8 @@ export default function App(): JSX.Element {
               <Route path="/" element={<Layout />}>
                 <Route index element={<Navigate to="/dashboard" replace />} />
                 <Route path="dashboard" element={<Dashboard />} />
-                <Route path="chat" element={<Chat />} />
+                {/* Chat 由 Layout 常驻渲染（切页不卸载，保持流式状态），此处仅保留路由可达性 */}
+                <Route path="chat" element={null} />
                 <Route path="agents" element={<Agents />} />
                 <Route path="tools" element={<Tools />} />
                 <Route path="orchestration" element={<OrchestrationRoute />} />

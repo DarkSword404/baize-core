@@ -15,6 +15,7 @@ import json
 import asyncio
 import inspect
 import logging
+import os
 
 import httpx
 import openai
@@ -68,7 +69,25 @@ _LLM_RETRY_BACKOFF_BASE = 1.0  # 指数退避基础秒数（1s -> 2s -> 4s -> 8s
 # 即中止等待并返回超时错误文本给模型，防止工具挂起（网络卡住/subprocess
 # 阻塞等）拖死整轮对话。超时后同步 handler 的底层线程仍会在后台跑完，
 # 但对话流程可继续，不阻塞后续轮次。
-_TOOL_EXEC_TIMEOUT = 300.0     # 单位：秒
+#
+# 注意这是一刀切的兜底上限：部分工具自身声明了更长的超时（如 hashcat_crack /
+# john 的 600s），上限偏小会把它提前截断，表现为"这些工具永远超时失败"。
+# 跑长任务（全端口扫描、口令破解）时调大该值，设为 <=0 表示不限制。
+DEFAULT_TOOL_EXEC_TIMEOUT = 300.0  # 单位：秒
+
+
+def _resolve_tool_exec_timeout() -> float:
+    """解析工具执行超时上限（秒）。
+
+    可用环境变量 ``BAIZE_TOOL_EXEC_TIMEOUT`` 覆盖；``<=0`` 表示不限制。
+    每次调用都重新读取，便于运行期调整而不用重启服务。
+    """
+    raw = os.environ.get("BAIZE_TOOL_EXEC_TIMEOUT", "")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_TOOL_EXEC_TIMEOUT
+    return value if value > 0 else 0.0
 
 
 def _missing_required_params(handler: Callable[..., Any], args: dict[str, Any]) -> list[str]:
@@ -85,6 +104,17 @@ def _missing_required_params(handler: Callable[..., Any], args: dict[str, Any]) 
             if param.default is inspect.Parameter.empty:
                 missing.append(name)
     return missing
+
+
+def _handler_accepts_param(handler: Callable[..., Any], name: str) -> bool:
+    """handler 是否显式声明了指定参数名（或通过 **kwargs 接受任意参数）。"""
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):  # 内建/不可内省对象
+        return False
+    if name in sig.parameters:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
 
 
 def _tool_missing_hint(name: str, exc: Exception) -> str:
@@ -204,21 +234,37 @@ class AgentTool:
         # 注意：不能对异步 handler 使用 asyncio.to_thread——它只会在线程池中创建
         # 协程对象（函数体不执行），随后仍在事件循环中运行，防阻塞机制形同虚设。
         handler = self.handler
+        timeout = _resolve_tool_exec_timeout()
+        # <=0 表示不限制，asyncio.wait_for 需传 None
+        limit: Optional[float] = timeout if timeout > 0 else None
+        # 尊重工具声明的单次执行时长：部分工具（hashcat/john/aircrack 等）
+        # 在参数里声明了更长 timeout（如 600s）。若运维未显式配置全局上限
+        # （即 BAIZE_TOOL_EXEC_TIMEOUT 未设置、仍为默认值），则跟随工具声明，
+        # 避免被默认 300s 一刀切提前截断，表现为"长任务工具永远超时失败"。
+        # 运维一旦显式设置该 env，则以全局为准（硬顶）。
+        if limit is not None and "BAIZE_TOOL_EXEC_TIMEOUT" not in os.environ:
+            raw_timeout = args.get("timeout") if isinstance(args, dict) else None
+            if (
+                isinstance(raw_timeout, (int, float))
+                and raw_timeout > 0
+                and _handler_accepts_param(handler, "timeout")
+            ):
+                limit = max(limit, float(raw_timeout))
         try:
             if inspect.iscoroutinefunction(handler):
                 # 异步 handler：直接在事件循环中 await（其内部应为纯异步实现，
                 # 如 async LLM 调用，不会阻塞事件循环）。
-                result = await asyncio.wait_for(handler(**args), timeout=_TOOL_EXEC_TIMEOUT)
+                result = await asyncio.wait_for(handler(**args), timeout=limit)
             else:
                 # 同步 handler（如内部使用 subprocess.run 的 shell/代码执行工具）
                 # 放到线程池执行：避免阻塞事件循环。wait_for 超时后协程被取消，
                 # 底层线程仍会在后台跑完，但对话流程可继续，不阻塞后续轮次。
                 result = await asyncio.wait_for(
-                    asyncio.to_thread(handler, **args), timeout=_TOOL_EXEC_TIMEOUT
+                    asyncio.to_thread(handler, **args), timeout=limit
                 )
         except asyncio.TimeoutError:
             return (
-                f"工具 `{self.name}` 执行超时（超过 {int(_TOOL_EXEC_TIMEOUT)}s），"
+                f"工具 `{self.name}` 执行超时（超过 {int(limit or 0)}s），"
                 f"结果未获取。请告知用户执行超时或改用其他方法。"
             )
         return str(result)
@@ -247,7 +293,56 @@ class AgentEvent:
     sandbox_session_id: Optional[str] = None  # 沙箱审批会话 ID
 
 
-# ── 工具输出图片自动注入 ──
+# ── Skill 按工具名按需注入 (P6') ──
+
+def _inject_skills_for_turn(history: list[ChatMessage], tool_count: int) -> None:
+    """本轮工具执行后，把命中的技能文本按需注入 history。
+
+    遍历本轮新增的 tool 消息的工具名，用 ``baize.skills`` 注册表解析对应
+    技能文件（如 ``shared_browser_*`` 工具族首次使用时注入协作浏览器手册）。
+    技能内容平时不常驻 system prompt，首次用到对应工具时才加入，省 token。
+
+    已注入过的技能（history 中已有该技能标题行）跳过，避免重复灌入。
+    """
+    if tool_count <= 0:
+        return
+    # 收集本轮调用的工具名（按 tool 消息从后向前取 tool_count 条）
+    names: list[str] = []
+    for m in reversed(history):
+        if len(names) >= tool_count:
+            break
+        if m.role == "tool" and m.name:
+            names.append(m.name)
+    if not names:
+        return
+    existing_content = "".join(m.content or "" for m in history)
+    for name in reversed(names):
+        try:
+            from baize.skills import resolve_skill_text
+
+            text = resolve_skill_text(name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("技能解析失败 (%s): %s", name, exc)
+            continue
+        if not text:
+            continue
+        first_line = text.splitlines()[0] if text.splitlines() else ""
+        if first_line and first_line in existing_content:
+            continue  # 该技能已在上下文中，跳过
+        # role=user + "[系统提示]" 前缀：与工具图片注入一致的注入模式，
+        # 避免在 tool 消息后插入 system 消息被严格实现拒绝。
+        history.append(
+            ChatMessage(
+                role="user",
+                content=(
+                    "[系统提示] 以下为按需注入的技能手册（非用户消息），"
+                    "仅供你后续操作参考：\n\n"
+                    f"[技能手册 · {name} 工具族]\n{text}"
+                ),
+            )
+        )
+        existing_content += first_line
+
 
 def _inject_tool_images(
     history: list[ChatMessage],
@@ -456,14 +551,43 @@ class Agent:
         db = _svc_get("db_recorder")
         if db is not None:
             try:
-                if kind == "session/start":
-                    db.start_session(self.session_log.session_id, self.name)
+                sid = self.session_log.session_id
+                if kind in ("session/start", "user/message"):
+                    # 幂等激活：首轮创建，后续轮（同会话复用日志时
+                    # 只有 user/message 而无 session/start）重新置为 active
+                    db.start_session(sid, self.name)
                 elif kind == "session/end":
-                    db.end_session(self.session_log.session_id, payload.get("reason", "done"))
-                db.record_event(self.session_log.session_id, event)
-                if kind == "tool/result" and "name" in payload:
-                    duration = payload.get("duration", 0)
-                    db.record_tool_call(self.session_log.session_id, payload["name"], duration)
+                    # reason 语义规范化：done -> completed，其余(如 error) -> interrupted
+                    reason = payload.get("reason", "done")
+                    status = "completed" if reason == "done" else "interrupted"
+                    db.end_session(sid, status)
+                db.record_event(sid, event)
+                # 工具执行统计：错误先以 tool/error 标记，随后的 tool/result
+                # 统一计数一次；被拦截 / 未注册的调用不构成真实执行，不计。
+                # 集合为运行时属性（Agent 可被 dataclasses.replace 克隆），惰性初始化。
+                pending = getattr(self, "_pending_tool_errors", None)
+                if pending is None:
+                    pending = set()
+                    self._pending_tool_errors = pending
+                if kind == "tool/error" and payload.get("name"):
+                    pending.add(payload["name"])
+                elif kind == "tool/result" and payload.get("name"):
+                    name = payload["name"]
+                    if (
+                        not payload.get("denied")
+                        and payload.get("reason") != "工具未注册"
+                    ):
+                        is_error = name in pending
+                        pending.discard(name)
+                        db.record_tool_call(
+                            sid,
+                            name,
+                            payload.get("duration", 0) or 0.0,
+                            error=is_error,
+                        )
+                    else:
+                        # 被拒 / 未注册：不计数，但清掉可能的错误标记
+                        self._pending_tool_errors.discard(name)
             except Exception as exc:  # noqa: BLE001
                 logger.debug("DbRecorder 写入失败: %s", exc)
 
@@ -471,6 +595,19 @@ class Agent:
         """确保会话日志已记录 session/start（首条事件，可重复调用）。"""
         if self.session_log is not None and len(self.session_log) == 0:
             self._log_event("session/start", session_id=self.session_log.session_id)
+
+    def _reset_sandbox_turn(self) -> None:
+        """重置沙箱的本轮危险工具计数（每次用户提问开始时调用）。
+
+        使 ``max_dangerous_per_turn`` 按"轮"生效，而非按整个会话累计。
+        """
+        sandbox = _svc_get("sandbox")
+        session_id = self.session_log.session_id if self.session_log else self.session_id
+        if sandbox is not None and session_id:
+            try:
+                sandbox.reset_turn(str(session_id))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("沙箱单轮计数重置失败: %s", exc)
 
     def _memory_block(self) -> Optional[str]:
         """加载记忆文本块（空串/无记忆返回 None）。"""
@@ -1055,6 +1192,11 @@ class Agent:
                             name=name,
                         )
                     )
+                # P6': 技能按工具名按需注入（本轮调用过某工具族则加载其手册）
+                try:
+                    _inject_skills_for_turn(history, len(result.tool_calls))
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("技能注入失败: %s", exc)
                 self._log_event("turn/end", index=turn_index)
                 # 单条超长消息（如超大工具输出）无条件截断，防止超出模型输入长度上限；
                 # 昂贵的语义摘要 / 整轮删除仍由下方防抖逻辑控制。
@@ -1082,28 +1224,78 @@ class Agent:
         return "", total
 
     async def _try_auto_refine(self, client, user_message: str, final_text: str) -> None:
-        """经验自动提炼：回合结束后检测信号，高置信度自动入库。"""
-        store = _svc_get("experience_store")
-        if store is None:
+        """记忆自动学习：每回合结束，把本轮轨迹固化为 Episode 并提炼经验。
+
+        依赖全局注册的 memory_service（全新记忆子系统 baize.memory）：
+        - 工具调用 / 观察 / 结论按时间序固化为 Episode（原始证据，只增不改）；
+        - 信号判定后提炼为自然语言经验（高置信度自动 active，否则 draft）。
+        """
+        svc = _svc_get("memory_service")
+        if svc is None:
             return
+        session_id = (self.session_log.session_id if self.session_log
+                      else self.session_id or "")
+        events = self._normalize_log_events(self._collect_tool_events())
+        task = (user_message or "").strip()[:400]
         try:
-            from baize.experiences.refine import auto_refine_if_worthy, _AUTO_SAVE_CONFIDENCE
-            tool_events = self._collect_tool_events()
-            result = await auto_refine_if_worthy(
-                client=client,
+            await svc.learn_events(
+                events=events,
+                task=task,
                 agent_key=self.name,
-                session_id=self.session_log.session_id if self.session_log else self.session_id or "",
+                session_id=session_id,
+                result_text=final_text or "",
+                error_text="",
+                status="failed" if not (final_text or "").strip() else "success",
                 user_message=user_message,
-                final_text=final_text,
-                tool_events=tool_events,
-                store=store,
+                client=client,
             )
-            if result.get("auto_saved"):
-                logger.info("经验自动入库: %s", result.get("candidate", {}).get("title", ""))
-            elif result.get("confidence", 0) > 0:
-                logger.info("经验提炼完成但未入库: 置信度 %.2f (阈值 %.2f)", result.get("confidence", 0), _AUTO_SAVE_CONFIDENCE)
+            logger.info(
+                "记忆已学习: session=%s task=%s events=%d",
+                session_id or "-", task[:60] or "(空)", len(events),
+            )
         except Exception as exc:  # noqa: BLE001
-            logger.warning("经验自动提炼异常: %s", exc)
+            logger.warning("记忆学习异常: %s", exc)
+
+    def _normalize_log_events(self, events: list[dict]) -> list[dict]:
+        """把 SessionLog 的 tool/call + tool/result 事件配对成 Episode 工具调用。"""
+        merged: dict[str, dict] = {}
+        order: list[str] = []
+        for ev in events:
+            kind = ev.get("kind")
+            if kind == "tool/call":
+                key = str(ev.get("call_id") or f"call:{len(order)}")
+                merged[key] = {
+                    "type": "tool_call",
+                    "name": ev.get("name", ""),
+                    "arguments": ev.get("arguments", ""),
+                    "output": "",
+                    "status": "",
+                    "ts": ev.get("ts", ev.get("timestamp", "")),
+                }
+                order.append(key)
+            elif kind == "tool/result":
+                key = ev.get("call_id")
+                if key is not None and str(key) in merged:
+                    key = str(key)
+                else:
+                    key = None
+                    for cand in reversed(order):
+                        rec = merged.get(cand, {})
+                        if rec.get("name") == ev.get("name", "") and not rec.get("output"):
+                            key = cand
+                            break
+                    if key is None:
+                        key = f"call:{len(order)}"
+                        merged[key] = {"type": "tool_call",
+                                       "name": ev.get("name", ""),
+                                       "arguments": "", "output": "",
+                                       "status": "", "ts": ""}
+                        order.append(key)
+                merged[key]["output"] = ev.get("output", "")
+                merged[key]["status"] = ("error" if ev.get("error")
+                                         else ("denied" if ev.get("denied")
+                                               else "ok"))
+        return [merged[k] for k in order]
 
     def _collect_tool_events(self) -> list[dict]:
         """从会话日志中收集本轮工具调用事件。"""
@@ -1114,6 +1306,53 @@ class Agent:
             if ev.kind in ("tool/call", "tool/result"):
                 events.append({"kind": ev.kind, **ev.payload})
         return events
+
+    async def _compress_recent_tool_outputs(
+        self,
+        history: list[ChatMessage],
+        tool_count: int,
+    ) -> None:
+        """对本轮新增的工具输出做语义压缩（只压缩送入 LLM 的历史）。
+
+        反向扫描最近 ``tool_count`` 条 tool 消息并逐条压缩。前端 SSE 事件、
+        会话日志与图片注入都已在压缩前拿到原始输出，因此本压缩只减少
+        后续每轮重复发送给模型的 token，不影响用户可见内容。
+
+        压缩失败或压缩无收益时保留原始输出，不阻塞对话。
+        """
+        comp = self.tool_output_compressor
+        if comp is None or tool_count <= 0:
+            return
+        remaining = tool_count
+        total_before = 0
+        total_after = 0
+        for m in reversed(history):
+            if remaining <= 0:
+                break
+            if m.role != "tool":
+                continue
+            remaining -= 1
+            text = m.content or ""
+            if not text:
+                continue
+            name = m.name or ""
+            if not comp.should_compress(name, text):
+                continue
+            try:
+                new_text = await comp.compress(name, text)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("工具输出压缩异常 (%s): %s，保留原始输出", name, exc)
+                continue
+            if new_text and new_text != text:
+                total_before += len(text)
+                total_after += len(new_text)
+                m.content = new_text
+        if total_before:
+            logger.info(
+                "工具输出压缩: %d→%d 字符 (%.0f%%)",
+                total_before, total_after,
+                total_after / max(total_before, 1) * 100,
+            )
 
     async def run(
         self,
@@ -1128,6 +1367,8 @@ class Agent:
         """
         ctx = self._merged_context(context_variables)
         await self._emit("on_start", self, user_message, ctx)
+        # 新一轮开始：重置沙箱的单轮危险工具配额
+        self._reset_sandbox_turn()
         self._ensure_session_started()
         self._log_event("user/message", content=user_message)
         try:
@@ -1180,6 +1421,8 @@ class Agent:
         """
         ctx = self._merged_context(context_variables)
         await self._emit("on_start", self, user_message, ctx)
+        # 新一轮开始：重置沙箱的单轮危险工具配额
+        self._reset_sandbox_turn()
         self._ensure_session_started()
         self._log_event("user/message", content=user_message)
         try:
@@ -1371,6 +1614,11 @@ class Agent:
                         history.append(
                             ChatMessage(role="tool", content=output, tool_call_id=tc_id, name=name)
                         )
+                    # P6': 技能按工具名按需注入（本轮调用过某工具族则加载其手册）
+                    try:
+                        _inject_skills_for_turn(history, len(tool_calls))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("技能注入失败: %s", exc)
                     self._log_event("turn/end", index=turn_index)
                     # ── 工具输出图片自动注入 ──
                     # 扫描本轮所有工具输出，若发现图片文件路径，自动注入
@@ -1381,6 +1629,10 @@ class Agent:
                             "工具图片已注入: turn=%d, tool_count=%d",
                             turn_index, len(tool_calls),
                         )
+                    # ── TokenJuice 语义压缩 ──
+                    # 放在图片注入之后：注入需要原始输出中的图片路径，先压缩会把它压掉。
+                    # 前端 SSE 事件与会话日志早已拿到原始输出，这里只压缩送入 LLM 的副本。
+                    await self._compress_recent_tool_outputs(history, len(tool_calls))
                     # 单条超长消息（如超大工具输出）无条件截断，防止超出模型输入长度上限；
                     # 昂贵的语义摘要 / 整轮删除仍由下方防抖逻辑控制。
                     self._truncate_long_messages(history, max_message_chars)

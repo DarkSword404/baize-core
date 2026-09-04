@@ -36,7 +36,6 @@ MODEL_CONFIG_PATHS = [
     Path(os.environ.get("BAIZE_DATA_DIR", "")).expanduser() / "model.json",
     Path.home() / ".baize" / "model.json",
 ]
-EMBEDDING_CONFIG_PATH = Path.home() / ".baize" / "embedding.json"
 
 C_RESET = "\033[0m"; C_GREEN = "\033[0;32m"; C_YELLOW = "\033[1;33m"; C_RED = "\033[0;31m"; C_CYAN = "\033[0;36m"
 
@@ -125,22 +124,6 @@ def check_model_config() -> None:
         print(_warn("配置项: base_url / api_key / model（OpenAI 协议兼容端点）"))
 
 
-def check_embedding() -> None:
-    """检查向量化（经验检索）配置。"""
-    _print_heading("经验向量化配置")
-    if EMBEDDING_CONFIG_PATH.is_file():
-        try:
-            cfg = json.loads(EMBEDDING_CONFIG_PATH.read_text())
-            print(_ok(f"embedding 配置已存在: {EMBEDDING_CONFIG_PATH}"))
-            print(f"     provider: {cfg.get('provider')}  model: {cfg.get('model')}")
-            print(_ok("经验入库/检索将自动使用语义向量"))
-        except Exception as exc:  # noqa: BLE001
-            print(_fail(f"embedding 配置解析失败: {exc}"))
-    else:
-        print(_warn("未配置 embedding provider — 经验检索退化为纯关键词匹配"))
-        print(_warn("在 Web「经验库」页面配置向量 Provider（如 DashScope / OpenAI embedding）即可启用语义检索"))
-
-
 def check_browser() -> None:
     """检查 playwright 浏览器二进制。"""
     _print_heading("浏览器依赖")
@@ -170,7 +153,6 @@ def cmd_doctor(argv: list[str]) -> int:
     missing = check_system_tools()
     check_runtime_env()
     check_model_config()
-    check_embedding()
     check_browser()
     print()
     if missing:
@@ -200,7 +182,7 @@ def cmd_serve(argv: list[str]) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Baize 命令行入口。"""
     parser = argparse.ArgumentParser(prog="baize", description="白泽·智脑 (Baize) 命令行")
-    parser.add_argument("--version", action="version", version="baize 1.7.2")
+    parser.add_argument("--version", action="version", version="baize 1.8.0")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("serve", help="启动 Web API 服务（默认）")
     sub.add_parser("doctor", help="环境自检：系统工具/模型/向量/浏览器依赖")

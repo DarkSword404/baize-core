@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
 import { listSessions, deleteSession, getSession } from '../api/client';
 import type { SessionDetail } from '../types';
 import type { JSX } from 'react';
 
 export function Sessions(): JSX.Element {
-  const { sessions, setSessions, setActiveSessionId, setCurrentView, removeSession, addToast } = useApp();
+  const { sessions, setSessions, setActiveSessionId, removeSession, addToast } = useApp();
+  const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [search, setSearch] = useState('');
   const [selectedSession, setSelectedSession] = useState<SessionDetail | null>(null);
@@ -26,7 +28,7 @@ export function Sessions(): JSX.Element {
   }
 
   async function handleDelete(id: string) {
-    if (!window.confirm('确定删除该会话？\n将同时删除该会话的附件、解压文件与附件索引。\n（若本次对话产生的经验已沉淀到经验库则不受影响）')) {
+    if (!window.confirm('确定删除该会话？\n将同时删除该会话的附件、解压文件与附件索引。\n（本次对话已沉淀的记忆不受影响，可在「记忆库」查看）')) {
       return;
     }
     try {
@@ -53,7 +55,7 @@ export function Sessions(): JSX.Element {
 
   async function handleContinue(id: string) {
     setActiveSessionId(id);
-    setCurrentView('chat');
+    navigate('/chat');
   }
 
   const filtered = sessions.filter(s =>

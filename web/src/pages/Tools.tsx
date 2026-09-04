@@ -25,6 +25,16 @@ const CATEGORY_CN: Record<string, string> = {
   custom: '自定义',
 };
 
+/** 列表/详情共用的工具卡片视图：内置工具无 record，自定义工具附带原始记录 */
+type ToolCardItem = {
+  name: string;
+  description: string;
+  category: string;
+  is_custom: boolean;
+  enabled: boolean;
+  record?: CustomTool;
+};
+
 export function Tools(): JSX.Element {
   const { addToast } = useApp();
   const [loading, setLoading] = useState(false);
@@ -34,7 +44,7 @@ export function Tools(): JSX.Element {
   const [customTools, setCustomTools] = useState<CustomTool[]>([]);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState(12);
-  const [selected, setSelected] = useState<CustomTool | ToolInfo | null>(null);
+  const [selected, setSelected] = useState<ToolCardItem | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
 
   // 创建工具 (Tool Builder)
@@ -67,7 +77,7 @@ export function Tools(): JSX.Element {
   useEffect(() => { setPage(1); }, [search, category]);
 
   // 合并：内置工具 + 自定义工具（自定义覆盖内置同名）
-  const allTools: Array<{ name: string; description: string; category: string; is_custom: boolean; enabled: boolean; record?: CustomTool }> = [];
+  const allTools: ToolCardItem[] = [];
   const seen = new Set<string>();
   for (const c of customTools) {
     allTools.push({

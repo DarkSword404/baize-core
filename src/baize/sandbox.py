@@ -40,13 +40,15 @@ SAFE_TOOLS: set[str] = {
 }
 
 # 危险区工具：需要审批才能执行
+# 注意：与 CONFIRM_TOOLS 保持互斥。shared_browser_open 需人工确认
+# （打开外部链接防钓鱼），已归入 CONFIRM_TOOLS，不再在此重复列出，
+# 否则 classify() 优先级会导致其越过"危险工具"分类统计。
 DANGEROUS_TOOLS: set[str] = {
     "generic_linux_command",
     "execute_code",
     "http_request",
     "web_request_framework",
     "port_scan",
-    "shared_browser_open",
     "shared_browser_click",
     "shared_browser_fill",
     "shared_browser_close",
@@ -117,6 +119,8 @@ class Sandbox:
         self._denials: dict[str, set[str]] = {}           # session_id -> {tool_name}
         # 一次性审批令牌
         self._tokens: dict[str, set[str]] = {}            # session_id -> {tool_name}
+        # 单轮危险工具调用计数（每轮用户提问开始时由 Agent 重置）
+        self._danger_counts: dict[str, int] = {}          # session_id -> 本轮危险调用数
         # 异步审批等待：agent 暂停等待用户审批
         self._pending_approvals: dict[str, dict[str, asyncio.Future]] = {}  # session_id -> {tool_name: Future[bool]}
 
@@ -164,6 +168,17 @@ class Sandbox:
 
         with self._lock:
             self._load_session_state(session_id)
+
+            # 0. 单轮危险工具配额（只统计危险工具；<=0 表示不限制）
+            limit = self.policy.max_dangerous_per_turn
+            if limit > 0 and self.classify(tool_name) == "dangerous":
+                used = self._danger_counts.get(session_id, 0)
+                if used >= limit:
+                    return {
+                        "allowed": False,
+                        "level": PermissionLevel.DENY,
+                        "reason": f"本轮危险工具调用已达上限（{limit} 次）",
+                    }
 
             # 1. 检查硬拒绝
             if tool_name in self._denials.get(session_id, set()):
@@ -237,7 +252,19 @@ class Sandbox:
             if success:
                 self._approvals.setdefault(session_id, {})
                 self._approvals[session_id][tool_name] = self._approvals[session_id].get(tool_name, 0) + 1
+                # 危险工具计入本轮配额（供 max_dangerous_per_turn 生效）
+                if self.classify(tool_name) == "dangerous":
+                    self._danger_counts[session_id] = self._danger_counts.get(session_id, 0) + 1
             self._save_session_state(session_id)
+
+    def reset_turn(self, session_id: str) -> None:
+        """重置本轮危险工具计数。
+
+        每次用户提问（即一轮对话）开始时由 Agent 调用，使
+        ``max_dangerous_per_turn`` 按"轮"生效，而不是按整个会话累计。
+        """
+        with self._lock:
+            self._danger_counts[session_id] = 0
 
     def reset_session(self, session_id: str) -> None:
         """重置会话的审批状态。"""
