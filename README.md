@@ -8,7 +8,7 @@
 
 > 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
 
-[![Version](https://img.shields.io/badge/version-v2.0.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v2.0.1-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
@@ -67,7 +67,7 @@
 ### 安装
 
 ```bash
-cd baize-core-v2.0.0
+cd baize-core-v2.0.1
 ./setup.sh    # 创建虚拟环境 + 安装 baize-core + 构建前端
 ./setup.sh --with-tools   # 推荐：安装时一并预装全部工具依赖（见下节）
 ```
@@ -503,7 +503,17 @@ baize-core/
 
 ## 📝 更新日志
 
-### v2.0.0（当前）
+### v2.0.1（当前）
+
+- 🧩 **命名空间子包合并（扩展模块可发现性修复）**：顶层 `src/baize/__init__.py` 引入
+  `pkgutil.extend_path(__path__, __name__)`——`baize` 在作为普通包的同时开放为可扩展命名空间，
+  baize-orchestration（`baize.orchestration`）与 core 分属不同源码树 / `pip install -e` 安装位置时，
+  不再因顶层目录先命中 `__init__.py` 而不可发现，无需手工 `ln -s` 合并
+- 📦 **编排依赖补齐**：baize-orchestration v1.6.1 显式声明 `jinja2>=3.0`（模板渲染 / 条件求值），
+  从零环境直接安装不再缺依赖
+- 🚀 **升级**：版本号统一为 2.0.1（后端 / 前端 / 脚本 / 文档）
+
+### v2.0.0
 
 - 📨 **告警持久化收件箱（Alert Inbox）**：Webhook / Syslog / 文件监听等入站数据不再只进内存队列，
   先落 SQLite 持久化收件箱（`src/baize/receivers/inbox.py`）——按接收器指纹幂等（重复投递返回既有 seq）、
@@ -690,6 +700,6 @@ baize-core/
 
 **白泽·智脑 (Baize)** · 仅供安全研究与授权测试使用
 
-[![Version](https://img.shields.io/badge/version-v2.0.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v2.0.1-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
 
 </div>
