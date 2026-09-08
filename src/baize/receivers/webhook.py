@@ -23,6 +23,10 @@ _SAFE_HEADERS = {
     "x-baize-webhook-key",
 }
 
+# 显式事件 ID：若出现在 query 参数中，提升到 metadata 顶层，
+# 供收件箱按"告警自带 ID"计算幂等指纹并展示（见 inbox.compute_fingerprint）。
+_EVENT_ID_QUERY_KEYS = ("alert_id", "event_id")
+
 
 def _validate_webhook_key(request: Request) -> None:
     """若配置了 BAIZE_WEBHOOK_API_KEY，则要求请求携带匹配密钥。
@@ -78,6 +82,11 @@ async def handle_webhook(request: Request, path: str) -> Response:
         "query_params": dict(request.query_params),
         "path": path,
     }
+    # 显式事件 ID 提升到顶层（alert_id/event_id），供指纹幂等与列表展示使用
+    for key in _EVENT_ID_QUERY_KEYS:
+        value = metadata["query_params"].get(key)
+        if value:
+            metadata.setdefault(key, value)
 
     accepted = manager.accept_webhook(
         receiver_id=receiver_id,

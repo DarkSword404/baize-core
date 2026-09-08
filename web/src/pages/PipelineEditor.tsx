@@ -1,11 +1,21 @@
 /**
  * 流水线管理页面
- * 统一展示内置模板 + 用户自定义流水线，支持编辑/激活/删除/执行。
+ * 正式两级模型：模板（图编排定义，内置 + 自定义）→ 流水线实例（可启用/停用、
+ * 绑定接收器、设置并行上限）。实例在调度器内并行消费接收器入站数据，
+ * 每次入站 = 一次独立 run/对话；对话保存在该 run 内，不进入渗透对话/会话管理。
+ * 数据接收器从设置页迁移至此页管理。
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import * as api from '../api/client';
 import type { AgentMetadata } from '../types';
+import type {
+  PipelineInstance,
+  InstanceStatus,
+  ReceiverConfig,
+  RunDetail,
+  RunBrief,
+} from '../api/client';
 
 type PipelineSource = 'builtin' | 'custom';
 
@@ -16,11 +26,27 @@ interface PipelineNode {
   description?: string;
   agent?: string;
   prompt_template?: string;
-  branches?: Array<{ when?: string; goto: string; label?: string; default?: boolean }>;
-  parallel_branches?: Array<{ node_id: string }>;
+  branches?: Array<{ when?: string; condition?: string; goto?: string; target?: string; label?: string; default?: boolean }>;
+  parallel_branches?: Array<{ node_id: string; node?: unknown } | string>;
   confirm_prompt?: string;
   confirm_options?: string[];
   confirm_branches?: Record<string, string>;
+  // 结束对话节点：true = 对话归档保留，false = 运行完成后回收
+  save_dialog?: boolean;
+  // ---- 图编排/SOAR 增强字段 ----
+  target?: string;              // 显式下一节点
+  merge_strategy?: string;      // parallel 合并策略
+  decision_prompt?: string;     // ai_decision: LLM 决策提示
+  decision_model?: string;      // ai_decision: 覆盖模型
+  decision_expression?: string; // decision: 简化表达式
+  transform_expr?: string;
+  pipeline_name?: string;
+  tools?: string[];
+  timeout_seconds?: number;     // 节点执行超时
+  max_retries?: number;         // 失败重试次数
+  error_target?: string;        // 失败分支路由目标
+  on_error?: string;            // 兼容别名
+  ignore_error?: boolean;       // 失败仅记录、继续走正常路径
 }
 
 interface PipelineEdge {
@@ -39,30 +65,35 @@ interface UnifiedPipeline {
   nodes?: PipelineNode[];
   edges?: PipelineEdge[];
   active?: boolean;
+  category?: string;
+  tags?: string[];
+  timeout_seconds?: number;
+  max_concurrency?: number;
   created_at?: string;
   updated_at?: string;
 }
 
-interface RunRecord {
-  run_id: string;
-  pipeline_id: string;
+// 历史/实例运行行（列表接口返回，可含对话统计）
+interface RunRow extends Omit<RunBrief, 'error'> {
   pipeline_name?: string;
-  status: string;
-  started_at?: string;
-  finished_at?: string;
   events_count?: number;
+  dialog_count?: number;
+  dialog_retained?: boolean;
+  error?: string;
 }
 
 const STORAGE_KEY = 'baize_pipeline_editor';
 const ICONS: Record<string, string> = {
   agent: 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z',
   decision: 'M3 5v14a2 2 0 002 2h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2zm7 7h4v4h-4v-4zm0-6h4v4h-4V6z',
+  ai_decision: 'M9 3V1h2v2h2V1h2v2h2a2 2 0 0 1 2 2v2h2v2h-2v2h2v2h-2v2h2v2h-2v2a2 2 0 0 1-2 2h-2v2h-2v-2h-2v2H7v-2H5a2 2 0 0 1-2-2v-2H1v-2h2v-2H1V9h2V7H1V5h2a2 2 0 0 1 2-2h2V1h2v2h2V1zM7 7h10v10H7V7zm2 2v6h6V9H9z',
   confirm: 'M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41L9 16.17z',
   parallel: 'M4 6h6v12H4V6zm10 0h6v12h-6V6z',
   transform: 'M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5',
   subpipeline: 'M4 4h16v16H4V4zm2 2h12v12H6V6zm2 2h8v8H8V8z',
   receiver: 'M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h6l6-6V5c0-1.1-.9-2-2-2zm-5 4h4v4h-4V7zm-2 4H8v-4h4v4zm-2 2h4v4h-4v-4z',
   datatransformer: 'M4 21V3h16v18l-8-5-8 5z',
+  end: 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-2 15l-5-5 1.41-1.41L10 14.17l7.59-7.59L19 8l-9 9z',
 };
 
 const NODE_LABELS: Record<string, string> = {
@@ -70,9 +101,11 @@ const NODE_LABELS: Record<string, string> = {
   datatransformer: '数据转换',
   agent: '智能体',
   decision: '条件判断',
+  ai_decision: 'AI 决策',
   confirm: '人工确认',
   parallel: '并行执行',
   transform: '数据转换',
+  end: '结束对话',
   subpipeline: '子流水线',
 };
 
@@ -81,10 +114,12 @@ const NODE_COLORS: Record<string, string> = {
   datatransformer: '#14b8a6',
   agent: '#3b82f6',
   decision: '#f59e0b',
+  ai_decision: '#d946ef',
   confirm: '#ec4899',
   parallel: '#8b5cf6',
   transform: '#10b981',
   subpipeline: '#6366f1',
+  end: '#ef4444',
 };
 
 const NODE_GRADIENTS: Record<string, [string, string]> = {
@@ -92,86 +127,110 @@ const NODE_GRADIENTS: Record<string, [string, string]> = {
   datatransformer: ['#14b8a6', '#0f766e'],
   agent: ['#3b82f6', '#1d4ed8'],
   decision: ['#f59e0b', '#b45309'],
+  ai_decision: ['#e879f9', '#c026d3'],
   confirm: ['#ec4899', '#be185d'],
   parallel: ['#8b5cf6', '#6d28d9'],
   transform: ['#10b981', '#047857'],
   subpipeline: ['#6366f1', '#4338ca'],
+  end: ['#ef4444', '#b91c1c'],
 };
 
 export default function PipelineEditor() {
-  const [activeTab, setActiveTab] = useState<'pipelines' | 'history'>('pipelines');
-  const [pipelines, setPipelines] = useState<UnifiedPipeline[]>([]);
-  const [runs, setRuns] = useState<RunRecord[]>([]);
-  const [selectedPipeline, setSelectedPipeline] = useState<UnifiedPipeline | null>(null);
+  const [activeTab, setActiveTab] = useState<'instances' | 'templates' | 'receivers' | 'history'>('instances');
+
+  // 模板库（内置 + 自定义）
+  const [templates, setTemplates] = useState<UnifiedPipeline[]>([]);
+  const [selectedTemplate, setSelectedTemplate] = useState<UnifiedPipeline | null>(null);
+
+  // 流水线实例（由模板创建的可运行对象）
+  const [instances, setInstances] = useState<PipelineInstance[]>([]);
+  const [selectedInstance, setSelectedInstance] = useState<PipelineInstance | null>(null);
+  const [instanceStatus, setInstanceStatus] = useState<InstanceStatus | null>(null);
+  const [instRuns, setInstRuns] = useState<RunRow[]>([]);
+
+  // 接收器（自设置页迁入）
+  const [receivers, setReceivers] = useState<ReceiverConfig[]>([]);
+
+  // 执行历史
+  const [runs, setRuns] = useState<RunRow[]>([]);
+
   const [loading, setLoading] = useState(true);
 
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; msg: string } | null>(null);
-  const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<{ kind: 'template' | 'instance' | 'builtin'; id: string; name: string } | null>(null);
 
-  // 编辑模式
-  const [editing, setEditing] = useState(false);
-  const [editData, setEditData] = useState<Partial<UnifiedPipeline>>({});
+  // 新建/编辑模板（同一拖拽图编辑器，编辑仅自定义模板）
+  const [showCreateTpl, setShowCreateTpl] = useState(false);
+  const [editTpl, setEditTpl] = useState<UnifiedPipeline | null>(null);
 
-  // 创建流水线
-  const [showCreate, setShowCreate] = useState(false);
+  // 新建/编辑实例
+  const [showCreateInst, setShowCreateInst] = useState(false);
+  const [instPresetTemplateId, setInstPresetTemplateId] = useState<string | null>(null);
+  const [editingInst, setEditingInst] = useState(false);
+  const [editInstData, setEditInstData] = useState<Partial<PipelineInstance>>({});
 
-  // 测试执行
-  const [showTest, setShowTest] = useState<string | null>(null); // pipeline_id
-  const [testInput, setTestInput] = useState('');
-  const [testRunning, setTestRunning] = useState(false);
-  const [testEvents, setTestEvents] = useState<Array<{ node_id?: string; event_type?: string; message?: string; timestamp?: string }>>([]);
+  // 接收器表单
+  const [showReceiverForm, setShowReceiverForm] = useState(false);
+  const [editingReceiver, setEditingReceiver] = useState<ReceiverConfig | null>(null);
+  const [receiverForm, setReceiverForm] = useState({
+    name: '', kind: 'webhook',
+    webhook_path: '', syslog_port: 514, syslog_host: '0.0.0.0',
+    watch_dir: '', watch_patterns: '*',
+  });
+  const [receiverSaving, setReceiverSaving] = useState(false);
+
+  // 测试执行（针对实例）
+  const [showTest, setShowTest] = useState<string | null>(null); // instance_id
+
+  // Run 详情（历史/对话查看）
+  const [viewRun, setViewRun] = useState<RunDetail | null>(null);
+  const [viewRunLoading, setViewRunLoading] = useState(false);
+
+  function showFeedback(type: 'ok' | 'err', msg: string) {
+    setFeedback({ type, msg });
+    setTimeout(() => setFeedback(null), 4000);
+  }
 
   // ---- 数据加载 ----
 
-  const loadPipelines = useCallback(async () => {
+  const loadTemplates = useCallback(async () => {
     try {
-      const [tpl, custom] = await Promise.all([
-        api.listPipelineTemplates(),
-        api.listCustomPipelines(),
-      ]);
+      const tpl = await api.listUnifiedTemplates();
+      const unified: UnifiedPipeline[] = (tpl.templates || []).map((t: any) => ({
+        id: t.id,
+        name: t.name,
+        description: t.description || '',
+        type: t.type || 'manual',
+        source: t.source === 'custom' || t.is_custom ? ('custom' as PipelineSource) : ('builtin' as PipelineSource),
+        nodes: (t.nodes || t.steps || []) as PipelineNode[],
+        edges: (t.edges || []) as PipelineEdge[],
+        category: t.category || '',
+        tags: Array.isArray(t.tags) ? t.tags : [],
+        timeout_seconds: t.timeout_seconds,
+        max_concurrency: t.max_concurrency,
+        created_at: t.created_at,
+        updated_at: t.updated_at,
+      }));
+      setTemplates(unified);
+    } catch (e: any) {
+      showFeedback('err', '加载模板库失败: ' + (e.message || '未知错误'));
+    }
+  }, []);
 
-      const activeStatuses = new Map<string, boolean>();
-      for (const t of tpl.templates) {
-        if (t.type === 'auto') {
-          try {
-            const st = await api.getPipelineStatus(t.id);
-            activeStatuses.set(t.id, st.active);
-          } catch { /* ignore */ }
-        }
-      }
-
-      const unified: UnifiedPipeline[] = [
-        // 内置模板
-        ...tpl.templates.map((t: any) => ({
-          id: t.id,
-          name: t.name,
-          description: t.description || '',
-          type: t.type || 'manual',
-          source: 'builtin' as PipelineSource,
-          nodes: t.nodes || t.steps || [],
-          edges: t.edges || [],
-          active: activeStatuses.get(t.id) ?? false,
-        })),
-        // 用户自定义流水线
-        ...custom.pipelines.map((p: any) => ({
-          id: p.id,
-          name: p.name,
-          description: p.description || '',
-          type: p.type || 'manual',
-          source: 'custom' as PipelineSource,
-          nodes: p.nodes || p.steps || [],
-          edges: p.edges || [],
-          created_at: p.created_at,
-          updated_at: p.updated_at,
-        })),
-      ];
-
-      setPipelines(unified);
+  const loadInstances = useCallback(async () => {
+    try {
+      const resp = await api.listInstances();
+      setInstances(resp.instances || []);
     } catch (e: any) {
       showFeedback('err', '加载流水线失败: ' + (e.message || '未知错误'));
-    } finally {
-      setLoading(false);
     }
+  }, []);
+
+  const loadReceivers = useCallback(async () => {
+    try {
+      const resp = await api.listReceivers();
+      setReceivers(resp.receivers || []);
+    } catch { /* 接收器不可用时静默 */ }
   }, []);
 
   const loadRuns = useCallback(async () => {
@@ -181,10 +240,13 @@ export default function PipelineEditor() {
     } catch { /* ignore */ }
   }, []);
 
-  useEffect(() => {
-    loadPipelines();
-    if (activeTab === 'history') loadRuns();
-  }, [activeTab, loadPipelines, loadRuns]);
+  const refreshAll = useCallback(() => {
+    setLoading(true);
+    Promise.allSettled([loadTemplates(), loadInstances(), loadReceivers(), loadRuns()])
+      .finally(() => setLoading(false));
+  }, [loadTemplates, loadInstances, loadReceivers, loadRuns]);
+
+  useEffect(() => { refreshAll(); }, [refreshAll]);
 
   // 恢复保存的状态
   useEffect(() => {
@@ -201,90 +263,230 @@ export default function PipelineEditor() {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ tab }));
   };
 
-  function showFeedback(type: 'ok' | 'err', msg: string) {
-    setFeedback({ type, msg });
-    setTimeout(() => setFeedback(null), 4000);
+  // 模板库中被某实例选用的模板视图（用于实例详情展示快照图）
+  function templateOf(inst: PipelineInstance): UnifiedPipeline | null {
+    const tpl = templates.find(t => t.id === inst.template_id);
+    const snap: any = (inst as any).template_snapshot;
+    return {
+      id: inst.template_id,
+      name: (snap?.name as string) || inst.template_name || tpl?.name || inst.name,
+      description: inst.description || tpl?.description || '',
+      type: inst.type || tpl?.type || 'auto',
+      source: (inst.template_source || tpl?.source || 'builtin') === 'custom' ? ('custom' as PipelineSource) : ('builtin' as PipelineSource),
+      nodes: (snap?.nodes || tpl?.nodes || []) as PipelineNode[],
+      edges: (snap?.edges || tpl?.edges || []) as PipelineEdge[],
+    };
   }
 
-  // ---- 激活/停止自动化 ----
+  // ---- 模板库操作 ----
 
-  async function toggleActivation(p: UnifiedPipeline) {
-    try {
-      if (p.active) {
-        await api.deactivatePipeline(p.id);
-        showFeedback('ok', `已停止 "${p.name}"`);
-      } else {
-        await api.activatePipeline(p.id);
-        showFeedback('ok', `已激活 "${p.name}"`);
-      }
-      setPipelines(prev =>
-        prev.map(pp => (pp.id === p.id ? { ...pp, active: !pp.active } : pp))
-      );
-    } catch (e: any) {
-      showFeedback('err', '操作失败: ' + (e.message || ''));
-    }
+  function selectTemplate(t: UnifiedPipeline) {
+    setSelectedTemplate(t);
   }
 
-  // ---- 删除 ----
+  /** 打开拖拽画布编辑自定义模板（节点/连线删除、重配均在此完成） */
+  function startEditTemplate(t: UnifiedPipeline) {
+    if (t.source !== 'custom') return;
+    setEditTpl(t);
+    setShowCreateTpl(false);
+  }
 
-  async function handleDelete(p: UnifiedPipeline) {
+  async function deleteTemplate(t: UnifiedPipeline) {
     try {
-      if (p.source === 'custom') {
-        await api.deleteCustomPipeline(p.id);
+      if (t.source === 'custom') {
+        await api.deleteCustomPipeline(t.id);
       } else {
-        await api.deleteBuiltinTemplate(p.id);
+        await api.deleteBuiltinTemplate(t.id);
       }
       setConfirmDelete(null);
-      showFeedback('ok', `已删除 "${p.name}"`);
-      setPipelines(prev => prev.filter(pp => pp.id !== p.id));
-      if (selectedPipeline?.id === p.id) setSelectedPipeline(null);
+      showFeedback('ok', `已删除模板 "${t.name}"`);
+      setTemplates(prev => prev.filter(x => x.id !== t.id));
+      if (selectedTemplate?.id === t.id) setSelectedTemplate(null);
     } catch (e: any) {
       showFeedback('err', '删除失败: ' + (e.message || ''));
     }
   }
 
+  // ---- 流水线实例操作 ----
 
-
-
-  // ---- 查看详情 ----
-
-  function selectPipeline(p: UnifiedPipeline) {
-    setSelectedPipeline(p);
-    setEditing(false);
-  }
-
-  // ---- 编辑（仅自定义） ----
-
-  function startEdit(p: UnifiedPipeline) {
-    setEditing(true);
-    setEditData({
-      name: p.name,
-      description: p.description,
-      nodes: p.nodes,
-      edges: p.edges,
-    });
-  }
-
-  async function saveEdit() {
-    if (!selectedPipeline || selectedPipeline.source !== 'custom') return;
+  async function selectInstance(inst: PipelineInstance) {
+    setSelectedInstance(inst);
+    setEditingInst(false);
+    setInstanceStatus(null);
+    setInstRuns([]);
     try {
-      await (api as any).updateCustomPipeline(selectedPipeline.id, {
-        name: editData.name || '',
-        description: editData.description || '',
-        nodes: editData.nodes || [],
-        edges: editData.edges || [],
-        steps: (editData.nodes || []).map((n: any) => ({
-          agent_name: n.agent || n.display_name || n.id,
-          display_name: n.display_name || n.id,
-          description: n.description || '',
-        })),
+      const st = await api.getInstanceStatus(inst.id);
+      setInstanceStatus(st);
+    } catch { /* ignore */ }
+    try {
+      const resp = await api.listInstanceRuns(inst.id, 20);
+      setInstRuns(resp.runs || []);
+    } catch { /* ignore */ }
+  }
+
+  async function toggleInstance(inst: PipelineInstance) {
+    try {
+      if (inst.enabled) {
+        await api.disableInstance(inst.id);
+        showFeedback('ok', `已停用 "${inst.name}"`);
+      } else {
+        await api.enableInstance(inst.id);
+        showFeedback('ok', `已启用 "${inst.name}"，开始并行消费接收器数据`);
+      }
+      const next = { ...inst, enabled: !inst.enabled };
+      setInstances(prev => prev.map(x => x.id === inst.id ? next : x));
+      if (selectedInstance?.id === inst.id) selectInstance(next);
+    } catch (e: any) {
+      showFeedback('err', '操作失败: ' + (e.message || ''));
+    }
+  }
+
+  async function syncInstance(inst: PipelineInstance) {
+    try {
+      const res = await api.syncInstance(inst.id);
+      showFeedback('ok', `实例 "${inst.name}" 已同步到模板最新定义`);
+      const next = { ...inst, ...res.instance };
+      setInstances(prev => prev.map(x => x.id === inst.id ? next : x));
+      if (selectedInstance?.id === inst.id) selectInstance(next);
+    } catch (e: any) {
+      showFeedback('err', '同步失败: ' + (e.message || ''));
+    }
+  }
+
+  async function deleteInstance(inst: PipelineInstance) {
+    try {
+      await api.deleteInstance(inst.id);
+      setConfirmDelete(null);
+      showFeedback('ok', `已删除流水线 "${inst.name}"`);
+      setInstances(prev => prev.filter(x => x.id !== inst.id));
+      if (selectedInstance?.id === inst.id) { setSelectedInstance(null); setInstanceStatus(null); setInstRuns([]); }
+    } catch (e: any) {
+      showFeedback('err', '删除失败: ' + (e.message || ''));
+    }
+  }
+
+  function openCreateInstance(presetTemplateId?: string) {
+    setInstPresetTemplateId(presetTemplateId || null);
+    setShowCreateInst(true);
+  }
+
+  function openEditInstance(inst: PipelineInstance) {
+    setEditInstData({
+      name: inst.name,
+      description: inst.description,
+      receiver_id: inst.receiver_id,
+      max_concurrency: inst.max_concurrency,
+    });
+    setEditingInst(true);
+  }
+
+  async function saveInstanceEdit() {
+    if (!selectedInstance) return;
+    try {
+      const res = await api.updateInstance(selectedInstance.id, {
+        name: editInstData.name || undefined,
+        description: editInstData.description,
+        receiver_id: editInstData.receiver_id,
+        max_concurrency: editInstData.max_concurrency,
       });
-      showFeedback('ok', '保存成功');
-      setEditing(false);
-      loadPipelines();
+      setEditingInst(false);
+      showFeedback('ok', '流水线已更新');
+      setInstances(prev => prev.map(x => x.id === selectedInstance.id ? { ...x, ...res.instance } : x));
+      selectInstance({ ...selectedInstance, ...res.instance });
     } catch (e: any) {
       showFeedback('err', '保存失败: ' + (e.message || ''));
     }
+  }
+
+  async function onInstanceCreated(inst: PipelineInstance) {
+    showFeedback('ok', `流水线「${inst.name}」已创建（来自模板 ${inst.template_name || inst.template_id}）`);
+    setShowCreateInst(false);
+    loadInstances();
+    setActiveTab('instances'); saveState('instances');
+    selectInstance(inst);
+  }
+
+  async function onTemplateCreated(name: string) {
+    showFeedback('ok', `模板「${name}」已创建，可进入「流水线实例」用它创建流水线`);
+    setShowCreateTpl(false);
+    setEditTpl(null);
+    loadTemplates();
+  }
+
+  async function onTemplateUpdated(name: string) {
+    showFeedback('ok', `模板「${name}」已更新`);
+    setShowCreateTpl(false);
+    setEditTpl(null);
+    loadTemplates();
+  }
+
+  // ---- 接收器操作 ----
+
+  function openCreateReceiver() {
+    setEditingReceiver(null);
+    setReceiverForm({ name: '', kind: 'webhook', webhook_path: '', syslog_port: 514, syslog_host: '0.0.0.0', watch_dir: '', watch_patterns: '*' });
+    setShowReceiverForm(true);
+  }
+  function openEditReceiver(r: ReceiverConfig) {
+    setEditingReceiver(r);
+    setReceiverForm({
+      name: r.name, kind: r.kind,
+      webhook_path: r.webhook_path, syslog_port: r.syslog_port || 514,
+      syslog_host: r.syslog_host || '0.0.0.0',
+      watch_dir: r.watch_dir, watch_patterns: r.watch_patterns || '*',
+    });
+    setShowReceiverForm(true);
+  }
+  async function saveReceiver() {
+    if (!receiverForm.name.trim()) return;
+    setReceiverSaving(true);
+    try {
+      if (editingReceiver) {
+        await api.updateReceiver(editingReceiver.id, receiverForm);
+      } else {
+        await api.createReceiver(receiverForm);
+      }
+      setShowReceiverForm(false);
+      loadReceivers();
+    } catch (e: any) {
+      showFeedback('err', '保存失败: ' + (e.message || ''));
+    } finally { setReceiverSaving(false); }
+  }
+  async function toggleReceiver(r: ReceiverConfig) {
+    try {
+      await api.updateReceiver(r.id, { enabled: !r.enabled });
+      setReceivers(prev => prev.map(x => x.id === r.id ? { ...x, enabled: !r.enabled } : x));
+    } catch (e: any) {
+      showFeedback('err', '操作失败: ' + (e.message || ''));
+    }
+  }
+  async function removeReceiver(r: ReceiverConfig) {
+    if (!confirm(`确定删除接收器「${r.name}」？绑定它的流水线将无法继续接收数据。`)) return;
+    try {
+      await api.deleteReceiver(r.id);
+      setReceivers(prev => prev.filter(x => x.id !== r.id));
+      showFeedback('ok', `已删除接收器 "${r.name}"`);
+    } catch (e: any) {
+      showFeedback('err', '删除失败: ' + (e.message || ''));
+    }
+  }
+
+  // ---- Run 详情 ----
+
+  async function openRunDetail(runId: string) {
+    setViewRunLoading(true);
+    setViewRun(null);
+    try {
+      const resp = await api.getRun(runId);
+      setViewRun(resp.run || (resp as any));
+    } catch (e: any) {
+      showFeedback('err', '加载运行详情失败: ' + (e.message || ''));
+    } finally { setViewRunLoading(false); }
+  }
+
+  // 判断接收器被哪些实例使用
+  function receiverBindings(r: ReceiverConfig): PipelineInstance[] {
+    return instances.filter(i => i.receiver_id === r.id);
   }
 
   // ---- 渲染 ----
@@ -300,17 +502,45 @@ export default function PipelineEditor() {
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-5">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">
-          流水线管理
-        </h1>
-        <div className="flex gap-2 items-center">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">流水线管理</h1>
+          <p className="text-xs text-gray-500 dark:text-slate-400 mt-1">
+            模板（图编排定义）→ 流水线实例（绑定接收器、可并行处理入站数据，每次入站 = 一次独立对话，不进入渗透对话/会话管理）
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
           <button
-            onClick={() => setShowCreate(true)}
-            className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors font-medium"
+            onClick={refreshAll}
+            title="刷新全部数据"
+            className="px-3 py-2 text-sm rounded-xl border border-slate-300 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
           >
-            + 新建流水线
+            刷新
           </button>
+          {activeTab === 'templates' && (
+            <button
+              onClick={() => setShowCreateTpl(true)}
+              className="px-4 py-2 text-sm bg-blue-600 hover:bg-blue-700 rounded-xl transition-colors font-medium text-white"
+            >
+              + 新建模板
+            </button>
+          )}
+          {activeTab === 'instances' && (
+            <button
+              onClick={() => openCreateInstance()}
+              className="px-4 py-2 text-sm bg-emerald-600 hover:bg-emerald-700 rounded-xl transition-colors font-medium text-white"
+            >
+              + 新建流水线
+            </button>
+          )}
+          {activeTab === 'receivers' && (
+            <button
+              onClick={openCreateReceiver}
+              className="px-4 py-2 text-sm bg-cyan-600 hover:bg-cyan-500 rounded-xl transition-colors font-medium text-white"
+            >
+              + 新建接收器
+            </button>
+          )}
           {feedback && (
             <div
               className={`px-3 py-1.5 rounded-lg text-sm font-medium ${
@@ -322,33 +552,15 @@ export default function PipelineEditor() {
               {feedback.msg}
             </div>
           )}
-          {confirmDelete && (
-            <div className="flex items-center gap-2 px-3 py-1.5 bg-red-50 rounded-lg border border-red-200 dark:bg-red-900/20 dark:border-red-800 text-sm">
-              <span className="text-red-700 dark:text-red-400">确认删除?</span>
-              <button
-                onClick={() => {
-                  const p = pipelines.find(pp => pp.id === confirmDelete);
-                  if (p) handleDelete(p);
-                }}
-                className="px-2 py-0.5 bg-red-600 text-white rounded text-xs font-medium"
-              >
-                删除
-              </button>
-              <button
-                onClick={() => setConfirmDelete(null)}
-                className="px-2 py-0.5 bg-slate-200 dark:bg-slate-700 rounded text-xs"
-              >
-                取消
-              </button>
-            </div>
-          )}
         </div>
       </div>
 
       {/* Tab Bar */}
-      <div className="flex border-b border-slate-200 dark:border-slate-700 gap-1">
+      <div className="flex border-b border-slate-200 dark:border-slate-700 gap-1 flex-wrap">
         {([
-          ['pipelines', '流水线'],
+          ['instances', '流水线实例'],
+          ['templates', '模板库'],
+          ['receivers', '数据接收器'],
           ['history', '执行历史'],
         ] as const).map(([id, label]) => (
           <button
@@ -365,287 +577,163 @@ export default function PipelineEditor() {
         ))}
       </div>
 
-      {/* ====== 流水线列表 ====== */}
-      {activeTab === 'pipelines' && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
-          {/* 左侧：流水线卡片列表 */}
-          <div className="lg:col-span-1 space-y-3 max-h-[calc(100vh-260px)] overflow-y-auto pr-1">
-            {pipelines.length === 0 && (
-              <div className="text-center py-12 text-slate-400 dark:text-slate-500">
-                暂无流水线，请先{" "}
-                <span className="text-blue-500 cursor-pointer" onClick={() => loadPipelines()}>
-                  刷新
-                </span>
-              </div>
-            )}
-            {pipelines.map(p => (
-              <div
-                key={p.id}
-                onClick={() => selectPipeline(p)}
-                className={`p-4 rounded-xl border cursor-pointer transition-all ${
-                  selectedPipeline?.id === p.id
-                    ? 'border-blue-400 bg-blue-50 dark:border-blue-500 dark:bg-blue-900/20 shadow-sm'
-                    : 'border-slate-200 dark:border-slate-700 hover:border-slate-300 dark:hover:border-slate-600 bg-white dark:bg-slate-800'
-                }`}
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <h3 className="font-semibold text-sm text-slate-900 dark:text-slate-100 truncate">
-                        {p.name}
-                      </h3>
-                      {p.source === 'builtin' ? (
-                        <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400">
-                          预置
-                        </span>
-                      ) : (
-                        <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-600 dark:bg-blue-900/30 dark:text-blue-400">
-                          自定义
-                        </span>
-                      )}
-                      <span
-                        className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded ${
-                          p.type === 'auto'
-                            ? 'bg-emerald-100 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400'
-                            : 'bg-amber-100 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400'
-                        }`}
-                      >
-                        {p.type === 'auto' ? '自动化' : '人工'}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-xs text-slate-500 dark:text-slate-400 line-clamp-2">
-                      {p.description}
-                    </p>
-                  </div>
-                </div>
-                <div className="mt-3 flex items-center gap-2">
-                  {p.type === 'auto' && (
-                    <button
-                      onClick={e => { e.stopPropagation(); toggleActivation(p); }}
-                      className={`text-[10px] px-2 py-0.5 rounded-full font-medium transition-colors ${
-                        p.active
-                          ? 'bg-emerald-500 text-white'
-                          : 'bg-slate-200 text-slate-500 dark:bg-slate-600 dark:text-slate-400'
-                      }`}
-                    >
-                      {p.active ? '● 已开启' : '○ 已关闭'}
-                    </button>
-                  )}
-                  <button
-                    onClick={e => {
-                      e.stopPropagation();
-                      selectPipeline(p);
-                      setShowTest(p.id);
-                      setTestInput('');
-                      setTestEvents([]);
-                    }}
-                    className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-blue-100 text-blue-600 dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 transition-colors"
-                  >
-                    测试
-                  </button>
-                  <button
-                    onClick={e => {
-                      e.stopPropagation();
-                      setConfirmDelete(p.id);
-                    }}
-                    className="text-[10px] px-2 py-0.5 rounded-full font-medium text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
-                  >
-                    删除
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
+      {/* ====== 流水线实例 ====== */}
+      {activeTab === 'instances' && (
+        <InstancesTab
+          instances={instances}
+          templates={templates}
+          receivers={receivers}
+          selected={selectedInstance}
+          status={instanceStatus}
+          instRuns={instRuns}
+          editing={editingInst}
+          editData={editInstData}
+          setEditData={setEditInstData}
+          onSelect={selectInstance}
+          onToggle={toggleInstance}
+          onSync={syncInstance}
+          onDelete={inst => setConfirmDelete({ kind: 'instance', id: inst.id, name: inst.name })}
+          onEdit={openEditInstance}
+          onSaveEdit={saveInstanceEdit}
+          onCancelEdit={() => setEditingInst(false)}
+          onTest={inst => setShowTest(inst.id)}
+          onOpenRun={openRunDetail}
+          onOpenRunsHistory={() => { setActiveTab('history'); saveState('history'); }}
+          templateOf={templateOf}
+        />
+      )}
 
-          {/* 右侧：详情面板 */}
-          <div className="lg:col-span-2">
-            {!selectedPipeline ? (
-              <div className="flex items-center justify-center h-64 border border-dashed border-slate-300 dark:border-slate-600 rounded-xl text-sm text-slate-400 dark:text-slate-500">
-                选择左侧流水线查看详情
-              </div>
-            ) : editing ? (
-              <PipelineEditPanel
-                pipeline={selectedPipeline}
-                editData={editData}
-                setEditData={setEditData}
-                onSave={saveEdit}
-                onCancel={() => setEditing(false)}
-              />
-            ) : (
-              <PipelineDetailPanel
-                pipeline={selectedPipeline}
-                onEdit={() => startEdit(selectedPipeline)}
-                onTest={() => {
-                  setShowTest(selectedPipeline.id);
-                  setTestInput('');
-                  setTestEvents([]);
-                }}
-                submitting={testRunning}
-                isCustom={selectedPipeline.source === 'custom'}
-              />
-            )}
-          </div>
-        </div>
+      {/* ====== 模板库 ====== */}
+      {activeTab === 'templates' && (
+        <TemplatesTab
+          templates={templates}
+          selected={selectedTemplate}
+          onSelect={selectTemplate}
+          onStartEdit={startEditTemplate}
+          onDelete={t => setConfirmDelete({ kind: t.source === 'custom' ? 'template' : 'builtin', id: t.id, name: t.name })}
+          onCreateInstance={t => openCreateInstance(t.id)}
+          onOpenCreate={() => setShowCreateTpl(true)}
+          onOpenRun={openRunDetail}
+        />
+      )}
+
+      {/* ====== 数据接收器 ====== */}
+      {activeTab === 'receivers' && (
+        <ReceiversTab
+          receivers={receivers}
+          instances={instances}
+          onOpenCreate={openCreateReceiver}
+          onOpenEdit={openEditReceiver}
+          onToggle={toggleReceiver}
+          onDelete={removeReceiver}
+          bindingsOf={receiverBindings}
+          onGotoInstance={inst => {
+            setActiveTab('instances'); saveState('instances');
+            const found = instances.find(i => i.id === inst.id);
+            if (found) selectInstance(found);
+          }}
+        />
       )}
 
       {/* ====== 执行历史 ====== */}
       {activeTab === 'history' && (
-        <div className="space-y-3">
-          <div className="flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-slate-700 dark:text-slate-300">历史执行记录</h2>
-            <button
-              onClick={loadRuns}
-              className="text-xs text-blue-500 hover:text-blue-600"
-            >
-              刷新
-            </button>
+        <HistoryTab runs={runs} onRefresh={loadRuns} onOpenRun={openRunDetail} />
+      )}
+
+      {/* ====== 新建/编辑模板（拖拽流程图编辑器） ====== */}
+      {(showCreateTpl || editTpl) && (
+        <CreatePipelineModal
+          initial={editTpl}
+          onClose={() => { setShowCreateTpl(false); setEditTpl(null); }}
+          onCreated={onTemplateCreated}
+          onUpdated={onTemplateUpdated}
+          showFeedback={showFeedback}
+        />
+      )}
+
+      {/* ====== 新建流水线实例 ====== */}
+      {showCreateInst && (
+        <CreateInstanceModal
+          templates={templates}
+          receivers={receivers}
+          presetTemplateId={instPresetTemplateId}
+          onClose={() => setShowCreateInst(false)}
+          onCreated={onInstanceCreated}
+          showFeedback={showFeedback}
+        />
+      )}
+
+      {/* ====== 接收器表单 ====== */}
+      {showReceiverForm && (
+        <ReceiverFormModal
+          editing={editingReceiver}
+          form={receiverForm}
+          setForm={setReceiverForm}
+          saving={receiverSaving}
+          onClose={() => setShowReceiverForm(false)}
+          onSave={saveReceiver}
+        />
+      )}
+
+      {/* ====== 删除确认 ====== */}
+      {confirmDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setConfirmDelete(null)}>
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-sm mx-4" onClick={e => e.stopPropagation()}>
+            <h3 className="text-base font-semibold text-slate-100">确认删除</h3>
+            <p className="text-sm text-gray-400 mt-1">
+              {confirmDelete.kind === 'instance'
+                ? `流水线实例「${confirmDelete.name}」将被删除，正在排队/运行的任务会被取消，历史记录保留。`
+                : confirmDelete.kind === 'template'
+                  ? `自定义模板「${confirmDelete.name}」将被删除；已由此模板创建的流水线实例仍可继续运行（保留快照）。`
+                  : `内置模板「${confirmDelete.name}」将从模板库隐藏（可稍后恢复）。`}
+            </p>
+            <div className="flex gap-3 mt-5">
+              <button
+                onClick={async () => {
+                  if (confirmDelete.kind === 'instance') {
+                    const inst = instances.find(i => i.id === confirmDelete.id);
+                    if (inst) await deleteInstance(inst);
+                  } else {
+                    const t = templates.find(x => x.id === confirmDelete.id);
+                    if (t) await deleteTemplate(t);
+                  }
+                }}
+                className="flex-1 px-4 py-2.5 bg-red-600 hover:bg-red-500 rounded-xl text-sm font-medium text-white"
+              >
+                删除
+              </button>
+              <button
+                onClick={() => setConfirmDelete(null)}
+                className="px-4 py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm text-gray-300"
+              >
+                取消
+              </button>
+            </div>
           </div>
-          {runs.length === 0 ? (
-            <div className="text-center py-12 text-slate-400 dark:text-slate-500 text-sm">
-              暂无执行记录
-            </div>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-slate-200 dark:border-slate-700 text-left text-slate-500 dark:text-slate-400">
-                    <th className="pb-2 font-medium">Run ID</th>
-                    <th className="pb-2 font-medium">流水线</th>
-                    <th className="pb-2 font-medium">状态</th>
-                    <th className="pb-2 font-medium">开始时间</th>
-                    <th className="pb-2 font-medium">事件数</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {runs.map(r => (
-                    <tr key={r.run_id} className="border-b border-slate-100 dark:border-slate-800">
-                      <td className="py-2 font-mono text-xs text-slate-600 dark:text-slate-400">
-                        {r.run_id.slice(0, 12)}...
-                      </td>
-                      <td className="py-2 text-slate-700 dark:text-slate-300">
-                        {r.pipeline_name || r.pipeline_id}
-                      </td>
-                      <td className="py-2">
-                        <RunStatusBadge status={r.status} />
-                      </td>
-                      <td className="py-2 text-xs text-slate-500 dark:text-slate-400">
-                        {r.started_at ? new Date(r.started_at).toLocaleString() : '-'}
-                      </td>
-                      <td className="py-2 text-slate-500 dark:text-slate-400">
-                        {r.events_count ?? '-'}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
         </div>
       )}
 
-      {/* ====== 创建流水线弹窗（拖拽流程图编辑器） ====== */}
-      {showCreate && <CreatePipelineModal
-        onClose={() => setShowCreate(false)}
-        onCreated={(name) => { showFeedback('ok', `流水线「${name}」已创建`); setShowCreate(false); loadPipelines(); }}
-        showFeedback={showFeedback}
-      />}
-
-      {/* ====== 测试流水线弹窗 ====== */}
+      {/* ====== 测试实例弹窗 ====== */}
       {showTest && (() => {
-        const testPipeline = pipelines.find(p => p.id === showTest);
-        if (!testPipeline) return null;
+        const inst = instances.find(i => i.id === showTest);
+        if (!inst) return null;
         return (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={() => setShowTest(null)}>
-            <div className="w-full max-w-2xl mx-4 bg-gray-900 border border-gray-800 rounded-2xl shadow-2xl max-h-[85vh] flex flex-col" onClick={e => e.stopPropagation()}>
-              <div className="flex items-center justify-between p-5 border-b border-gray-800">
-                <div>
-                  <h2 className="text-lg font-semibold text-slate-100">测试流水线: {testPipeline.name}</h2>
-                  <p className="text-xs text-gray-500 mt-0.5">输入测试数据，观察流水线各节点的运行情况</p>
-                </div>
-                <button onClick={() => setShowTest(null)} className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-400">
-                  <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
-                </button>
-              </div>
-              <div className="p-5 space-y-4 overflow-y-auto flex-1">
-                <div>
-                  <label className="block text-xs font-semibold text-gray-400 mb-1.5">测试输入数据</label>
-                  <textarea
-                    value={testInput} onChange={e => setTestInput(e.target.value)}
-                    rows={4} placeholder='输入 JSON 格式的测试数据，例如: {"target": "example.com", "action": "scan"}'
-                    className="w-full px-3 py-2 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 focus:border-blue-500 outline-none resize-none font-mono"
-                  />
-                </div>
-                <button onClick={async () => {
-                  setTestRunning(true);
-                  setTestEvents([]);
-                  try {
-                    let inputData: any = { trigger: 'test' };
-                    if (testInput.trim()) {
-                      try { inputData = { ...inputData, context: JSON.parse(testInput) }; }
-                      catch { inputData = { ...inputData, context: { raw_input: testInput } }; }
-                    }
-                    const resp = await api.submitRun({ pipeline_id: testPipeline.id, context: inputData });
-                    setTestEvents([{ event_type: 'started', message: `测试已提交 (Run #${resp.run_id.slice(0, 8)})`, timestamp: new Date().toISOString() }]);
-                    let attempts = 0;
-                    const poll = setInterval(async () => {
-                      attempts++;
-                      try {
-                        const result: any = await api.getRun(resp.run_id);
-                        const status = result.run || result;
-                        const statusEvents = (status.events || []) as any[];
-                        if (statusEvents.length > testEvents.length) {
-                          setTestEvents(prev => {
-                            const existingIds = new Set(prev.map((e: any) => e.node_id || e.event_type));
-                            const newEvents = statusEvents.filter((e: any) => !existingIds.has(e.id || e.node_id)).map((e: any) => ({
-                              node_id: e.node_id || e.id, event_type: e.event_type || e.type || 'step',
-                              message: e.message || e.data?.message || JSON.stringify(e.data || {}),
-                              timestamp: e.timestamp || new Date().toISOString()
-                            }));
-                            return [...prev, ...newEvents];
-                          });
-                        }
-                        const st = (status as any).status || (status as any).state;
-                        if (['completed', 'failed', 'cancelled'].includes(st) || attempts > 60) {
-                          clearInterval(poll);
-                          setTestEvents(prev => [...prev, { event_type: st, message: `流水线${st === 'completed' ? '执行完成' : st === 'failed' ? '执行失败' : '已取消'}`, timestamp: new Date().toISOString() }]);
-                        }
-                      } catch { clearInterval(poll); }
-                    }, 1500);
-                  } catch (e: any) {
-                    setTestEvents([{ event_type: 'error', message: '提交测试失败: ' + (e.message || '未知'), timestamp: new Date().toISOString() }]);
-                  } finally { setTestRunning(false); }
-                }} disabled={testRunning}
-                  className="px-4 py-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 rounded-xl text-sm font-medium transition-colors">
-                  {testRunning ? '提交中...' : '运行测试'}
-                </button>
-                {testEvents.length > 0 && (
-                  <div>
-                    <h3 className="text-xs font-semibold text-gray-400 mb-2 uppercase">执行日志</h3>
-                    <div className="space-y-1.5 max-h-64 overflow-y-auto">
-                      {testEvents.map((ev, i) => {
-                        const colorMap: Record<string, string> = { started: 'text-blue-400', step: 'text-gray-300', completed: 'text-emerald-400', failed: 'text-red-400', cancelled: 'text-yellow-400', error: 'text-red-500' };
-                        return (
-                          <div key={i} className="flex items-start gap-2 text-xs">
-                            <span className={`shrink-0 mt-0.5 ${colorMap[ev.event_type || ''] || 'text-gray-400'}`}>
-                              {ev.event_type === 'started' ? '' : ev.event_type === 'completed' ? '' : ev.event_type === 'failed' ? '' : ''}
-                            </span>
-                            <div className="flex-1">
-                              {ev.node_id && <span className="font-mono text-[10px] px-1 py-0.5 bg-gray-800 rounded text-gray-400 mr-1.5">{ev.node_id}</span>}
-                              <span className="text-gray-300">{ev.message}</span>
-                            </div>
-                            {ev.timestamp && <span className="shrink-0 text-[10px] text-gray-600">{new Date(ev.timestamp).toLocaleTimeString()}</span>}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          </div>
+          <TestPipelineModal
+            instance={inst}
+            onClose={() => setShowTest(null)}
+            onFinished={() => { loadRuns(); if (selectedInstance?.id === inst.id) selectInstance(selectedInstance); }}
+          />
         );
       })()}
 
+      {/* ====== Run 详情（流水线对话） ====== */}
+      {(viewRunLoading || viewRun) && (
+        <RunDialogModal
+          loading={viewRunLoading}
+          run={viewRun}
+          onClose={() => { setViewRun(null); setViewRunLoading(false); }}
+        />
+      )}
     </div>
   );
 }
@@ -676,12 +764,14 @@ function RunStatusBadge({ status }: { status: string }) {
   );
 }
 
-function PipelineDetailPanel({ pipeline, onEdit, onTest, submitting, isCustom }: {
+function PipelineDetailPanel({ pipeline, onEdit, onPrimary, primaryLabel, submitting, isCustom, hideActions }: {
   pipeline: UnifiedPipeline;
-  onEdit: () => void;
-  onTest: () => void;
-  submitting: boolean;
-  isCustom: boolean;
+  onEdit?: () => void;
+  onPrimary?: () => void;
+  primaryLabel?: string;
+  submitting?: boolean;
+  isCustom?: boolean;
+  hideActions?: boolean;
 }) {
   const [viewMode, setViewMode] = useState<'list' | 'graph'>('graph');
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
@@ -809,8 +899,14 @@ function PipelineDetailPanel({ pipeline, onEdit, onTest, submitting, isCustom }:
           <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{pipeline.description || '无描述'}</p>
         </div>
         <div className="flex gap-2">
-          {isCustom && (<button onClick={onEdit} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300 hover:bg-slate-200">编辑</button>)}
-          <button onClick={onTest} disabled={submitting} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50">{submitting ? '提交中...' : '测试'}</button>
+          {!hideActions && isCustom && onEdit && (
+            <button onClick={onEdit} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-100 text-slate-600 dark:bg-slate-700 dark:text-slate-300 hover:bg-slate-200">编辑</button>
+          )}
+          {!hideActions && onPrimary && (
+            <button onClick={onPrimary} disabled={submitting} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50">
+              {submitting ? '提交中...' : (primaryLabel || '执行')}
+            </button>
+          )}
         </div>
       </div>
 
@@ -1128,81 +1224,8 @@ function Field({ label, value, mono, long }: { label: string; value?: string; mo
   );
 }
 
-function PipelineEditPanel({ pipeline, editData, setEditData, onSave, onCancel }: {
-  pipeline: UnifiedPipeline;
-  editData: Partial<UnifiedPipeline>;
-  setEditData: (d: Partial<UnifiedPipeline>) => void;
-  onSave: () => void;
-  onCancel: () => void;
-}) {
-  return (
-    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5 space-y-4">
-      <h2 className="text-lg font-bold text-slate-900 dark:text-slate-100">编辑: {pipeline.name}</h2>
-
-      <label className="block">
-        <span className="text-xs font-medium text-slate-500">名称</span>
-        <input
-          type="text"
-          value={editData.name || ''}
-          onChange={e => setEditData({ ...editData, name: e.target.value })}
-          className="mt-1 w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100"
-        />
-      </label>
-
-      <label className="block">
-        <span className="text-xs font-medium text-slate-500">描述</span>
-        <textarea
-          value={editData.description || ''}
-          onChange={e => setEditData({ ...editData, description: e.target.value })}
-          rows={3}
-          className="mt-1 w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 resize-none"
-        />
-      </label>
-
-      <label className="block">
-        <span className="text-xs font-medium text-slate-500">节点定义 (JSON)</span>
-        <textarea
-          value={JSON.stringify(editData.nodes || [], null, 2)}
-          onChange={e => {
-            try {
-              const parsed = JSON.parse(e.target.value);
-              setEditData({ ...editData, nodes: parsed });
-            } catch { /* invalid JSON, ignore */ }
-          }}
-          rows={10}
-          className="mt-1 w-full px-3 py-2 text-xs font-mono border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 resize-none"
-        />
-      </label>
-
-      <label className="block">
-        <span className="text-xs font-medium text-slate-500">边定义 (JSON)</span>
-        <textarea
-          value={JSON.stringify(editData.edges || [], null, 2)}
-          onChange={e => {
-            try {
-              const parsed = JSON.parse(e.target.value);
-              setEditData({ ...editData, edges: parsed });
-            } catch { /* ignore */ }
-          }}
-          rows={5}
-          className="mt-1 w-full px-3 py-2 text-xs font-mono border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 resize-none"
-        />
-      </label>
-
-      <div className="flex gap-2 pt-2">
-        <button onClick={onSave} className="px-4 py-2 bg-blue-600 text-white text-sm rounded-lg hover:bg-blue-700">
-          保存
-        </button>
-        <button onClick={onCancel} className="px-4 py-2 bg-slate-200 dark:bg-slate-700 text-sm rounded-lg">
-          取消
-        </button>
-      </div>
-    </div>
-  );
-}
-
 /* ================================================================
-   CreatePipelineModal — 拖拽流程图编辑器
+   CreatePipelineModal — 拖拽流程图编辑器（新建 & 编辑共用）
    ================================================================ */
 interface CanvasNode {
   id: string;
@@ -1212,16 +1235,25 @@ interface CanvasNode {
   prompt_template?: string;
   description?: string;
   tools?: string[];
-  branches?: Array<{ condition?: string; goto: string; label?: string; default?: boolean }>;
+  branches?: Array<{ when?: string; condition?: string; goto?: string; target?: string; label?: string; default?: boolean }>;
   parallel_branches?: string[];
   confirm_prompt?: string;
   confirm_options?: string[];
+  confirm_branches?: Record<string, string>;
+  decision_prompt?: string;
+  decision_model?: string;
+  decision_expression?: string;
   pipeline_name?: string;
   transform_expr?: string;
   timeout_seconds?: number;
   max_retries?: number;
   merge_strategy?: string;
   max_concurrency?: number;
+  target?: string;
+  error_target?: string;
+  ignore_error?: boolean;
+  // 结束对话节点：true=保留归档，false/缺省=运行完成后回收
+  save_dialog?: boolean;
   x: number;
   y: number;
 }
@@ -1234,48 +1266,280 @@ interface CanvasEdge {
 
 const NCW = 184, NCH = 80;
 
-function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
+/** 分支类节点：目标由节点内分支元数据驱动（画布连线仅作为视图） */
+function isBranchNodeType(t: string) {
+  return t === 'decision' || t === 'ai_decision' || t === 'confirm' || t === 'parallel';
+}
+
+function edgeKey(e: { source: string; target: string }) { return `${e.source}→${e.target}`; }
+
+/** 从模板节点推导连线（与详情页展示一致，供布局与编辑初始化使用） */
+function deriveGraphEdges(nodeList: CanvasNode[]): CanvasEdge[] {
+  const result: CanvasEdge[] = [];
+  for (let i = 0; i < nodeList.length - 1; i++) {
+    const n = nodeList[i];
+    if ((n.type === 'decision' || n.type === 'ai_decision') && n.branches && n.branches.length > 0) {
+      n.branches.forEach((b: any) => {
+        const tgt = b.goto || b.target;
+        if (tgt && tgt !== n.id) result.push({ source: n.id, target: tgt, label: b.label || b.condition || b.when || (b.default ? '默认' : '') });
+      });
+    } else if (n.type === 'confirm' && n.confirm_branches && Object.keys(n.confirm_branches).length > 0) {
+      Object.entries(n.confirm_branches).forEach(([k, v]) => result.push({ source: n.id, target: v as string, label: k }));
+    } else if (n.type === 'parallel' && n.parallel_branches && n.parallel_branches.length > 0) {
+      n.parallel_branches.forEach((b: any) => {
+        const tgt = typeof b === 'string' ? b : (b && b.node_id);
+        if (tgt && tgt !== n.id) result.push({ source: n.id, target: tgt, label: '并行' });
+      });
+    } else {
+      const nx = nodeList[i + 1];
+      if (nx && nx.id !== n.id) result.push({ source: n.id, target: nx.id });
+    }
+  }
+  const seen = new Set<string>();
+  return result.filter(e => {
+    if (e.source === e.target) return false;
+    const k = edgeKey(e);
+    if (seen.has(k)) return false;
+    seen.add(k); return true;
+  });
+}
+
+/** 分层布局：为缺少坐标的模板节点计算画布位置（中心坐标） */
+function layoutTemplateNodes(nodeList: CanvasNode[], edges: CanvasEdge[]): Array<{ id: string; x: number; y: number }> {
+  const out: Array<{ id: string; x: number; y: number }> = [];
+  if (nodeList.length === 0) return out;
+  const nodeMap = new Map(nodeList.map(n => [n.id, n]));
+  const inDegree = new Map<string, number>();
+  const adj = new Map<string, string[]>();
+  nodeList.forEach(n => { inDegree.set(n.id, 0); adj.set(n.id, []); });
+  edges.forEach(e => {
+    if (!nodeMap.has(e.source) || !nodeMap.has(e.target) || e.source === e.target) return;
+    if (!adj.has(e.source)) adj.set(e.source, []);
+    adj.get(e.source)!.push(e.target);
+    inDegree.set(e.target, (inDegree.get(e.target) || 0) + 1);
+  });
+  const layers: string[][] = [];
+  let queue: string[] = [];
+  inDegree.forEach((deg, id) => { if (deg === 0) queue.push(id); });
+  if (queue.length === 0) queue.push(nodeList[0].id);
+  let remaining = nodeList.length;
+  const done = new Set<string>();
+  while (queue.length > 0 && remaining > 0) {
+    const layer: string[] = [];
+    const nextQ: string[] = [];
+    for (const id of queue) {
+      if (done.has(id)) continue;
+      done.add(id); layer.push(id); remaining--;
+      for (const nxt of (adj.get(id) || [])) {
+        if (done.has(nxt)) continue;
+        const nd = (inDegree.get(nxt) || 1) - 1; inDegree.set(nxt, nd);
+        if (nd <= 0) nextQ.push(nxt);
+      }
+    }
+    if (layer.length > 0) layers.push(layer);
+    if (nextQ.length === 0 && remaining > 0) {
+      nodeList.forEach(n => { if (!done.has(n.id)) { layers.push([n.id]); done.add(n.id); remaining--; } });
+      break;
+    }
+    queue = nextQ;
+  }
+  // 层内排序：保持与原列表一致的相对顺序，减少交叉
+  const orderOf = new Map(nodeList.map((n, i) => [n.id, i]));
+  layers.forEach(l => l.sort((a, b) => (orderOf.get(a) || 0) - (orderOf.get(b) || 0)));
+  const sx = NCW + 70, sy = NCH + 46, padL = NCW / 2 + 40, padT = NCH / 2 + 30;
+  layers.forEach((layer, li) => {
+    layer.forEach((nodeId, ni) => {
+      out.push({ id: nodeId, x: padL + li * sx, y: padT + ni * sy });
+    });
+  });
+  return out;
+}
+
+function canvasSizeFor(nodes: CanvasNode[]): { width: number; height: number } {
+  if (nodes.length === 0) return { width: 960, height: 560 };
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  nodes.forEach(n => {
+    minX = Math.min(minX, n.x - NCW / 2); maxX = Math.max(maxX, n.x + NCW / 2);
+    minY = Math.min(minY, n.y - NCH / 2); maxY = Math.max(maxY, n.y + NCH / 2);
+  });
+  return {
+    width: Math.max(Math.ceil(maxX - minX) + 120, 960),
+    height: Math.max(Math.ceil(maxY - minY) + 120, 560),
+  };
+}
+
+function CreatePipelineModal({ initial, onClose, onCreated, onUpdated, showFeedback }: {
+  initial?: UnifiedPipeline | null;
   onClose: () => void;
   onCreated: (name: string) => void;
+  onUpdated?: (name: string) => void;
   showFeedback: (type: 'ok' | 'err', msg: string) => void;
 }) {
-  const [name, setName] = useState('');
-  const [description, setDescription] = useState('');
-  const [pipelineType, setPipelineType] = useState<'manual' | 'auto'>('manual');
+  const isEdit = !!initial;
+  const [name, setName] = useState(initial?.name || '');
+  const [description, setDescription] = useState(initial?.description || '');
+  const [pipelineType, setPipelineType] = useState<'manual' | 'auto'>(initial?.type === 'auto' ? 'auto' : 'manual');
   const [nodes, setNodes] = useState<CanvasNode[]>([]);
   const [edges, setEdges] = useState<CanvasEdge[]>([]);
   const [agents, setAgents] = useState<AgentMetadata[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [connectStart, setConnectStart] = useState<string | null>(null);
   const [dragging, setDragging] = useState<{ id: string; sx: number; sy: number } | null>(null);
+  const [selEdgeKey, setSelEdgeKey] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const svgRef = useRef<SVGSVGElement>(null);
+  const initRef = useRef(false);
 
   // 加载已有智能体列表
   useEffect(() => {
     api.listAgents().then(r => setAgents(r.agents)).catch(() => {});
   }, []);
 
+  // 编辑模板：把模板 nodes 装入画布（自动补坐标 / 推导连线）
+  useEffect(() => {
+    if (!initial || initRef.current) return;
+    initRef.current = true;
+    const raw: any[] = (initial.nodes as any[]) || [];
+    if (raw.length === 0) return;
+    const list: CanvasNode[] = raw.map((n: any) => {
+      const { x, y, ...rest } = n;
+      const b: CanvasNode = { ...rest, x: 0, y: 0 } as CanvasNode;
+      // 兼容老字段
+      if (Array.isArray(b.parallel_branches)) {
+        b.parallel_branches = b.parallel_branches.map((pb: any) => typeof pb === 'string' ? pb : (pb && pb.node_id) || '').filter(Boolean);
+      }
+      if (!b.confirm_branches) b.confirm_branches = {};
+      return b;
+    }).filter((n: any) => n && n.id);
+    // 优先用存储边，否则从节点分支/顺序推导（仅作编辑底稿）
+    let es: CanvasEdge[] = ((initial.edges as any[]) || []).map((e: any) => ({ source: e.source, target: e.target, label: e.label || '' }));
+    if (es.length === 0) es = deriveGraphEdges(list);
+    // 既有显式连线也要与分支节点合并展示（去重）
+    const derived = deriveGraphEdges(list);
+    const seen = new Set(es.map(edgeKey));
+    derived.forEach(e => { if (!seen.has(edgeKey(e))) { es.push(e); seen.add(edgeKey(e)); } });
+    const placed = layoutTemplateNodes(list, es);
+    const posMap = new Map(placed.map(p => [p.id, p]));
+    const positioned = list.map((n, i) => {
+      const p = posMap.get(n.id);
+      if (p) return { ...n, x: p.x, y: p.y };
+      return { ...n, x: 120 + (i % 4) * 230, y: 80 + Math.floor(i / 4) * 130 };
+    });
+    setNodes(positioned);
+    setEdges(es);
+  }, [initial]);
+
   const selectedNode = selectedNodeId ? nodes.find(n => n.id === selectedNodeId) : null;
 
+  function nextNodeId() {
+    let max = 0;
+    nodes.forEach(n => { const m = /^node_(\d+)$/.exec(n.id); if (m) max = Math.max(max, parseInt(m[1], 10)); });
+    return `node_${max + 1}`;
+  }
+
   function addNode(nodeType: string) {
-    const idx = nodes.length + 1;
+    const id = nextNodeId();
+    const count = nodes.length + 1;
     setNodes(prev => [...prev, {
-      id: `node_${idx}`, type: nodeType, display_name: '',
-      x: 180 + Math.random() * 300, y: 100 + Math.random() * 350,
+      id, type: nodeType, display_name: '',
+      x: 160 + (count % 3) * 230 + Math.random() * 40, y: 120 + (count % 4) * 120,
     }]);
+    setSelectedNodeId(id);
   }
 
   function updateNode(updates: Partial<CanvasNode>) {
-    setNodes(prev => prev.map(n => n.id === selectedNodeId ? { ...n, ...updates } : n));
+    const cur = nodes.find(n => n.id === selectedNodeId);
+    if (!cur) return;
+    const oldId = cur.id;
+    const nextId = (updates.id || '').trim();
+    // 改名后级联修正其它节点引用与连线，避免产生悬空引用
+    const renamed = nextId !== '' && nextId !== oldId;
+    setNodes(prev => prev.map(n => {
+      let nn: CanvasNode = n.id === selectedNodeId ? { ...n, ...updates } : { ...n };
+      if (!renamed) return nn;
+      const ref = (v: string | undefined) => (v === oldId ? nextId : v);
+      if (n.id === oldId) nn.id = nextId;
+      nn.target = ref(nn.target);
+      nn.error_target = ref(nn.error_target);
+      if (Array.isArray(nn.branches)) nn.branches = nn.branches.map(b =>
+        ((b.goto || b.target) === oldId) ? { ...b, goto: nextId, target: nextId } : b);
+      if (Array.isArray(nn.parallel_branches)) nn.parallel_branches = nn.parallel_branches.map(pb => pb === oldId ? nextId : pb);
+      if (nn.confirm_branches) {
+        const cb: Record<string, string> = {};
+        Object.entries(nn.confirm_branches).forEach(([k, v]) => { cb[k] = v === oldId ? nextId : v; });
+        nn.confirm_branches = cb;
+      }
+      return nn;
+    }));
+    if (renamed) {
+      setEdges(prev => prev.map(e => ({
+        ...e,
+        source: e.source === oldId ? nextId : e.source,
+        target: e.target === oldId ? nextId : e.target,
+      })));
+      setSelectedNodeId(nextId);
+    }
   }
 
+  /** 删除节点时同步清除其它节点内对该节点的引用，避免“删不掉/校验失败” */
   function deleteNode() {
     if (!selectedNodeId) return;
-    setNodes(prev => prev.filter(n => n.id !== selectedNodeId));
-    setEdges(prev => prev.filter(e => e.source !== selectedNodeId && e.target !== selectedNodeId));
+    const dead = selectedNodeId;
+    setNodes(prev => prev
+      .filter(n => n.id !== dead)
+      .map(n => {
+        let next = { ...n };
+        if (next.target === dead) next.target = undefined;
+        if (next.error_target === dead) next.error_target = undefined;
+        if (Array.isArray(next.branches)) next.branches = next.branches.filter(b => (b.goto || b.target) !== dead);
+        if (Array.isArray(next.parallel_branches)) next.parallel_branches = next.parallel_branches.filter(b => b !== dead);
+        if (next.confirm_branches) {
+          const cb: Record<string, string> = {};
+          Object.entries(next.confirm_branches).forEach(([k, v]) => { if (v !== dead) cb[k] = v; });
+          next.confirm_branches = cb;
+        }
+        return next;
+      }));
+    setEdges(prev => prev.filter(e => e.source !== dead && e.target !== dead));
     setSelectedNodeId(null);
   }
+
+  function deleteEdge() {
+    if (!selEdgeKey) return;
+    const [s, t] = selEdgeKey.split('→');
+    setEdges(prev => prev.filter(e => !(e.source === s && e.target === t)));
+    // 若该连线源节点是分支类节点，则同步删除对应分支元数据
+    setNodes(prev => prev.map(n => {
+      if (n.id !== s) return n;
+      let next = { ...n };
+      if (n.type === 'decision' || n.type === 'ai_decision') {
+        next.branches = (n.branches || []).filter(b => (b.goto || b.target) !== t);
+      } else if (n.type === 'confirm' && n.confirm_branches) {
+        const cb: Record<string, string> = {};
+        Object.entries(n.confirm_branches).forEach(([k, v]) => { if (v !== t) cb[k] = v; });
+        next.confirm_branches = cb;
+      } else if (n.type === 'parallel' && Array.isArray(n.parallel_branches)) {
+        next.parallel_branches = n.parallel_branches.filter(pb => pb !== t);
+      }
+      return next;
+    }));
+    setSelEdgeKey(null);
+  }
+
+  /** 点键盘 Delete/Backspace 删除选中的节点或连线（输入框聚焦时不触发） */
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const el = e.target as HTMLElement;
+      if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable)) return;
+      if ((e.key === 'Delete' || e.key === 'Backspace')) {
+        if (selEdgeKey) { e.preventDefault(); deleteEdge(); }
+        else if (selectedNodeId) { e.preventDefault(); deleteNode(); }
+      }
+      if (e.key === 'Escape') { setConnectStart(null); setSelEdgeKey(null); setSelectedNodeId(null); }
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
 
   function svgCoords(e: React.MouseEvent): { x: number; y: number } {
     const svg = svgRef.current;
@@ -1296,17 +1560,61 @@ function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
     const coords = svgCoords(e);
     setDragging({ id: nodeId, sx: coords.x - node.x, sy: coords.y - node.y });
     setSelectedNodeId(nodeId);
+    setSelEdgeKey(null);
+  }
+
+  function handleEdgeClick(e: React.MouseEvent, key: string) {
+    e.stopPropagation();
+    setSelEdgeKey(prev => prev === key ? null : key);
+    setSelectedNodeId(null);
+  }
+
+  /** 分支类节点连线时自动写入分支元数据，保证运行路由生效 */
+  function linkBranchMeta(n: CanvasNode, targetId: string): CanvasNode {
+    const upd: CanvasNode = { ...n };
+    if (n.type === 'decision' || n.type === 'ai_decision') {
+      const brs = n.branches || [];
+      if (!brs.some(b => (b.goto || b.target) === targetId)) {
+        const anyDefault = brs.some(b => !!b.default);
+        upd.branches = [...brs, {
+          target: targetId, goto: targetId, condition: '', label: `分支${brs.length + 1}`,
+          default: !anyDefault && brs.length === 0,
+        }];
+      }
+    } else if (n.type === 'confirm') {
+      const opts = (n.confirm_options || []).slice();
+      if (opts.length === 0) opts.push('确认');
+      const cb = { ...(n.confirm_branches || {}) };
+      let opt: string | null = null;
+      for (const o of opts) if (!cb[o]) { opt = o; break; }
+      if (!opt) { opt = `操作${Object.keys(cb).length + 1}`; opts.push(opt); }
+      cb[opt] = targetId;
+      upd.confirm_options = opts;
+      upd.confirm_branches = cb;
+    } else if (n.type === 'parallel') {
+      const pb = n.parallel_branches || [];
+      if (!pb.includes(targetId)) upd.parallel_branches = [...pb, targetId];
+    }
+    return upd;
   }
 
   function handlePortClick(e: React.MouseEvent, nodeId: string, port: 'out' | 'in') {
     e.stopPropagation();
     if (port === 'out') {
-      setConnectStart(nodeId);
+      setSelEdgeKey(null);
+      setConnectStart(prev => prev === nodeId ? null : nodeId);
     } else if (port === 'in' && connectStart && connectStart !== nodeId) {
-      if (!edges.some(ed => ed.source === connectStart && ed.target === nodeId)) {
-        setEdges(prev => [...prev, { source: connectStart, target: nodeId }]);
+      const src = connectStart;
+      if (!nodes.some(n => n.id === src)) { setConnectStart(null); return; }
+      const srcType = nodes.find(n => n.id === src)?.type || '';
+      if (!edges.some(ed => ed.source === src && ed.target === nodeId)) {
+        setEdges(prev => [...prev, { source: src, target: nodeId }]);
+      }
+      if (isBranchNodeType(srcType)) {
+        setNodes(prev => prev.map(n => n.id === src ? linkBranchMeta(n, nodeId) : n));
       }
       setConnectStart(null);
+      setSelEdgeKey(null);
     }
   }
 
@@ -1320,25 +1628,123 @@ function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
   }
   function handleSvgMouseUp() { setDragging(null); }
 
+  /** 画布展示 = 已存连线 + 从分支元数据实时推导的连线（去重） */
+  const displayEdges = (() => {
+    const out: CanvasEdge[] = [];
+    const seen = new Set<string>();
+    edges.forEach(e => { out.push(e); seen.add(edgeKey(e)); });
+    for (const n of nodes) {
+      if ((n.type === 'decision' || n.type === 'ai_decision') && n.branches) {
+        n.branches.forEach((b: any) => {
+          const t = b.goto || b.target;
+          if (t && t !== n.id && !seen.has(edgeKey({ source: n.id, target: t }))) {
+            seen.add(edgeKey({ source: n.id, target: t }));
+            out.push({ source: n.id, target: t, label: b.label || b.condition || b.when || (b.default ? '默认' : '') });
+          }
+        });
+      } else if (n.type === 'confirm' && n.confirm_branches) {
+        Object.entries(n.confirm_branches).forEach(([k, v]) => {
+          if (v && !seen.has(edgeKey({ source: n.id, target: v }))) {
+            seen.add(edgeKey({ source: n.id, target: v }));
+            out.push({ source: n.id, target: v, label: k });
+          }
+        });
+      } else if (n.type === 'parallel' && n.parallel_branches) {
+        n.parallel_branches.forEach(pb => {
+          if (pb && !seen.has(edgeKey({ source: n.id, target: pb }))) {
+            seen.add(edgeKey({ source: n.id, target: pb }));
+            out.push({ source: n.id, target: pb, label: '并行' });
+          }
+        });
+      }
+      if (n.target && n.target !== n.id && !seen.has(edgeKey({ source: n.id, target: n.target }))) {
+        seen.add(edgeKey({ source: n.id, target: n.target }));
+        out.push({ source: n.id, target: n.target, label: '继续' });
+      }
+    }
+    return out;
+  })();
+
+  /** 节点保存前校验：发现悬空分支引用、无入口等基础问题 */
+  function validateGraph(): string[] {
+    const problems: string[] = [];
+    if (nodes.length === 0) { problems.push('尚未添加任何节点'); return problems; }
+    const seenIds = new Map<string, number>();
+    nodes.forEach(n => {
+      if (!n.id.trim()) problems.push('存在空节点 ID，请为每个节点填写 ID');
+      else if (!/^[A-Za-z0-9_.-]+$/.test(n.id)) problems.push(`节点 ID「${n.id}」含非法字符，仅允许字母数字 . _ -`);
+      seenIds.set(n.id, (seenIds.get(n.id) || 0) + 1);
+    });
+    seenIds.forEach((cnt, id) => { if (cnt > 1) problems.push(`节点 ID「${id}」重复出现 ${cnt} 次，请改为唯一`); });
+    if (problems.length > 0) return problems;
+    const nodeIds = new Set(nodes.map(n => n.id));
+    nodes.forEach(n => {
+      const refs: string[] = [];
+      if (n.target) refs.push(n.target);
+      if (n.error_target) refs.push(n.error_target);
+      (n.branches || []).forEach(b => { const t = b.goto || b.target; if (t) refs.push(t); });
+      (n.parallel_branches || []).forEach(b => refs.push(b));
+      Object.values(n.confirm_branches || {}).forEach(v => refs.push(v));
+      refs.forEach(r => { if (r && !nodeIds.has(r)) problems.push(`节点 ${n.id} 引用了不存在的节点「${r}」`); });
+    });
+    // 分支条件缺失提示（默认分支允许留空）
+    nodes.forEach(n => {
+      if ((n.type === 'decision' || n.type === 'ai_decision') && (n.branches || []).length > 0) {
+        (n.branches || []).forEach((b, i) => {
+          const hasTarget = !!(b.goto || b.target);
+          if (!hasTarget) problems.push(`节点 ${n.id} 第 ${i + 1} 个分支缺少跳转目标`);
+        });
+        const defaultCount = (n.branches || []).filter(b => !!b.default).length;
+        if (defaultCount > 1) problems.push(`节点 ${n.id} 有 ${defaultCount} 个默认分支，只能保留一个`);
+      }
+    });
+    return problems;
+  }
+
   async function handleSave() {
     if (!name.trim()) { showFeedback('err', '请填写流水线名称'); return; }
+    const problems = validateGraph();
+    if (problems.length > 0) { showFeedback('err', problems[0]); return; }
     setCreating(true);
     try {
       const payload = {
         name: name.trim(),
         description: description || undefined,
         type: pipelineType,
-        nodes: nodes.map(n => { const { x, y, ...rest } = n; return rest; }),
+        category: (initial as any)?.category || undefined,
+        tags: (initial as any)?.tags || undefined,
+        nodes: nodes.map(n => {
+          const { x, y, ...rest } = n;
+          // 清理空引用，避免后端校验报错
+          const nn: any = { ...rest };
+          if (nn.branches && Array.isArray(nn.branches)) nn.branches = nn.branches.filter((b: any) => b.goto || b.target || b.default);
+          if (nn.parallel_branches) nn.parallel_branches = nn.parallel_branches.filter(Boolean);
+          if (nn.confirm_branches) {
+            const cb: Record<string, string> = {};
+            Object.entries(nn.confirm_branches).forEach(([k, v]) => { if (v) cb[k] = v; });
+            nn.confirm_branches = Object.keys(cb).length ? cb : undefined;
+          }
+          if (nn.target === '') delete nn.target;
+          if (nn.error_target === '') delete nn.error_target;
+          return nn;
+        }),
         edges: edges.map(e => ({ source: e.source, target: e.target, label: e.label || undefined })),
         steps: nodes.map(n => ({ agent_name: n.agent || n.id, display_name: n.display_name || n.id, description: n.type || 'agent' })),
       };
-      await (api as any).createCustomPipeline(payload);
-      onCreated(name.trim());
-    } catch (e: any) { showFeedback('err', '创建失败: ' + (e.message || '')); }
-    finally { setCreating(false); }
+      if (isEdit && initial) {
+        await (api as any).updateCustomPipeline(initial.id, payload);
+        onUpdated && onUpdated(name.trim());
+      } else {
+        await (api as any).createCustomPipeline(payload);
+        onCreated(name.trim());
+      }
+    } catch (e: any) {
+      showFeedback('err', (isEdit ? '保存' : '创建') + '失败: ' + (e.message || ''));
+    } finally { setCreating(false); }
   }
 
   const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null);
+  const dims = canvasSizeFor(nodes);
 
   return (
     <div className="fixed inset-0 z-50 flex bg-black/60" onClick={onClose}>
@@ -1346,7 +1752,7 @@ function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-3 border-b border-gray-800 shrink-0">
           <div className="flex items-center gap-4">
-            <h2 className="text-base font-semibold text-slate-100">新建流水线（拖拽编排）</h2>
+            <h2 className="text-base font-semibold text-slate-100">{isEdit ? '编辑模板（拖拽编排）' : '新建流水线（拖拽编排）'}</h2>
             <input type="text" value={name} onChange={e => setName(e.target.value)} placeholder="流水线名称 *"
               className="w-48 px-3 py-1.5 bg-gray-800 border border-gray-700 rounded-lg text-sm text-gray-200 placeholder-gray-600 outline-none focus:border-blue-500" />
             <input type="text" value={description} onChange={e => setDescription(e.target.value)} placeholder="描述（可选）"
@@ -1361,7 +1767,17 @@ function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
             </div>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-[10px] text-gray-500">{nodes.length} 节点, {edges.length} 连线</span>
+            <span className="text-[10px] text-gray-500">{nodes.length} 节点, {displayEdges.length} 连线</span>
+            {selEdgeKey && (
+              <button onClick={deleteEdge} title="删除选中的连线（节点分支目标也会同步清理）"
+                className="flex items-center gap-1 px-2 py-1 rounded-lg text-[10px] font-medium text-red-300 bg-red-500/10 border border-red-500/30 hover:bg-red-500/20">
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24"><path strokeLinecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
+                删除选中连线
+              </button>
+            )}
+            {isEdit && (
+              <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/10 text-amber-300 border border-amber-500/20">编辑模式</span>
+            )}
             <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-400">
               <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
             </button>
@@ -1392,10 +1808,10 @@ function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
 
           {/* Center canvas */}
           <div className="flex-1 flex flex-col overflow-hidden">
-            <div className="relative flex-1 bg-gray-950 border-b border-gray-800"
+            <div className="relative flex-1 bg-gray-950 border-b border-gray-800 overflow-auto"
               onMouseMove={(e) => { handleSvgMouseMove(e); if (connectStart) setMousePos(svgCoords(e)); }}
               onMouseUp={handleSvgMouseUp} onMouseLeave={() => { setDragging(null); }}>
-              <svg ref={svgRef} width="100%" height="100%" style={{ display: 'block' }}>
+              <svg ref={svgRef} width={dims.width} height={dims.height} style={{ display: 'block', minWidth: '100%', minHeight: '100%' }}>
                 <defs>
                   {/* 阴影 */}
                   <filter id="cvShadow" x="-20%" y="-20%" width="140%" height="140%">
@@ -1424,9 +1840,9 @@ function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
                   </pattern>
                 </defs>
                 {/* 网格背景 */}
-                <rect width="100%" height="100%" fill="url(#cvGrid)" />
-                {/* 边：贝塞尔曲线 */}
-                {edges.map((e, i) => {
+                <rect width={dims.width} height={dims.height} fill="url(#cvGrid)" />
+                {/* 边：贝塞尔曲线（点击选中，Delete/Backspace 或中点 ╳ 删除） */}
+                {displayEdges.map((e) => {
                   const sn = nodes.find(n => n.id === e.source);
                   const tn = nodes.find(n => n.id === e.target);
                   if (!sn || !tn) return null;
@@ -1434,15 +1850,28 @@ function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
                   const x2 = tn.x, y2 = tn.y - NCH / 2;
                   const dx = Math.abs(x2 - x1) * 0.4;
                   const d = `M ${x1} ${y1} C ${x1} ${y1 + dx}, ${x2} ${y2 - dx}, ${x2} ${y2}`;
+                  const key = edgeKey(e);
+                  const isSel = selEdgeKey === key;
+                  const lx = (x1 + x2) / 2, ly = (sn.y + tn.y) / 2;
                   return (
-                    <g key={`edge-${i}`}>
-                      <path d={d} fill="none" stroke="#334155" strokeWidth={5} opacity="0.3" />
-                      <path d={d} fill="none" stroke="#64748b" strokeWidth={2} strokeLinecap="round" markerEnd="url(#cvArrow)" />
-                      {e.label && (
+                    <g key={`edge-${key}`}>
+                      <path d={d} fill="none" stroke={isSel ? '#3b82f6' : '#334155'} strokeWidth={isSel ? 10 : 6} opacity={isSel ? 0.22 : 0.28}
+                        style={{ cursor: 'pointer' }} onClick={ev => handleEdgeClick(ev, key)} />
+                      <path d={d} fill="none" stroke={isSel ? '#60a5fa' : '#64748b'} strokeWidth={isSel ? 2.5 : 2} strokeLinecap="round"
+                        markerEnd="url(#cvArrow)" style={{ pointerEvents: 'none' }} />
+                      {e.label ? (
                         <>
-                          <rect x={(x1 + x2) / 2 - 30} y={(sn.y + tn.y) / 2 - 13} width={60} height={16} rx={8} fill="#1e293b" stroke="#334155" strokeWidth={0.5} />
-                          <text x={(x1 + x2) / 2} y={(sn.y + tn.y) / 2 - 2} textAnchor="middle" fill="#cbd5e1" fontSize={9} fontWeight={600}>{e.label}</text>
+                          <rect x={lx - 34} y={ly - 13} width={68} height={16} rx={8}
+                            fill={isSel ? '#1e40af' : '#1e293b'} stroke={isSel ? '#60a5fa' : '#334155'} strokeWidth={0.5}
+                            style={{ pointerEvents: 'none' }} />
+                          <text x={lx} y={ly - 2} textAnchor="middle" fill="#cbd5e1" fontSize={9} fontWeight={600}>{e.label}</text>
                         </>
+                      ) : null}
+                      {isSel && (
+                        <g onClick={ev => { ev.stopPropagation(); deleteEdge(); }} style={{ cursor: 'pointer' }}>
+                          <circle cx={lx} cy={ly + 24} r={8} fill="#dc2626" stroke="#7f1d1d" strokeWidth={1} />
+                          <path d={`M ${lx - 3} ${ly + 21} l 6 6 M ${lx + 3} ${ly + 21} l -6 6`} stroke="#fff" strokeWidth={1.6} strokeLinecap="round" />
+                        </g>
                       )}
                     </g>
                   );
@@ -1505,8 +1934,8 @@ function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
               </svg>
             </div>
             <div className="h-6 bg-gray-900/80 backdrop-blur border-t border-gray-800 flex items-center justify-between px-4">
-              <span className="text-[10px] text-gray-600">拖拽移动节点 | 点击 ○ 端口连线 | 点击节点编辑配置</span>
-              <span className="text-[10px] text-gray-600">{nodes.length} 节点 · {edges.length} 连线</span>
+              <span className="text-[10px] text-gray-600">拖拽移动 · ○ 端口连线 · 点击连线/节点后用 Delete/Backspace 删除 · Esc 取消选择</span>
+              <span className="text-[10px] text-gray-600">{nodes.length} 节点 · {displayEdges.length} 连线</span>
             </div>
           </div>
 
@@ -1518,14 +1947,30 @@ function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
                   <div className="text-xs font-semibold" style={{ color: NODE_COLORS[selectedNode.type] || '#94a3b8' }}>
                     {NODE_LABELS[selectedNode.type] || selectedNode.type} 配置
                   </div>
-                  <button onClick={deleteNode} className="p-1 rounded text-red-400 hover:bg-red-500/10">
-                    <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <span className="text-[9px] text-gray-600 font-mono">#{selectedNode.id}</span>
+                    <button onClick={deleteNode} title="删除该节点（自动清理引用它的分支/连线）"
+                      className="flex items-center gap-1 px-2 py-1 rounded-lg text-red-400 bg-red-500/10 border border-red-500/25 text-[10px] font-medium hover:bg-red-500/20">
+                      删除
+                    </button>
+                  </div>
                 </div>
-                <NodeConfigForm node={selectedNode} onChange={updateNode} agents={agents} />
+                <NodeConfigForm node={selectedNode} onChange={updateNode} agents={agents} allNodes={nodes} />
+                <div className="pt-1 border-t border-gray-800 mt-1">
+                  <p className="text-[9px] text-gray-600 leading-relaxed">
+                    分支类节点（条件/AI决策/确认/并行）：连出线会自动写入右侧分支目标；条件、默认分支可在此配置。
+                  </p>
+                </div>
               </>
             ) : (
-              <div className="text-[10px] text-gray-500 pt-8 text-center">点击画布节点<br/>编辑配置</div>
+              <div className="text-[10px] text-gray-500 pt-6 text-center space-y-3">
+                <div>点击画布节点<br/>编辑配置</div>
+                {selEdgeKey && (
+                  <button onClick={deleteEdge} className="px-3 py-1.5 rounded-lg text-red-300 bg-red-500/10 border border-red-500/30 text-[11px] hover:bg-red-500/20">
+                    删除选中的连线
+                  </button>
+                )}
+              </div>
             )}
           </div>
         </div>
@@ -1534,19 +1979,33 @@ function CreatePipelineModal({ onClose, onCreated, showFeedback }: {
         <div className="flex items-center justify-between px-5 py-3 border-t border-gray-800 shrink-0">
           <span className="text-[10px] text-gray-500">{nodes.length > 0 ? `${nodes.length} 个节点` : '请从左侧面板添加节点'}</span>
           <div className="flex items-center gap-3">
+            {isEdit && (
+              <span className="text-[10px] text-amber-400/80 max-w-[280px] truncate">模板 {initial?.name} 的节点结构将整体替换</span>
+            )}
             <button onClick={onClose} className="px-4 py-2 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-xl text-sm text-gray-300">取消</button>
             <button onClick={handleSave} disabled={creating || !name.trim()}
               className="px-5 py-2 bg-blue-600 hover:bg-blue-700 disabled:bg-gray-800 disabled:text-gray-600 rounded-xl text-sm font-medium">
-              {creating ? '创建中...' : '确认创建'}
+              {creating ? (isEdit ? '保存中...' : '创建中...') : (isEdit ? '保存修改' : '确认创建')}
             </button>
           </div>
         </div>
+        {/* 全画布节点 ID 自动补全（分支目标 / 错误目标 / 并行目标输入框共用） */}
+        <datalist id="cvNodeOptions">
+          {nodes.map(n => (
+            <option key={n.id} value={n.id}>{n.display_name || n.id}</option>
+          ))}
+        </datalist>
       </div>
     </div>
   );
 }
 
-function NodeConfigForm({ node, onChange, agents }: { node: CanvasNode; onChange: (u: Partial<CanvasNode>) => void; agents: AgentMetadata[] }) {
+function NodeConfigForm({ node, onChange, agents, allNodes }: {
+  node: CanvasNode;
+  onChange: (u: Partial<CanvasNode>) => void;
+  agents: AgentMetadata[];
+  allNodes?: CanvasNode[];
+}) {
   return (
     <div className="space-y-2.5">
       <label className="block">
@@ -1578,19 +2037,60 @@ function NodeConfigForm({ node, onChange, agents }: { node: CanvasNode; onChange
           </label>
         </>
       )}
-      {node.type === 'decision' && (
-        <div>
-          <span className="text-[10px] text-gray-500">分支条件</span>
-          <BranchesEditor node={node} onChange={onChange} />
+      {(node.type === 'decision' || node.type === 'ai_decision') && (
+        <div className="space-y-1.5">
+          <span className="text-[10px] text-gray-500">{node.type === 'ai_decision' ? 'AI 决策路由' : '条件分支路由'}</span>
+          <p className="text-[9px] text-gray-600 leading-relaxed">条件为空的分支作为兜底（勾选“默认”）。也可在画布从本节点输出端口连到目标节点自动生成分支。</p>
+          <BranchesEditor node={node} onChange={onChange} allNodes={allNodes} />
         </div>
       )}
+      {node.type === 'ai_decision' && (
+        <>
+          <label className="block">
+            <span className="text-[10px] text-gray-500">决策模型（留空用流水线默认模型）</span>
+            <input type="text" value={node.decision_model || ''} onChange={e => onChange({ decision_model: e.target.value })}
+              placeholder="如 deepseek-chat / gpt-4o"
+              className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 font-mono outline-none focus:border-blue-500" />
+          </label>
+          <label className="block">
+            <span className="text-[10px] text-gray-500">AI 决策指令</span>
+            <textarea value={node.decision_prompt || ''} onChange={e => onChange({ decision_prompt: e.target.value })}
+              rows={3} className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500 resize-none"
+              placeholder={'判断输入后输出与某个分支标签（label）一致的短词，例如 verdict: blocked'} />
+          </label>
+        </>
+      )}
       {node.type === 'parallel' && (
-        <label className="block">
-          <span className="text-[10px] text-gray-500">并行目标ID（逗号分隔）</span>
-          <input type="text" value={(node.parallel_branches || []).join(', ')}
-            onChange={e => onChange({ parallel_branches: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })}
-            className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500" />
-        </label>
+        <>
+          <label className="block">
+            <span className="text-[10px] text-gray-500">并行子分支目标ID（逗号分隔）</span>
+            <input list="cvNodeOptions" type="text" value={(node.parallel_branches || []).join(', ')}
+              onChange={e => onChange({ parallel_branches: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })}
+              className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500" />
+            <p className="text-[9px] text-gray-600 mt-0.5">在画布上从「并行」节点输出端口分别连到子分支节点，会自动加入此列表。</p>
+          </label>
+          <label className="block">
+            <span className="text-[10px] text-gray-500">最大并发数</span>
+            <input type="number" min={1} max={10} value={node.max_concurrency ?? ''}
+              onChange={e => onChange({ max_concurrency: e.target.value === '' ? undefined : Math.max(1, Math.min(10, Math.floor(Number(e.target.value)))) })}
+              className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500" />
+          </label>
+          <label className="block">
+            <span className="text-[10px] text-gray-500">并行收尾后 → 下一节点</span>
+            <input list="cvNodeOptions" type="text" value={node.target || ''}
+              onChange={e => onChange({ target: e.target.value })}
+              placeholder="不填则按模板顺序寻找后续节点"
+              className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 font-mono outline-none focus:border-blue-500" />
+          </label>
+          <label className="block">
+            <span className="text-[10px] text-gray-500">合并策略</span>
+            <select value={node.merge_strategy || 'all'} onChange={e => onChange({ merge_strategy: e.target.value })}
+              className="w-full mt-0.5 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500">
+              <option value="all">等待全部完成 (all)</option>
+              <option value="first">最快返回 (first)</option>
+            </select>
+          </label>
+        </>
       )}
       {node.type === 'confirm' && (
         <>
@@ -1602,9 +2102,28 @@ function NodeConfigForm({ node, onChange, agents }: { node: CanvasNode; onChange
           <label className="block">
             <span className="text-[10px] text-gray-500">确认选项（逗号分隔）</span>
             <input type="text" value={(node.confirm_options || []).join(', ')}
-              onChange={e => onChange({ confirm_options: e.target.value.split(',').map(s => s.trim()).filter(Boolean) })}
+              onChange={e => {
+                const opts = e.target.value.split(',').map(s => s.trim()).filter(Boolean);
+                const cb = { ...(node.confirm_branches || {}) };
+                (node.confirm_options || []).forEach(o => { if (!opts.includes(o)) delete cb[o]; });
+                onChange({ confirm_options: opts, confirm_branches: cb });
+              }}
               className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500" />
           </label>
+          {(node.confirm_options || []).length > 0 && (
+            <div className="space-y-1">
+              <span className="text-[10px] text-gray-500">选项 → 跳转目标（人工选择后路由）</span>
+              {(node.confirm_options || []).map((opt, i) => (
+                <div key={`${opt}-${i}`} className="flex items-center gap-1">
+                  <span className="text-[10px] text-gray-300 w-20 truncate shrink-0">{opt}</span>
+                  <input list="cvNodeOptions" type="text" value={(node.confirm_branches || {})[opt] || ''}
+                    onChange={e => onChange({ confirm_branches: { ...(node.confirm_branches || {}), [opt]: e.target.value } })}
+                    placeholder="目标节点ID"
+                    className="flex-1 px-2 py-0.5 bg-gray-800 border border-gray-700 rounded text-[10px] text-gray-200 font-mono outline-none focus:border-blue-500" />
+                </div>
+              ))}
+            </div>
+          )}
         </>
       )}
       {node.type === 'subpipeline' && (
@@ -1627,12 +2146,24 @@ function NodeConfigForm({ node, onChange, agents }: { node: CanvasNode; onChange
             <span className="text-[10px] text-gray-500">绑定接收器 ID</span>
             <input type="text" value={node.agent || ''} onChange={e => onChange({ agent: e.target.value })}
               className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 font-mono outline-none focus:border-blue-500"
-              placeholder="在设置中创建接收器后填入 ID" />
+              placeholder="在「数据接收器」页创建后填入 ID" />
           </label>
           <p className="text-[9px] text-gray-600">
-            输入在「系统设置 → 数据接收器」中创建的接收器 ID。流水线运行时将从此接收器拉取数据。
+            输入在「流水线 → 数据接收器」页创建的接收器 ID。流水线运行时将从此接收器拉取数据。
           </p>
         </>
+      )}
+      {node.type === 'end' && (
+        <label className="block">
+          <span className="text-[10px] text-gray-500">对话处置（运行到本节点时）</span>
+          <select value={node.save_dialog ? 'save' : 'discard'}
+            onChange={e => onChange({ save_dialog: e.target.value === 'save' })}
+            className="w-full mt-0.5 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500">
+            <option value="discard">回收删除（不保存本次对话）</option>
+            <option value="save">保留归档（保存本次对话）</option>
+          </select>
+          <p className="text-[9px] text-gray-600 mt-1">流水线对话仅保留在运行历史中，不进入渗透对话/会话管理。</p>
+        </label>
       )}
       {node.type === 'datatransformer' && (
         <>
@@ -1655,33 +2186,1154 @@ function NodeConfigForm({ node, onChange, agents }: { node: CanvasNode; onChange
           </label>
         </>
       )}
+      {/* 失败处理 / 超时 / 重试（对所有节点生效；end 由自身处置策略控制） */}
+      {node.type !== 'end' && (
+        <div className="pt-2 border-t border-gray-800 space-y-2.5">
+          <span className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">失败处理 / 执行参数</span>
+          <label className="block">
+            <span className="text-[10px] text-gray-500">失败策略</span>
+            <select
+              value={node.ignore_error ? 'ignore' : (node.error_target ? 'route' : 'default')}
+              onChange={e => {
+                const v = e.target.value;
+                if (v === 'ignore') onChange({ ignore_error: true, error_target: undefined, on_error: undefined });
+                else if (v === 'route') onChange({ ignore_error: false, error_target: node.error_target || '', on_error: undefined });
+                else onChange({ ignore_error: false, error_target: undefined, on_error: undefined });
+              }}
+              className="w-full mt-0.5 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500">
+              <option value="default">失败即整体失败（可配合重试）</option>
+              <option value="route">失败时路由到错误处理节点</option>
+              <option value="ignore">忽略错误，记录后继续正常流程</option>
+            </select>
+          </label>
+          {!node.ignore_error && node.error_target && (
+            <label className="block">
+              <span className="text-[10px] text-gray-500">错误处理节点 ID</span>
+              <input list="cvNodeOptions" type="text" value={node.error_target || ''}
+                onChange={e => onChange({ error_target: e.target.value })}
+                placeholder="填写一个节点的 ID（如 handoff）"
+                className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 font-mono outline-none focus:border-blue-500" />
+              <p className="text-[9px] text-gray-600 mt-0.5">节点执行异常（重试耗尽后）将从正常连线改走该分支；路由器与其它条件分支互斥。</p>
+            </label>
+          )}
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block">
+              <span className="text-[10px] text-gray-500">失败重试次数</span>
+              <input type="number" min={0} max={5} value={node.max_retries ?? ''}
+                onChange={e => onChange({ max_retries: e.target.value === '' ? undefined : Math.max(0, Math.min(5, Math.floor(Number(e.target.value)))) })}
+                placeholder="0"
+                className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500" />
+            </label>
+            <label className="block">
+              <span className="text-[10px] text-gray-500">执行超时（秒）</span>
+              <input type="number" min={1} max={3600} value={node.timeout_seconds ?? ''}
+                onChange={e => onChange({ timeout_seconds: e.target.value === '' ? undefined : Math.max(1, Math.min(3600, Math.floor(Number(e.target.value)))) })}
+                placeholder="不限制"
+                className="w-full mt-0.5 px-2 py-1 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500" />
+            </label>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function BranchesEditor({ node, onChange }: { node: CanvasNode; onChange: (u: Partial<CanvasNode>) => void }) {
+function BranchesEditor({ node, onChange, allNodes }: {
+  node: CanvasNode;
+  onChange: (u: Partial<CanvasNode>) => void;
+  allNodes?: CanvasNode[];
+}) {
   const branches = node.branches || [];
+  const isAi = node.type === 'ai_decision';
   function updateBranches(newB: typeof branches) { onChange({ branches: newB }); }
-  function updateBranch(idx: number, field: string, val: string | boolean) {
-    const nb = [...branches]; nb[idx] = { ...nb[idx], [field]: val }; updateBranches(nb);
+  function updateBranch(idx: number, patch: Record<string, string | boolean | undefined>) {
+    const nb = branches.map((b, i) => i === idx ? { ...b, ...patch } : b);
+    updateBranches(nb);
   }
   return (
     <div className="space-y-1.5 mt-1">
-      {branches.map((b, i) => (
-        <div key={i} className="p-2 rounded bg-gray-800/50 space-y-1">
-          <input type="text" value={b.condition || b.label || ''} onChange={e => updateBranch(i, 'condition', e.target.value)}
-            placeholder="条件 (如 status==ok)" className="w-full px-2 py-0.5 bg-gray-700 border border-gray-600 rounded text-[10px] text-gray-200 font-mono outline-none" />
-          <div className="flex gap-1">
-            <input type="text" value={b.goto || ''} onChange={e => updateBranch(i, 'goto', e.target.value)}
-              placeholder="跳转目标节点ID" className="flex-1 px-2 py-0.5 bg-gray-700 border border-gray-600 rounded text-[10px] text-gray-200 font-mono outline-none" />
-            <label className="flex items-center gap-0.5 text-[9px] text-gray-400">
-              <input type="checkbox" checked={!!b.default} onChange={e => updateBranch(i, 'default', e.target.checked)} /> 默认
-            </label>
+      {branches.length === 0 && (
+        <p className="text-[10px] text-gray-600">暂无分支。在画布上从本节点输出端口（下方 ●）拖到目标节点会自动生成分支；或手动添加。</p>
+      )}
+      {branches.map((b, i) => {
+        const target = b.goto || b.target || '';
+        return (
+          <div key={i} className="p-2 rounded bg-gray-800/50 border border-gray-700/60 space-y-1">
+            <div className="flex gap-1 items-center">
+              <input
+                type="text"
+                value={isAi ? (b.label || '') : (b.condition || '')}
+                onChange={e => {
+                  if (isAi) updateBranch(i, { label: e.target.value, condition: undefined });
+                  else updateBranch(i, { condition: e.target.value, label: e.target.value });
+                }}
+                placeholder={isAi ? '分支标签/提示（LLM 判断依据，如 blocked）' : '条件表达式 (如 status==ok)'}
+                className="flex-1 px-2 py-0.5 bg-gray-700 border border-gray-600 rounded text-[10px] text-gray-200 font-mono outline-none focus:border-blue-400" />
+              <button onClick={() => updateBranches(branches.filter((_, j) => j !== i))} title="删除该分支"
+                className="p-1 rounded text-gray-500 hover:text-red-400 hover:bg-red-500/10">
+                <svg className="w-3 h-3" fill="none" stroke="currentColor" strokeWidth={2.5} viewBox="0 0 24 24"><path strokeLinecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
+              </button>
+            </div>
+            {isAi && (
+              <input type="text" value={b.condition || ''} onChange={e => updateBranch(i, { condition: e.target.value })}
+                placeholder="额外路由条件（可选，如包含 IP）"
+                className="w-full px-2 py-0.5 bg-gray-700 border border-gray-600 rounded text-[10px] text-gray-200 font-mono outline-none focus:border-blue-400" />
+            )}
+            <div className="flex gap-1">
+              <input list="cvNodeOptions" type="text" value={target}
+                onChange={e => { updateBranch(i, { goto: e.target.value, target: e.target.value }); }}
+                placeholder="跳转目标节点ID"
+                className="flex-1 px-2 py-0.5 bg-gray-700 border border-gray-600 rounded text-[10px] text-gray-200 font-mono outline-none focus:border-blue-400" />
+              <label className="flex items-center gap-1 text-[9px] text-gray-400 shrink-0" title="勾选后无匹配/异常时走此分支">
+                <input type="checkbox" checked={!!b.default}
+                  onChange={e => updateBranches(branches.map((bb, j) => j === i ? { ...bb, default: e.target.checked } : (bb.default ? { ...bb, default: false } : bb)))} />
+                默认
+              </label>
+            </div>
           </div>
+        );
+      })}
+      <button onClick={() => updateBranches([...branches, { condition: '', label: '', goto: '', target: '', default: branches.length === 0 }])}
+        className="w-full text-[10px] py-1 bg-gray-800 border border-gray-700 rounded text-gray-400 hover:text-gray-200 hover:border-gray-500">+ 添加分支</button>
+    </div>
+  );
+}
+
+/* ================================================================
+   管理模块四页签子组件
+   ================================================================ */
+
+const RECEIVER_KIND_LABEL: Record<string, string> = {
+  webhook: 'Webhook',
+  syslog: 'Syslog 收集',
+  file: '文件监听',
+  watch: '文件监听',
+};
+
+/** 时间格式化：兼容秒级时间戳(number)与 ISO 字符串 */
+function fmtTime(ts?: number | string | null): string {
+  if (ts === null || ts === undefined || ts === '') return '-';
+  const d = new Date(ts);
+  return isNaN(d.getTime()) ? '-' : d.toLocaleString();
+}
+
+function shortId(s?: string | null, n = 8): string {
+  if (!s) return '-';
+  return s.length <= n ? s : s.slice(0, n) + '…';
+}
+
+/* ------------------------------------------------------------------
+   InstancesTab — 流水线实例（左列表 + 右详情/编辑）
+   ------------------------------------------------------------------ */
+function InstancesTab(props: {
+  instances: PipelineInstance[];
+  templates: UnifiedPipeline[];
+  receivers: ReceiverConfig[];
+  selected: PipelineInstance | null;
+  status: InstanceStatus | null;
+  instRuns: RunRow[];
+  editing: boolean;
+  editData: Partial<PipelineInstance>;
+  setEditData: (d: Partial<PipelineInstance>) => void;
+  onSelect: (inst: PipelineInstance) => void;
+  onToggle: (inst: PipelineInstance) => void;
+  onSync: (inst: PipelineInstance) => void;
+  onDelete: (inst: PipelineInstance) => void;
+  onEdit: (inst: PipelineInstance) => void;
+  onSaveEdit: () => void;
+  onCancelEdit: () => void;
+  onTest: (inst: PipelineInstance) => void;
+  onOpenRun: (runId: string) => void;
+  onOpenRunsHistory: () => void;
+  templateOf: (inst: PipelineInstance) => UnifiedPipeline | null;
+}) {
+  const receiverName = (id: string | undefined | null) =>
+    id ? (props.receivers.find(r => r.id === id)?.name || '') : '';
+
+  const runRows = props.instRuns;
+  const sel = props.selected;
+
+  return (
+    <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-4 items-start">
+      {/* 左侧列表 */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between px-1">
+          <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">流水线实例 ({props.instances.length})</span>
         </div>
-      ))}
-      <button onClick={() => updateBranches([...branches, { condition: '', goto: '', default: false }])}
-        className="w-full text-[10px] py-1 bg-gray-800 border border-gray-700 rounded text-gray-400 hover:text-gray-300">+ 添加分支</button>
+        {props.instances.length === 0 ? (
+          <div className="text-sm text-slate-400 border border-dashed border-slate-300 dark:border-slate-700 rounded-xl p-6 text-center leading-6">
+            还没有流水线实例。
+            <br />点击右上角「+ 新建流水线」从模板创建。
+          </div>
+        ) : (
+          <div className="space-y-2 max-h-[72vh] overflow-y-auto pr-1">
+            {props.instances.map(inst => {
+              const active = sel?.id === inst.id;
+              const rn = receiverName(inst.receiver_id);
+              return (
+                <div key={inst.id}
+                  onClick={() => props.onSelect(inst)}
+                  className={`rounded-xl border p-3 cursor-pointer transition-all ${
+                    active
+                      ? 'border-emerald-400 ring-1 ring-emerald-400/30 bg-emerald-50/60 dark:bg-emerald-900/10'
+                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:border-slate-300 dark:hover:border-slate-600'
+                  }`}>
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="text-sm font-medium text-slate-800 dark:text-slate-200 truncate">{inst.name}</div>
+                    <span className={`shrink-0 text-[10px] px-2 py-0.5 rounded-full font-medium ${
+                      inst.enabled
+                        ? 'bg-emerald-100 text-emerald-600 dark:bg-emerald-900/30 dark:text-emerald-400'
+                        : 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400'
+                    }`}>
+                      {inst.enabled ? '已启用' : '已停用'}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-[11px] text-slate-400 truncate">
+                    模板: {inst.template_name || inst.template_id || '-'}
+                    {inst.template_deleted ? <span className="text-amber-500 ml-1">(已删)</span> : null}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-slate-400 flex items-center justify-between gap-2">
+                    <span className="truncate">{rn ? `接收器: ${rn}` : '未绑定接收器'}</span>
+                    <span className="shrink-0 text-slate-300 dark:text-slate-600">并发 {inst.max_concurrency}</span>
+                  </div>
+                  <div className="mt-2 flex items-center gap-1.5">
+                    <button
+                      onClick={e => { e.stopPropagation(); props.onToggle(inst); }}
+                      className={`px-2 py-1 text-[10px] rounded-md font-medium ${
+                        inst.enabled
+                          ? 'bg-amber-100 text-amber-600 hover:bg-amber-200 dark:bg-amber-900/20 dark:text-amber-400'
+                          : 'bg-emerald-100 text-emerald-600 hover:bg-emerald-200 dark:bg-emerald-900/20 dark:text-emerald-400'
+                      }`}>
+                      {inst.enabled ? '停用' : '启用'}
+                    </button>
+                    <button onClick={e => { e.stopPropagation(); props.onTest(inst); }}
+                      className="px-2 py-1 text-[10px] rounded-md font-medium bg-blue-100 text-blue-600 hover:bg-blue-200 dark:bg-blue-900/20 dark:text-blue-400">
+                      测试
+                    </button>
+                    <button onClick={e => { e.stopPropagation(); props.onDelete(inst); }}
+                      className="ml-auto px-2 py-1 text-[10px] rounded-md font-medium text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20">
+                      删除
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* 右侧详情 */}
+      <div className="min-w-0 space-y-4">
+        {!sel ? (
+          <div className="border border-dashed border-slate-300 dark:border-slate-700 rounded-xl p-12 text-center text-sm text-slate-400">
+            在左侧选择一条流水线实例查看详情
+          </div>
+        ) : props.editing ? (
+          /* ---- 编辑模式 ---- */
+          <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-5 space-y-4">
+            <h3 className="text-base font-semibold text-slate-900 dark:text-slate-100">编辑实例: {sel.name}</h3>
+            <label className="block">
+              <span className="text-xs font-medium text-slate-500 dark:text-slate-400">名称</span>
+              <input type="text" value={props.editData.name || ''}
+                onChange={e => props.setEditData({ ...props.editData, name: e.target.value })}
+                className="mt-1 w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100" />
+            </label>
+            <label className="block">
+              <span className="text-xs font-medium text-slate-500 dark:text-slate-400">描述</span>
+              <textarea value={props.editData.description || ''} rows={3}
+                onChange={e => props.setEditData({ ...props.editData, description: e.target.value })}
+                className="mt-1 w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100 resize-none" />
+            </label>
+            <label className="block">
+              <span className="text-xs font-medium text-slate-500 dark:text-slate-400">绑定接收器</span>
+              <select value={props.editData.receiver_id || ''}
+                onChange={e => props.setEditData({ ...props.editData, receiver_id: e.target.value })}
+                className="mt-1 w-full px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100">
+                <option value="">不绑定（可手动触发）</option>
+                {props.receivers.map(r => (
+                  <option key={r.id} value={r.id}>{r.name}（{RECEIVER_KIND_LABEL[r.kind] || r.kind}）{r.enabled ? '' : '· 已停用'}</option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span className="text-xs font-medium text-slate-500 dark:text-slate-400">并行上限（1-50，默认 10）</span>
+              <input type="number" min={1} max={50}
+                value={props.editData.max_concurrency ?? 10}
+                onChange={e => props.setEditData({ ...props.editData, max_concurrency: Math.max(1, Math.min(50, parseInt(e.target.value, 10) || 10)) })}
+                className="mt-1 w-32 px-3 py-2 text-sm border border-slate-300 dark:border-slate-600 rounded-lg bg-white dark:bg-slate-700 text-slate-900 dark:text-slate-100" />
+            </label>
+            <div className="flex gap-2 pt-1">
+              <button onClick={props.onSaveEdit} className="px-4 py-2 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700">保存</button>
+              <button onClick={props.onCancelEdit} className="px-4 py-2 text-sm bg-slate-200 dark:bg-slate-700 text-slate-700 dark:text-slate-200 rounded-lg">取消</button>
+            </div>
+          </div>
+        ) : (
+          <>
+            {/* 操作区 */}
+            <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-4 flex flex-wrap items-center gap-2">
+              <div className="mr-auto min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="text-base font-semibold text-slate-900 dark:text-slate-100 truncate">{sel.name}</span>
+                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium ${sel.enabled ? 'bg-emerald-100 text-emerald-600' : 'bg-slate-100 text-slate-500'}`}>
+                    {sel.enabled ? '运行中' : '已停用'}
+                  </span>
+                </div>
+                <div className="mt-0.5 text-[11px] text-slate-400 flex gap-2 flex-wrap">
+                  <span>来自模板: {sel.template_name || shortId(sel.template_id, 12)}</span>
+                  <span>接收器: {receiverName(sel.receiver_id) || '未绑定'}</span>
+                  <span>并行上限: {sel.max_concurrency}</span>
+                </div>
+              </div>
+              {!sel.enabled && (
+                <button onClick={() => props.onToggle(sel)} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-emerald-600 text-white hover:bg-emerald-700">
+                  启用
+                </button>
+              )}
+              <button onClick={() => props.onEdit(sel)} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-100 dark:bg-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-200">编辑</button>
+              <button onClick={() => props.onSync(sel)} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-indigo-100 dark:bg-indigo-900/20 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-200">同步到模板</button>
+              <button onClick={() => props.onTest(sel)} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-600 text-white hover:bg-blue-700">测试投递</button>
+              <button onClick={() => props.onDelete(sel)} className="px-3 py-1.5 text-xs font-medium rounded-lg text-red-500 bg-red-50 dark:bg-red-900/20 hover:bg-red-100">删除</button>
+            </div>
+
+            {/* 运行状态 */}
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              {[
+                { label: '并行消费中', value: props.status ? `${props.status.active_count ?? 0}/${props.status.max_concurrency ?? sel.max_concurrency}` : '—', sub: props.status?.enabled || sel.enabled ? '消费中' : '未启用' },
+                { label: '累计处理', value: String(props.status?.processed ?? 0), sub: '完成入站' },
+                { label: '失败', value: String(props.status?.failed ?? 0), sub: props.status?.dead ? `失效 ${props.status.dead}` : '' },
+                { label: '最近运行', value: props.status?.last_run_at ? fmtTime(props.status.last_run_at) : '—', sub: '—' },
+              ].map(s => (
+                <div key={s.label} className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-3">
+                  <div className="text-[10px] text-slate-400">{s.label}</div>
+                  <div className="text-base font-semibold text-slate-800 dark:text-slate-100 truncate mt-0.5" title={s.value}>{s.value}</div>
+                  <div className="text-[10px] text-slate-400">{s.sub}</div>
+                </div>
+              ))}
+            </div>
+            {props.status?.last_error && (
+              <div className="text-xs text-red-500 bg-red-50 dark:bg-red-900/20 border border-red-100 dark:border-red-900/40 rounded-lg px-3 py-2 break-all">
+                {props.status.last_error}
+              </div>
+            )}
+
+            {/* 模板定义图 */}
+            {(() => {
+              const tpl = props.templateOf(sel);
+              if (!tpl) return null;
+              return <PipelineDetailPanel pipeline={tpl} hideActions />;
+            })()}
+
+            {/* 该实例最近运行 */}
+            <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-4">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">最近对话执行（{runRows.length}）</span>
+                <button onClick={props.onOpenRunsHistory} className="text-[11px] text-blue-600 dark:text-blue-400 hover:underline">查看全部历史 →</button>
+              </div>
+              {runRows.length === 0 ? (
+                <div className="text-xs text-slate-400 py-4 text-center border border-dashed border-slate-200 dark:border-slate-700 rounded-lg">
+                  暂无执行记录。启用后用「测试投递」发送一条入站数据，或等待接收器数据。
+                </div>
+              ) : (
+                <div className="space-y-1.5 max-h-64 overflow-y-auto pr-1">
+                  {runRows.map(run => (
+                    <div key={run.run_id} onClick={() => props.onOpenRun(run.run_id)}
+                      className="flex items-center gap-3 px-3 py-2 rounded-lg border border-slate-100 dark:border-slate-700 cursor-pointer hover:border-blue-200 dark:hover:border-blue-800 bg-slate-50 dark:bg-slate-900/40">
+                      <RunStatusBadge status={run.status} />
+                      <span className="text-[11px] font-mono text-slate-500 dark:text-slate-400">{shortId(run.run_id, 12)}</span>
+                      <span className="text-[11px] text-slate-400 hidden sm:inline">{fmtTime(run.created_at)}</span>
+                      <span className="ml-auto flex items-center gap-1 text-[11px] text-slate-400">
+                        {run.dialog_count != null && (
+                          <span title={`${run.dialog_count} 条对话`}>对话 {run.dialog_count}</span>
+                        )}
+                        {run.dialog_retained && <span className="text-emerald-500">·保留</span>}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   TemplatesTab — 模板库（内置 + 自定义）
+   ------------------------------------------------------------------ */
+function TemplatesTab(props: {
+  templates: UnifiedPipeline[];
+  selected: UnifiedPipeline | null;
+  onSelect: (t: UnifiedPipeline) => void;
+  onStartEdit: (t: UnifiedPipeline) => void;
+  onDelete: (t: UnifiedPipeline) => void;
+  onCreateInstance: (t: UnifiedPipeline) => void;
+  onOpenCreate: () => void;
+  onOpenRun: (runId: string) => void;
+}) {
+  const sel = props.selected;
+  return (
+    <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-4 items-start">
+      {/* 左侧模板列表 */}
+      <div className="space-y-2">
+        <div className="flex items-center justify-between px-1">
+          <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">模板库 ({props.templates.length})</span>
+          <span className="text-[10px] text-slate-400">内置可直接使用 · 自定义可编辑</span>
+        </div>
+        {props.templates.length === 0 ? (
+          <div className="text-sm text-slate-400 border border-dashed border-slate-300 dark:border-slate-700 rounded-xl p-6 text-center leading-6">
+            暂无模板。
+            <br />点击「+ 新建模板」通过图编排创建。
+          </div>
+        ) : (
+          <div className="space-y-2 max-h-[72vh] overflow-y-auto pr-1">
+            {props.templates.map(t => {
+              const active = sel?.id === t.id;
+              return (
+                <div key={t.id} onClick={() => props.onSelect(t)}
+                  className={`rounded-xl border p-3 cursor-pointer transition-all ${
+                    active
+                      ? 'border-blue-400 ring-1 ring-blue-400/30 bg-blue-50/60 dark:bg-blue-900/10'
+                      : 'border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-800 hover:border-slate-300 dark:hover:border-slate-600'
+                  }`}>
+                  <div className="flex items-center gap-2">
+                    <div className="text-sm font-medium text-slate-800 dark:text-slate-200 truncate">{t.name}</div>
+                    <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
+                      t.source === 'custom'
+                        ? 'bg-blue-100 text-blue-600 dark:bg-blue-900/30 dark:text-blue-400'
+                        : 'bg-slate-100 text-slate-500 dark:bg-slate-700 dark:text-slate-400'
+                    }`}>
+                      {t.source === 'custom' ? '自定义' : '内置'}
+                    </span>
+                    <span className={`shrink-0 text-[10px] px-1.5 py-0.5 rounded-full font-medium ${
+                      t.type === 'auto' ? 'bg-emerald-100 text-emerald-600 dark:bg-emerald-900/30' : 'bg-amber-100 text-amber-600 dark:bg-amber-900/30'
+                    }`}>
+                      {t.type === 'auto' ? '自动' : '人工介入'}
+                    </span>
+                  </div>
+                  <div className="mt-1 text-[11px] text-slate-400 line-clamp-1">{t.description || '无描述'}</div>
+                  <div className="mt-1 text-[11px] text-slate-300 dark:text-slate-600">{(t.nodes || []).length} 节点 · {(t.edges || []).length} 连线</div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+
+      {/* 右侧详情 */}
+      <div className="min-w-0 space-y-4">
+        {!sel ? (
+          <div className="border border-dashed border-slate-300 dark:border-slate-700 rounded-xl p-12 text-center">
+            <div className="text-sm text-slate-400">在左侧选择模板查看定义，或</div>
+            <button onClick={props.onOpenCreate} className="mt-3 px-4 py-2 text-sm bg-blue-600 text-white rounded-xl hover:bg-blue-700">
+              通过图编排新建模板
+            </button>
+          </div>
+        ) : (
+          <>
+            <PipelineDetailPanel
+              pipeline={sel}
+              isCustom={sel.source === 'custom'}
+              onEdit={sel.source === 'custom' ? () => props.onStartEdit(sel) : undefined}
+              onPrimary={() => props.onCreateInstance(sel)}
+              primaryLabel="由此模板创建流水线实例"
+            />
+            {/* 元信息 + 危险操作 */}
+            <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-4 flex flex-wrap items-center gap-3">
+              <div className="text-[11px] text-slate-400 mr-auto space-x-3">
+                <span>ID: <span className="font-mono">{shortId(sel.id, 14)}</span></span>
+                {sel.created_at ? <span>创建: {fmtTime(sel.created_at)}</span> : null}
+                {sel.updated_at ? <span>更新: {fmtTime(sel.updated_at)}</span> : null}
+              </div>
+              {sel.source === 'custom' && (
+                <button
+                  onClick={() => props.onStartEdit(sel)}
+                  className="px-3 py-1.5 text-xs font-medium rounded-lg text-blue-600 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100"
+                  title="在拖拽画布中重画/删除节点与连线"
+                >
+                  画布编辑
+                </button>
+              )}
+              <button onClick={() => props.onDelete(sel)} className="px-3 py-1.5 text-xs font-medium rounded-lg text-red-500 bg-red-50 dark:bg-red-900/20 hover:bg-red-100">
+                {sel.source === 'custom' ? '删除模板' : '隐藏内置模板'}
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   ReceiversTab — 数据接收器（自设置页迁入）
+   ------------------------------------------------------------------ */
+function ReceiversTab(props: {
+  receivers: ReceiverConfig[];
+  instances: PipelineInstance[];
+  onOpenCreate: () => void;
+  onOpenEdit: (r: ReceiverConfig) => void;
+  onToggle: (r: ReceiverConfig) => void;
+  onDelete: (r: ReceiverConfig) => void;
+  bindingsOf: (r: ReceiverConfig) => PipelineInstance[];
+  onGotoInstance: (i: PipelineInstance) => void;
+}) {
+  const rc = props.receivers;
+  if (rc.length === 0) {
+    return (
+      <div className="border border-dashed border-slate-300 dark:border-slate-700 rounded-xl p-12 text-center">
+        <div className="text-sm text-slate-400 leading-6">
+          还没有数据接收器。<br />
+          创建 Webhook / Syslog / 文件监听接收器后，再在流水线实例上绑定它，即可自动消费入站数据。
+        </div>
+        <button onClick={props.onOpenCreate} className="mt-4 px-4 py-2 text-sm bg-cyan-600 text-white rounded-xl hover:bg-cyan-500">
+          + 新建接收器
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between px-1">
+        <span className="text-xs font-semibold text-slate-500 dark:text-slate-400">数据接收器 ({rc.length})</span>
+        <span className="text-[10px] text-slate-400">入站数据进入绑定流水线的对话流</span>
+      </div>
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
+        {rc.map(r => {
+          const usedBy = props.bindingsOf(r);
+          const kindColor: Record<string, string> = {
+            webhook: '#06b6d4', syslog: '#8b5cf6', watch: '#f59e0b',
+          };
+          const color = kindColor[r.kind] || '#64748b';
+          return (
+            <div key={r.id} className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl p-4 flex flex-col gap-3">
+              {/* 头 */}
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-lg flex items-center justify-center shrink-0" style={{ backgroundColor: color + '20' }}>
+                  <svg viewBox="0 0 24 24" className="w-5 h-5" style={{ color }}><path d={ICONS.receiver} fill="currentColor" /></svg>
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="text-sm font-semibold text-slate-800 dark:text-slate-200 truncate">{r.name}</div>
+                  <div className="text-[10px] text-slate-400 flex items-center gap-1.5">
+                    <span style={{ color }}>{RECEIVER_KIND_LABEL[r.kind] || r.kind}</span>
+                    <span>· {shortId(r.id, 10)}</span>
+                  </div>
+                </div>
+                {/* 开关 */}
+                <button onClick={() => props.onToggle(r)} title={r.enabled ? '停用' : '启用'}
+                  className={`relative w-9 h-5 rounded-full transition-colors ${r.enabled ? 'bg-emerald-500' : 'bg-slate-300 dark:bg-slate-600'}`}>
+                  <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${r.enabled ? 'left-4.5 translate-x-0' : 'left-0.5'}`} style={{ left: r.enabled ? 18 : 2 }} />
+                </button>
+              </div>
+
+              {/* 接入信息 */}
+              <div className="text-[11px] space-y-1 bg-slate-50 dark:bg-slate-900/50 rounded-lg p-2.5 border border-slate-100 dark:border-slate-700">
+                {r.kind === 'webhook' && (
+                  <>
+                    <div className="text-slate-400">POST JSON 到</div>
+                    <div className="font-mono text-slate-600 dark:text-slate-300 break-all">/api/v1/hook/{r.webhook_path || '...'}</div>
+                    <div className="text-slate-400">字段: text / content / payload</div>
+                  </>
+                )}
+                {r.kind === 'syslog' && (
+                  <>
+                    <div className="text-slate-400">监听地址</div>
+                    <div className="font-mono text-slate-600 dark:text-slate-300">{(r.syslog_host || '0.0.0.0')}:{r.syslog_port || 514} {r.syslog_protocol || 'udp'}</div>
+                  </>
+                )}
+                {(r.kind === 'file' || r.kind === 'watch') && (
+                  <>
+                    <div className="text-slate-400">监听目录</div>
+                    <div className="font-mono text-slate-600 dark:text-slate-300 break-all">{r.watch_dir || '—'}（{r.watch_patterns || '*'}）</div>
+                  </>
+                )}
+              </div>
+
+              {/* 统计 */}
+              <div className="flex items-center gap-3 text-[11px] text-slate-400">
+                <span>累计 <b className="text-slate-600 dark:text-slate-300">{r.total_received ?? 0}</b></span>
+                <span>排队 <b className="text-slate-600 dark:text-slate-300">{r.queue_size ?? 0}</b></span>
+                <span className="ml-auto truncate">最近 {fmtTime(r.last_received_at)}</span>
+              </div>
+
+              {/* 绑定流水线 */}
+              <div className="space-y-1 min-h-0">
+                {usedBy.length === 0 ? (
+                  <div className="text-[11px] text-slate-400 border border-dashed border-slate-200 dark:border-slate-700 rounded-lg px-2 py-1.5 text-center">
+                    未绑定流水线实例
+                  </div>
+                ) : (
+                  usedBy.map(inst => (
+                    <div key={inst.id} className="flex items-center gap-2 px-2 py-1 rounded-lg bg-blue-50 dark:bg-blue-900/10 border border-blue-100 dark:border-blue-900/40">
+                      <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${inst.enabled ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+                      <span className="text-[11px] text-slate-600 dark:text-slate-300 truncate">{inst.name}</span>
+                      <span className="text-[10px] text-slate-400 shrink-0">{inst.enabled ? '消费中' : '未启用'}</span>
+                      <button onClick={() => props.onGotoInstance(inst)} className="ml-auto text-[10px] text-blue-600 dark:text-blue-400 hover:underline shrink-0">打开</button>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {/* 操作 */}
+              <div className="flex gap-2 mt-auto pt-1">
+                <button onClick={() => props.onOpenEdit(r)} className="flex-1 px-2 py-1.5 text-[11px] font-medium rounded-lg bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200">
+                  编辑
+                </button>
+                <button onClick={() => props.onDelete(r)} className="flex-1 px-2 py-1.5 text-[11px] font-medium rounded-lg text-red-500 bg-red-50 dark:bg-red-900/20 hover:bg-red-100">
+                  删除
+                </button>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   HistoryTab — 执行历史
+   ------------------------------------------------------------------ */
+function HistoryTab(props: {
+  runs: RunRow[];
+  onRefresh: () => void;
+  onOpenRun: (runId: string) => void;
+}) {
+  const runs = props.runs;
+  return (
+    <div className="bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-xl overflow-hidden">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-slate-200 dark:border-slate-700">
+        <div>
+          <span className="text-sm font-semibold text-slate-800 dark:text-slate-200">执行历史</span>
+          <span className="ml-2 text-[11px] text-slate-400">流水线实例 / 模板触发（最近 {runs.length}）</span>
+        </div>
+        <button onClick={props.onRefresh} className="px-3 py-1.5 text-xs font-medium rounded-lg bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200">
+          刷新
+        </button>
+      </div>
+      {runs.length === 0 ? (
+        <div className="text-sm text-slate-400 py-12 text-center">暂无执行记录</div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-left text-[10px] uppercase text-slate-400 border-b border-slate-100 dark:border-slate-700">
+                <th className="px-4 py-2 font-semibold">时间</th>
+                <th className="px-3 py-2 font-semibold">流水线</th>
+                <th className="px-3 py-2 font-semibold">Run ID</th>
+                <th className="px-3 py-2 font-semibold">状态</th>
+                <th className="px-3 py-2 font-semibold text-right">事件</th>
+                <th className="px-3 py-2 font-semibold text-right">对话</th>
+                <th className="px-4 py-2 font-semibold">备注</th>
+              </tr>
+            </thead>
+            <tbody>
+              {runs.map(run => (
+                <tr key={run.run_id} onClick={() => props.onOpenRun(run.run_id)}
+                  className="border-b border-slate-50 dark:border-slate-700/60 cursor-pointer hover:bg-slate-50 dark:hover:bg-slate-700/40 transition-colors">
+                  <td className="px-4 py-2 text-[11px] text-slate-500 dark:text-slate-400 whitespace-nowrap">{fmtTime(run.created_at)}</td>
+                  <td className="px-3 py-2 text-xs text-slate-700 dark:text-slate-300 max-w-[180px] truncate">
+                    {run.pipeline_name || '模板执行'}
+                    <span className="text-slate-400 block font-mono text-[10px]">{shortId(run.pipeline_id, 16)}</span>
+                  </td>
+                  <td className="px-3 py-2 text-[11px] font-mono text-slate-500">{shortId(run.run_id, 14)}</td>
+                  <td className="px-3 py-2"><RunStatusBadge status={run.status} /></td>
+                  <td className="px-3 py-2 text-right text-xs text-slate-500">{run.events_count ?? 0}</td>
+                  <td className="px-3 py-2 text-right">
+                    {run.dialog_count != null ? (
+                      <span className="text-[11px] text-slate-600 dark:text-slate-300">
+                        {run.dialog_count}
+                        {run.dialog_retained ? <span className="ml-1 text-[10px] text-emerald-500 font-medium">保留</span> : <span className="ml-1 text-[10px] text-slate-400">回收</span>}
+                      </span>
+                    ) : (
+                      <span className="text-[11px] text-slate-400">—</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-2 text-[11px] text-red-500 max-w-[160px] truncate" title={run.error || ''}>
+                    {run.error || <span className="text-slate-300 dark:text-slate-600">点击查看对话</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ================================================================
+   CreateInstanceModal — 从模板创建流水线实例（模板图快照进实例）
+   ================================================================ */
+interface ReceiverFormState {
+  name: string;
+  kind: string;
+  webhook_path: string;
+  syslog_port: number;
+  syslog_host: string;
+  watch_dir: string;
+  watch_patterns: string;
+}
+
+function CreateInstanceModal(props: {
+  templates: UnifiedPipeline[];
+  receivers: ReceiverConfig[];
+  presetTemplateId?: string | null;
+  onClose: () => void;
+  onCreated: (inst: PipelineInstance) => void;
+  showFeedback: (type: 'ok' | 'err', msg: string) => void;
+}) {
+  const [templateId, setTemplateId] = useState(
+    props.presetTemplateId && props.templates.some(t => t.id === props.presetTemplateId)
+      ? props.presetTemplateId
+      : (props.templates[0]?.id || ''),
+  );
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [receiverId, setReceiverId] = useState('');
+  const [maxConcurrency, setMaxConcurrency] = useState(10);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    if (props.presetTemplateId && props.templates.some(t => t.id === props.presetTemplateId)) {
+      setTemplateId(props.presetTemplateId);
+    }
+  }, [props.presetTemplateId, props.templates]);
+
+  const template = props.templates.find(t => t.id === templateId) || null;
+
+  async function submit() {
+    if (!templateId) { props.showFeedback('err', '请先选择要创建的模板'); return; }
+    setSaving(true);
+    try {
+      const res = await api.createInstance({
+        template_id: templateId,
+        name: name.trim() || undefined,
+        description: description.trim() || undefined,
+        receiver_id: receiverId || undefined,
+        max_concurrency: Math.max(1, Math.min(50, maxConcurrency || 10)),
+      });
+      props.onCreated(res.instance);
+    } catch (e: any) {
+      props.showFeedback('err', '创建流水线失败: ' + (e.message || ''));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const inputCls = 'w-full px-3 py-2 text-sm border border-gray-700 rounded-lg bg-gray-800 text-gray-200 outline-none focus:border-blue-500';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={props.onClose}>
+      <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="text-base font-semibold text-slate-100">从模板创建流水线实例</h3>
+          <button onClick={props.onClose} className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-400">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+        <p className="text-[11px] text-gray-500 mb-4">
+          模板的图定义会快照进实例，之后模板的修改不会影响已创建的实例。
+        </p>
+
+        {props.templates.length === 0 ? (
+          <div className="text-sm text-gray-400 py-8 text-center border border-dashed border-gray-700 rounded-xl">
+            暂无可用模板，请先在「模板库」创建。
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <label className="block">
+              <span className="text-xs font-medium text-gray-400">模板</span>
+              <select value={templateId} onChange={e => setTemplateId(e.target.value)} className={inputCls + ' mt-1'}>
+                <option value="">-- 选择模板 --</option>
+                {props.templates.map(t => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}（{t.source === 'custom' ? '自定义' : '内置'} · {t.type === 'auto' ? '自动' : '人工介入'}）
+                  </option>
+                ))}
+              </select>
+              {template && (
+                <span className="block text-[10px] text-gray-500 mt-1">
+                  {template.description || '无描述'} · {(template.nodes || []).length} 节点
+                </span>
+              )}
+            </label>
+
+            <label className="block">
+              <span className="text-xs font-medium text-gray-400">名称（留空用模板名）</span>
+              <input type="text" value={name} onChange={e => setName(e.target.value)}
+                placeholder={template?.name || '流水线实例名称'} className={inputCls + ' mt-1'} />
+            </label>
+
+            <label className="block">
+              <span className="text-xs font-medium text-gray-400">描述</span>
+              <textarea value={description} rows={2} onChange={e => setDescription(e.target.value)}
+                className={inputCls + ' mt-1 resize-none'} placeholder="可选" />
+            </label>
+
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block">
+                <span className="text-xs font-medium text-gray-400">绑定接收器</span>
+                <select value={receiverId} onChange={e => setReceiverId(e.target.value)} className={inputCls + ' mt-1'}>
+                  <option value="">不绑定</option>
+                  {props.receivers.map(r => (
+                    <option key={r.id} value={r.id}>{r.name}（{RECEIVER_KIND_LABEL[r.kind] || r.kind}）</option>
+                  ))}
+                </select>
+              </label>
+              <label className="block">
+                <span className="text-xs font-medium text-gray-400">并行上限（默认 10）</span>
+                <input type="number" min={1} max={50} value={maxConcurrency}
+                  onChange={e => setMaxConcurrency(Math.max(1, Math.min(50, parseInt(e.target.value, 10) || 10)))}
+                  className={inputCls + ' mt-1'} />
+              </label>
+            </div>
+            <p className="text-[10px] text-gray-500 leading-5">
+              启用后，实例以最多「并行上限」条同时处理绑定接收器的入站数据；每条入站数据 = 一次独立 run/对话，
+              对话保存在 run 历史中，不进入渗透对话/会话管理。
+            </p>
+
+            <div className="flex gap-3 pt-1">
+              <button onClick={submit} disabled={saving || !templateId}
+                className="flex-1 px-4 py-2.5 bg-emerald-600 hover:bg-emerald-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-xl text-sm font-medium text-white transition-all">
+                {saving ? '创建中...' : '创建流水线实例'}
+              </button>
+              <button onClick={props.onClose} className="px-4 py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm text-gray-300">
+                取消
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   ReceiverFormModal — 接收器创建/编辑表单（webhook / syslog / file）
+   ------------------------------------------------------------------ */
+function ReceiverFormModal(props: {
+  editing: ReceiverConfig | null;
+  form: ReceiverFormState;
+  setForm: (fn: (prev: ReceiverFormState) => ReceiverFormState) => void;
+  saving: boolean;
+  onClose: () => void;
+  onSave: () => void;
+}) {
+  const { form } = props;
+  const up = (patch: Partial<ReceiverFormState>) => props.setForm(p => ({ ...p, ...patch }));
+  const inputCls = 'w-full px-3 py-2 text-sm border border-gray-700 rounded-lg bg-gray-800 text-gray-200 outline-none focus:border-cyan-500';
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={props.onClose}>
+      <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-lg mx-4 max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        <h3 className="text-base font-semibold text-slate-100 mb-4">{props.editing ? '编辑接收器' : '新建接收器'}</h3>
+        <div className="space-y-3.5">
+          <label className="block">
+            <span className="text-xs font-medium text-gray-400">名称</span>
+            <input type="text" value={form.name} onChange={e => up({ name: e.target.value })}
+              className={inputCls + ' mt-1'} placeholder="如：SOC 告警接收器" />
+          </label>
+          <label className="block">
+            <span className="text-xs font-medium text-gray-400">协议类型</span>
+            <select value={form.kind} onChange={e => up({ kind: e.target.value })} className={inputCls + ' mt-1'}>
+              <option value="webhook">HTTP Webhook</option>
+              <option value="syslog">Syslog (UDP)</option>
+              <option value="file">文件监听</option>
+            </select>
+          </label>
+
+          {form.kind === 'webhook' && (
+            <label className="block">
+              <span className="text-xs font-medium text-gray-400">Webhook 路径</span>
+              <div className="flex items-center mt-1">
+                <span className="text-xs text-gray-500 px-2.5 py-2 bg-gray-800 border border-r-0 border-gray-700 rounded-l-lg">/api/v1/hook/</span>
+                <input type="text" value={form.webhook_path} onChange={e => up({ webhook_path: e.target.value })}
+                  className="flex-1 px-3 py-2 bg-gray-800 border border-gray-700 rounded-r-lg text-sm text-gray-200 outline-none focus:border-cyan-500" placeholder="my-receiver" />
+              </div>
+              <span className="text-[10px] text-gray-500 block mt-1">外部系统 POST JSON 到此路径，字段支持 text / content / payload</span>
+            </label>
+          )}
+
+          {form.kind === 'syslog' && (
+            <>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="text-xs font-medium text-gray-400">监听端口</span>
+                  <input type="number" value={form.syslog_port} onChange={e => up({ syslog_port: Number(e.target.value) || 0 })}
+                    className={inputCls + ' mt-1'} placeholder="514" />
+                </label>
+                <label className="block">
+                  <span className="text-xs font-medium text-gray-400">绑定地址</span>
+                  <input type="text" value={form.syslog_host} onChange={e => up({ syslog_host: e.target.value })}
+                    className={inputCls + ' mt-1'} placeholder="0.0.0.0" />
+                </label>
+              </div>
+              <span className="text-[10px] text-gray-500 block">接收 Syslog 设备（如防火墙/IPS）的 UDP 告警。</span>
+            </>
+          )}
+
+          {form.kind === 'file' && (
+            <>
+              <label className="block">
+                <span className="text-xs font-medium text-gray-400">监听目录</span>
+                <input type="text" value={form.watch_dir} onChange={e => up({ watch_dir: e.target.value })}
+                  className={inputCls + ' mt-1'} placeholder="/var/reports/" />
+              </label>
+              <label className="block">
+                <span className="text-xs font-medium text-gray-400">文件匹配模式（逗号分隔）</span>
+                <input type="text" value={form.watch_patterns} onChange={e => up({ watch_patterns: e.target.value })}
+                  className={inputCls + ' mt-1'} placeholder="*.pdf,*.html,*.json" />
+              </label>
+              <span className="text-[10px] text-gray-500 block">监视目录内新出现的匹配文件，将作为一条入站数据进入流水线。</span>
+            </>
+          )}
+
+          <p className="text-[10px] text-gray-500 leading-5">
+            接收器只负责「接收 + 入队」。接收器从设置页迁移至流水线页管理；绑定到流水线实例并启用后，入站数据才会被并行消费。
+          </p>
+        </div>
+        <div className="flex gap-3 mt-5">
+          <button onClick={props.onSave} disabled={props.saving}
+            className="flex-1 px-4 py-2.5 bg-cyan-600 hover:bg-cyan-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-xl text-sm font-medium text-white transition-all">
+            {props.saving ? '保存中...' : (props.editing ? '更新' : '创建')}
+          </button>
+          <button onClick={props.onClose} className="px-4 py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm text-gray-300">
+            取消
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   TestPipelineModal — 向流水线实例投递一条测试入站数据（走真实收件箱）
+   ------------------------------------------------------------------ */
+function TestPipelineModal(props: {
+  instance: PipelineInstance;
+  onClose: () => void;
+  onFinished: () => void;
+}) {
+  const [text, setText] = useState('这是一条来自流水线「测试投递」的入站数据，请解析并给出结论。');
+  const [asJson, setAsJson] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
+  const [result, setResult] = useState<{
+    ok: boolean; instance_id?: string; receiver_id?: string; seq?: number;
+    created?: boolean; enabled?: boolean; message?: string; error?: string;
+  } | null>(null);
+
+  async function submit() {
+    if (!text.trim() && !asJson) return;
+    setSending(true);
+    setResult(null);
+    let payload: unknown;
+    if (asJson) {
+      try { payload = JSON.parse(text); }
+      catch { setSending(false); setResult({ ok: false, error: 'JSON 格式不正确，无法解析' }); return; }
+    }
+    try {
+      const res = await api.testInstance(props.instance.id, asJson ? { payload } : { content: text });
+      setResult(res);
+      if (res.ok) setSent(true);
+    } catch (e: any) {
+      setResult({ ok: false, error: (e.message || '投递失败') });
+    } finally {
+      setSending(false);
+    }
+  }
+
+  function close() {
+    if (sent) props.onFinished();
+    props.onClose();
+  }
+
+  const inputCls = 'w-full px-3 py-2 text-sm border border-gray-700 rounded-lg bg-gray-800 text-gray-200 outline-none focus:border-blue-500';
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={close}>
+      <div className="bg-gray-900 border border-gray-700 rounded-2xl p-6 w-full max-w-xl mx-4 max-h-[90vh] overflow-y-auto" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between mb-1">
+          <h3 className="text-base font-semibold text-slate-100">测试投递</h3>
+          <button onClick={close} className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-400">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+        <p className="text-[11px] text-gray-500 mb-4">
+          实例「{props.instance.name}」· 模板 {props.instance.template_name || props.instance.template_id} · 并行上限 {props.instance.max_concurrency}
+          {props.instance.enabled
+            ? <span className="text-emerald-400"> · 已启用，数据将即时消费</span>
+            : <span className="text-amber-400"> · 未启用，数据先排队，启用后自动消费</span>}
+        </p>
+
+        <label className="block">
+          <span className="text-xs font-medium text-gray-400">入站数据内容</span>
+          <textarea value={text} rows={5} onChange={e => setText(e.target.value)}
+            className={inputCls + ' mt-1 resize-y font-mono text-xs'} placeholder="输入要投递的内容；开启 JSON 模式后可投递结构化对象/数组" />
+        </label>
+
+        <label className="flex items-center gap-2 mt-2 text-xs text-gray-400">
+          <input type="checkbox" checked={asJson} onChange={e => setAsJson(e.target.checked)} className="accent-blue-600" />
+          按 JSON 解析并投递（payload）
+        </label>
+
+        {result && (
+          <div className={`mt-3 px-3 py-2.5 rounded-lg text-xs leading-5 break-all ${
+            result.ok
+              ? 'bg-emerald-900/20 border border-emerald-700/40 text-emerald-300'
+              : 'bg-red-900/20 border border-red-700/40 text-red-300'
+          }`}>
+            {result.ok ? (
+              <>
+                已入队，队列序号 seq=<b>{result.seq ?? '-'}</b>（receiver: {result.receiver_id || '-'}）。
+                <br />
+                {result.enabled === false
+                  ? '实例当前未启用，数据将排队等待，启用后自动消费。'
+                  : '实例已启用，将在并行会话中生成一次独立 run/对话，可在「执行历史 / 实例最近运行」查看。'}
+              </>
+            ) : (
+              <>{result.error || result.message || '投递失败'}</>
+            )}
+          </div>
+        )}
+
+        <div className="flex gap-3 mt-4">
+          <button onClick={submit} disabled={sending}
+            className="flex-1 px-4 py-2.5 bg-blue-600 hover:bg-blue-500 disabled:bg-gray-700 disabled:text-gray-500 rounded-xl text-sm font-medium text-white transition-all">
+            {sending ? '投递中...' : '投递测试数据'}
+          </button>
+          <button onClick={close} className="px-4 py-2.5 bg-gray-800 hover:bg-gray-700 rounded-xl text-sm text-gray-300">
+            关闭
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------
+   RunDialogModal — run 详情查看：状态、摘要、报告与流水线对话实录
+   ------------------------------------------------------------------ */
+const DIALOG_KIND_STYLE: Record<string, string> = {
+  input: 'bg-blue-900/20 border-blue-800/50 text-blue-100',
+  llm: 'bg-gray-800/60 border-gray-700 text-gray-200',
+  note: 'bg-slate-800/40 border-slate-700/50 text-slate-300',
+};
+
+function RunDialogModal(props: {
+  loading: boolean;
+  run: RunDetail | null;
+  onClose: () => void;
+}) {
+  const { run } = props;
+  const dialogEntries = (run?.dialog || []).filter(d => d.content || d.output || d.prompt);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onClick={props.onClose}>
+      <div className="bg-gray-900 border border-gray-700 rounded-2xl w-full max-w-3xl mx-4 max-h-[90vh] flex flex-col overflow-hidden" onClick={e => e.stopPropagation()}>
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-3 border-b border-gray-800 shrink-0">
+          <div className="flex items-center gap-3 min-w-0">
+            <h3 className="text-base font-semibold text-slate-100">运行详情</h3>
+            {run && <RunStatusBadge status={run.status} />}
+            {run?.dialog_action === 'save' && <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-900/30 text-emerald-400">对话已保留</span>}
+            {run?.dialog_action === 'discard' && <span className="text-[10px] px-2 py-0.5 rounded-full bg-slate-800 text-slate-400">对话已回收</span>}
+          </div>
+          <button onClick={props.onClose} className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-400 shrink-0">
+            <svg className="w-5 h-5" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24"><path strokeLinecap="round" d="M6 6l12 12M18 6L6 18"/></svg>
+          </button>
+        </div>
+
+        {props.loading || !run ? (
+          <div className="flex items-center justify-center py-20 text-sm text-gray-500 animate-pulse">
+            {props.loading ? '加载运行详情...' : '暂无数据'}
+          </div>
+        ) : (
+          <div className="p-5 space-y-4 overflow-y-auto">
+            {/* 元信息 */}
+            <div className="flex flex-wrap gap-x-5 gap-y-1 text-[11px] text-gray-400">
+              <span>Run: <b className="font-mono text-gray-300">{run.run_id}</b></span>
+              <span>流水线: <b className="font-mono text-gray-300">{run.pipeline_id}</b></span>
+              <span>创建: {fmtTime(run.created_at)}</span>
+              {run.started_at != null && <span>开始: {fmtTime(run.started_at)}</span>}
+              {run.ended_at != null && <span>结束: {fmtTime(run.ended_at)}</span>}
+              <span>事件: {run.events_count ?? (run.events || []).length}</span>
+              {run.dialog_count != null && <span>对话条数: {run.dialog_count}</span>}
+            </div>
+
+            {run.error && (
+              <div className="text-xs text-red-300 bg-red-900/20 border border-red-800/50 rounded-lg px-3 py-2 break-all whitespace-pre-wrap">
+                {run.error}
+              </div>
+            )}
+
+            {run.report && (
+              <div>
+                <div className="text-xs font-semibold text-gray-300 mb-1.5">执行报告</div>
+                <pre className="text-xs text-gray-300 bg-gray-950/60 border border-gray-800 rounded-lg p-3 whitespace-pre-wrap break-words max-h-56 overflow-y-auto">
+                  {run.report}
+                </pre>
+              </div>
+            )}
+
+            {/* 流水线对话实录 */}
+            <div>
+              <div className="flex items-center justify-between mb-1.5">
+                <span className="text-xs font-semibold text-gray-300">流水线对话实录</span>
+                <span className="text-[10px] text-gray-500">每次入站 = 一次独立对话；仅在 run 历史中查看</span>
+              </div>
+              {dialogEntries.length === 0 ? (
+                <div className="text-xs text-gray-500 py-6 text-center border border-dashed border-gray-700 rounded-lg">
+                  无对话内容（未产生 LLM 调用，或对话已被回收）
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {dialogEntries.map((d, i) => {
+                    const style = DIALOG_KIND_STYLE[d.kind || ''] || DIALOG_KIND_STYLE.note;
+                    const body = d.output || d.content || d.prompt || '';
+                    const label = d.kind === 'input' ? '入站' : d.kind === 'llm' ? 'LLM' : (d.kind === 'note' ? '说明' : (d.kind || '事件'));
+                    return (
+                      <div key={i} className={`rounded-lg border px-3 py-2 ${style}`}>
+                        <div className="flex items-center gap-2 text-[10px] opacity-80">
+                          <span className="font-mono">#{d.seq ?? i + 1}</span>
+                          <span className="font-semibold">{label}</span>
+                          {d.node ? <span className="text-gray-400">节点 {d.node}</span> : null}
+                          {d.agent ? <span className="text-gray-400">智能体 {d.agent}</span> : null}
+                          {d.source ? <span className="text-gray-400">来源 {d.source}</span> : null}
+                        </div>
+                        <div className="mt-1 text-xs whitespace-pre-wrap break-words">{body}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* 节点/事件流水 */}
+            {(run.nodes && Object.keys(run.nodes).length > 0) && (
+              <div>
+                <div className="text-xs font-semibold text-gray-300 mb-1.5">节点执行</div>
+                <div className="space-y-1">
+                  {Object.values(run.nodes).map((n, i) => (
+                    <div key={i} className="flex items-center gap-2 text-[11px] px-3 py-1.5 rounded-lg bg-gray-800/40 border border-gray-800">
+                      <RunStatusBadge status={n.status} />
+                      <span className="font-mono text-gray-300">{n.node_id}</span>
+                      <span className="text-gray-500">{n.node_type}</span>
+                      {n.error && <span className="ml-auto text-red-400 truncate max-w-[220px]" title={n.error}>{n.error}</span>}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        <div className="px-5 py-3 border-t border-gray-800 flex justify-end shrink-0">
+          <button onClick={props.onClose} className="px-4 py-2 bg-gray-800 hover:bg-gray-700 rounded-lg text-sm text-gray-300">
+            关闭
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

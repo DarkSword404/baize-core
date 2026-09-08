@@ -96,7 +96,24 @@ class ReceiverManager:
         # webhook 不在这里启动，由 FastAPI 路由处理
 
     async def _on_data(self, receiver_id: str, data: ReceivedData):
-        """接收器回调：数据入队列 + 更新统计"""
+        """接收器回调：写入持久化收件箱（唯一事实源）+ 入内存队列 + 更新统计"""
+        # 持久化收件箱：重启/崩溃不丢告警；Supervisor（编排侧）据此 claim 处理。
+        try:
+            from .inbox import get_alert_inbox
+            inbox = get_alert_inbox()
+            inbox.enqueue(
+                receiver_id=receiver_id,
+                raw_payload=data.raw_payload,
+                content_type=data.content_type,
+                source=data.source,
+                metadata=data.metadata,
+            )
+        except Exception:
+            import logging
+            logging.getLogger("baize.receivers").exception(
+                f"Receiver [{receiver_id}] 写入收件箱失败"
+            )
+
         queue = self._queues.get(receiver_id)
         if queue is None:
             queue = asyncio.Queue()

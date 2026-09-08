@@ -16,6 +16,15 @@ function persistState(key: string, value: any) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch { /* quota */ }
 }
 
+// 兼容非安全上下文（例如 http://192.168.x.x）
+// crypto.randomUUID 只在安全上下文（localhost/https/127.0.0.1）可用。
+function generateToastId(): string {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`;
+}
+
 // ============================================
 // AppState
 // ============================================
@@ -96,7 +105,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const toastRef = useRef(toasts);
   toastRef.current = toasts;
   const addToast = useCallback((t: Omit<Toast, 'id'>) => {
-    const id = crypto.randomUUID();
+    const id = generateToastId();
     const toast: Toast = { ...t, id };
     setToasts(prev => [...prev.slice(-9), toast]);
     setTimeout(() => {
@@ -166,13 +175,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const setApiKey = useCallback((k: string) => { setApiKeyState(k); }, []);
 
   // ─ 已安装模块 ─────────────────────────────────
+  // 拉取时机：页面挂载时、后端恢复为可达时立即拉取；
+  // 连接期间每 30s 复查一次（覆盖后端重启/热安装模块后无需手动刷新页面的场景）。
   const [installedModules, setInstalledModules] = useState<Record<string, ModuleInfo>>({});
 
   useEffect(() => {
-    fetchModules()
-      .then(r => setInstalledModules(r.modules))
-      .catch(() => { /* 服务器未就绪时静默 */ });
-  }, []);
+    let cancelled = false;
+    const refresh = () => {
+      fetchModules()
+        .then(r => { if (!cancelled) setInstalledModules(r.modules); })
+        .catch(() => { /* 服务器未就绪时保持上一次状态 */ });
+    };
+    refresh();
+    if (serverConnected) {
+      const timer = window.setInterval(refresh, 30000);
+      return () => { cancelled = true; window.clearInterval(timer); };
+    }
+    return () => { cancelled = true; };
+  }, [serverConnected]);
 
   return (
     <AppContext.Provider

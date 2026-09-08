@@ -8,7 +8,7 @@
 
 > 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
 
-[![Version](https://img.shields.io/badge/version-v1.8.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v2.0.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
@@ -35,6 +35,8 @@
 | 🖥️ | **执行环境抽象（v1.4.0）** | 统一执行器接口 + 沙箱隔离，工具可无缝切换 local / docker / ssh 后端 |
 | 📋 | **会话日志（v1.4.0）** | append-only 审计日志，模型历史可重建、攻击链可重放（DFIR 取证） |
 | 💾 | **记忆库（v1.8.0）** | 长期记忆升级为结构化记忆库：经验 / 任务轨迹 / 事实 / 实体分层沉淀，知识图谱关联，混合检索自动命中 |
+| 📨 | **告警研判收件箱（v2.0.0）** | Webhook / Syslog / 文件监听入站告警统一落 SQLite 持久化收件箱（指纹幂等 / 租约消费 / 退避重试 / 死信），编排长驻会话自动 claim 研判 |
+| 🔄 | **流水线模板→实例（v2.0.0）** | 编排升级两级模型：模板实例化快照、绑定接收器、并行上限（默认 10），启用/停用与运行历史；每次入站 = 独立 run / 独立对话 |
 | 🛡️ | **护栏 Guardrails（v1.3.0）** | 文件化可配置的输入/输出策略，注入防护、敏感信息保护与 SSRF 运行时配置 |
 | 📡 | **外部接收器（v1.3.0）** | Webhook / Syslog / 文件监听，打通外部事件源 |
 | ⚡ | **实时交互** | SSE 流式输出、会话持久化、美观的暗色 UI |
@@ -65,7 +67,7 @@
 ### 安装
 
 ```bash
-cd baize-core-v1.8.0
+cd baize-core-v2.0.0
 ./setup.sh    # 创建虚拟环境 + 安装 baize-core + 构建前端
 ./setup.sh --with-tools   # 推荐：安装时一并预装全部工具依赖（见下节）
 ```
@@ -454,7 +456,8 @@ baize-core/
 - [x] **v1.5** 稳定性加固（LLM 重试 / 工具超时 / 异常隔离）+ Swarm 协作 + 流水线接入 + 双浏览器
 - [x] **v1.6** 共享浏览器实时可交互面板 + 对话绑定 + SSRF 护栏配置 + 数据目录可配置
 - [x] **v1.7** 沙箱边界 + 工具输出压缩 + 多模态图片注入
-- [ ] **v1.8** 多智能体并行协作优化 + 外部威胁情报接入
+- [x] **v1.8** 记忆库（经验/轨迹/知识图谱/混合检索）+ 大附件与内存镜像上传
+- [x] **v2.0** 编排流水线两级模型 + 告警收件箱长驻自动研判（模块 v1.6.0）
 
 ---
 
@@ -500,7 +503,25 @@ baize-core/
 
 ## 📝 更新日志
 
-### v1.8.0（当前）
+### v2.0.0（当前）
+
+- 📨 **告警持久化收件箱（Alert Inbox）**：Webhook / Syslog / 文件监听等入站数据不再只进内存队列，
+  先落 SQLite 持久化收件箱（`src/baize/receivers/inbox.py`）——按接收器指纹幂等（重复投递返回既有 seq）、
+  租约消费（claim → lease）、失败退避重试与超限死信；进程崩溃/重启后过期租约自动回收重派，告警不丢
+- 🔄 **编排流水线升级两级模型（配合 baize-orchestration v1.6.0）**：模板（图编排定义）→ 实例
+  （可启用/停用的具体流水线）；实例创建时快照模板，可绑定接收器、设置并行上限（默认 10），
+  支持停用/启用、模板同步与运行历史；每次入站数据触发 = 一次独立 run / 独立对话
+- 🤖 **长驻会话自动研判**：编排侧 Supervisor 长驻调度——持续 claim 收件箱告警 → 独立 Worker 执行研判 →
+  写回结果；at-least-once + `dedup_key` 幂等兜底，走到"结束对话"节点的 run 自动回收对话（保留摘要）
+- 🔗 **接收器与模板联动**：接收器回调改为"先落收件箱"，Webhook 支持 `alert_id` / `event_id` 显式 ID 提升
+  参与指纹幂等；内置 SOC 告警研判模板修复——告警内容 / 绑定 agent 运行期实时注入，不再静态化
+- 🧩 **Agent 扩展元数据**：自定义 Agent 持久化保留图编排字段白名单（`type` / `category` / `tags` /
+  `max_concurrency` 等），流水线实例复用既有 agent 管理链路
+- ⚡ **前端编排页重构 + 健壮性**：PipelineEditor 迁移至"模板 → 实例"两级视图（数据接收器管理一并迁入）；
+  兼容非安全上下文（`crypto.randomUUID` 降级）；模块列表随后端可达状态轮询刷新，服务重启 / 热装模块后自动恢复
+- 🚀 **升级**：版本号统一为 2.0.0（后端 / 前端 / 脚本 / 文档）；编排模块随本版发布 v1.6.0
+
+### v1.8.0
 
 - 🧠 **经验系统重构为「记忆库」子系统**：新增 `src/baize/memory/`（存储 / 自动沉淀 / 轨迹 / 演进 / 知识图谱 / 检索），
   数据按 **经验 / 任务轨迹 / 事实 / 实体** 分层组织；Web「记忆」页重构为四视图：
@@ -669,6 +690,6 @@ baize-core/
 
 **白泽·智脑 (Baize)** · 仅供安全研究与授权测试使用
 
-[![Version](https://img.shields.io/badge/version-v1.8.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
+[![Version](https://img.shields.io/badge/version-v2.0.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
 
 </div>

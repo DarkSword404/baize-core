@@ -154,6 +154,9 @@ export async function listCustomPipelines(): Promise<CustomPipelinesResponse> {
 export async function createCustomPipeline(data: {
   name: string;
   description?: string;
+  type?: 'auto' | 'manual';
+  nodes?: unknown[];
+  edges?: unknown[];
   steps?: Array<{ agent_name: string; display_name: string; description: string }>;
 }): Promise<CustomPipeline> {
   return request('/pipelines/custom', { method: 'POST', body: JSON.stringify(data) });
@@ -162,6 +165,9 @@ export async function createCustomPipeline(data: {
 export async function updateCustomPipeline(id: string, data: {
   name?: string;
   description?: string;
+  type?: 'auto' | 'manual';
+  nodes?: unknown[];
+  edges?: unknown[];
   steps?: Array<{ agent_name: string; display_name: string; description: string }>;
 }): Promise<CustomPipeline> {
   return request(`/pipelines/custom/${id}`, { method: 'PUT', body: JSON.stringify(data) });
@@ -796,6 +802,24 @@ export interface RunDetail {
   events: RunEvent[];
   events_count: number;
   report: string;
+  dialog?: DialogEntry[];
+  dialog_action?: '' | 'discard' | 'save';
+  dialog_retained?: boolean;
+  dialog_count?: number;
+}
+
+export interface DialogEntry {
+  kind?: 'input' | 'llm' | 'note' | string;
+  node?: string;
+  node_type?: string;
+  agent?: string;
+  source?: string;
+  receiver_id?: string;
+  content?: string;
+  prompt?: string;
+  output?: string;
+  seq?: number;
+  timestamp?: number;
 }
 
 /** 提交一次后台执行（立即返回 run_id） */
@@ -973,6 +997,132 @@ export async function updateReceiver(id: string, data: Record<string, any>): Pro
 }
 export async function deleteReceiver(id: string): Promise<{ status: string }> {
   return request(`/receivers/${id}`, { method: 'DELETE' });
+}
+
+// ===== 两级模型：统一模板库 / 流水线实例 =====
+
+/** 统一模板条目（内置模板 source=builtin / 自定义模板 source=custom） */
+export interface UnifiedTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  type?: string;                       // auto | manual
+  category?: string;
+  tags?: string[];
+  source: 'builtin' | 'custom';
+  is_custom?: boolean;
+  nodes?: unknown[];
+  edges?: unknown[];
+  max_concurrency?: number;
+  steps?: unknown[];
+}
+
+export async function listUnifiedTemplates(): Promise<{ templates: UnifiedTemplate[]; total: number }> {
+  return request('/pipeline-templates');
+}
+
+/** 流水线实例（由模板创建的可运行流水线） */
+export interface PipelineInstance {
+  id: string;
+  name: string;
+  description: string;
+  template_id: string;
+  type: 'auto' | 'manual';
+  receiver_id: string;
+  max_concurrency: number;
+  enabled: boolean;
+  created_at: number;
+  updated_at: number;
+  template_name?: string;
+  template_source?: string;
+  template_deleted?: boolean;
+  template_snapshot?: Record<string, any>;
+}
+
+export async function listInstances(): Promise<{ instances: PipelineInstance[]; total: number }> {
+  return request('/pipelines/instances');
+}
+
+export async function getInstance(id: string): Promise<{ ok: boolean; instance: PipelineInstance }> {
+  return request(`/pipelines/instances/${id}`);
+}
+
+export async function createInstance(data: {
+  template_id: string;
+  name?: string;
+  description?: string;
+  receiver_id?: string;
+  max_concurrency?: number;
+}): Promise<{ ok: boolean; instance: PipelineInstance }> {
+  return request('/pipelines/instances', { method: 'POST', body: JSON.stringify(data) });
+}
+
+export async function updateInstance(id: string, data: Partial<{
+  name: string; description: string; receiver_id: string; max_concurrency: number;
+}>): Promise<{ ok: boolean; instance: PipelineInstance }> {
+  return request(`/pipelines/instances/${id}`, { method: 'PUT', body: JSON.stringify(data) });
+}
+
+export async function deleteInstance(id: string): Promise<{ ok: boolean; instance_id: string }> {
+  return request(`/pipelines/instances/${id}`, { method: 'DELETE' });
+}
+
+/** 启用流水线实例（启动并行长驻消费） */
+export async function enableInstance(id: string): Promise<{ ok: boolean; instance_id: string; active: boolean }> {
+  return request(`/pipelines/instances/${id}/enable`, { method: 'POST' });
+}
+
+/** 停用流水线实例 */
+export async function disableInstance(id: string): Promise<{ ok: boolean; instance_id: string; active: boolean }> {
+  return request(`/pipelines/instances/${id}/disable`, { method: 'POST' });
+}
+
+/** 同步实例快照到模板最新定义 */
+export async function syncInstance(id: string): Promise<{ ok: boolean; instance: PipelineInstance }> {
+  return request(`/pipelines/instances/${id}/sync`, { method: 'POST' });
+}
+
+export interface InstanceStatus {
+  ok?: boolean;
+  instance_id: string;
+  enabled?: boolean;
+  active?: boolean;
+  receiver_id?: string;
+  processed?: number;
+  failed?: number;
+  dead?: number;
+  active_count?: number;
+  last_run_at?: number | null;
+  last_error?: string;
+  max_concurrency?: number;
+  recent_runs?: unknown[];
+}
+
+/** 实例运行状态（含并发/收件箱统计） */
+export async function getInstanceStatus(id: string): Promise<InstanceStatus> {
+  return request(`/pipelines/instances/${id}/status`);
+}
+
+/** 实例历史 = 按 pipeline_id=实例 id 查询 runs */
+export async function listInstanceRuns(id: string, limit = 50): Promise<RunListResponse> {
+  return listRuns({ pipeline_id: id, limit });
+}
+
+/** 实例测试投递：向该实例绑定的接收器投递一条测试入站数据（等同真实入站，走并行会话消费） */
+export async function testInstance(id: string, data: { payload?: unknown; content?: string }): Promise<{
+  ok: boolean;
+  instance_id?: string;
+  receiver_id?: string;
+  seq?: number;
+  created?: boolean;
+  enabled?: boolean;
+  message?: string;
+  error?: string;
+}> {
+  return request(`/pipelines/instances/${id}/test`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
 }
 
 // ===== 安全护栏管理 =====

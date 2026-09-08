@@ -129,6 +129,12 @@ class CustomPipelineStore:
         tmp.write_text(json.dumps(pipeline, indent=2, ensure_ascii=False), encoding="utf-8")
         tmp.replace(f)
 
+    # 持久化时允许保留的图编排元数据（白名单）
+    _META_KEYS = (
+        "type", "category", "tags", "version", "triggers",
+        "context_schema", "timeout_seconds", "max_concurrency",
+    )
+
     def list(self) -> list[dict[str, Any]]:
         return sorted(self._pipelines.values(), key=lambda p: p["created_at"])
 
@@ -139,6 +145,7 @@ class CustomPipelineStore:
             "id": secrets.token_hex(10),
             "name": data.get("name", ""),
             "description": data.get("description", ""),
+            "type": data.get("type", "auto"),
             "steps": data.get("steps", data.get("nodes", [])),
             "nodes": data.get("nodes", data.get("steps", [])),
             "edges": data.get("edges", []),
@@ -146,6 +153,9 @@ class CustomPipelineStore:
             "updated_at": now,
             "is_custom": True,
         }
+        for key in self._META_KEYS:
+            if key in data and key not in ("type",):
+                pipeline[key] = data[key]
         with self._lock:
             self._pipelines[pipeline["id"]] = pipeline
             self._save(pipeline)
@@ -156,7 +166,10 @@ class CustomPipelineStore:
             pipeline = self._pipelines.get(pipeline_id)
             if pipeline is None:
                 return None
-            for key in ("name", "description", "steps", "nodes", "edges"):
+            for key in ("name", "description", "steps", "nodes", "edges", "type"):
+                if key in data:
+                    pipeline[key] = data[key]
+            for key in self._META_KEYS:
                 if key in data:
                     pipeline[key] = data[key]
             # 同步 nodes ← steps 或 steps ← nodes
