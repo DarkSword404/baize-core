@@ -1221,6 +1221,26 @@ class Agent:
             return result.content, total
 
         self._log_event("turn/end", index=turn_index)
+        # 工具调用配额耗尽但尚未产出最终文本报告：强制再请求一次模型，
+        # 明确要求它基于已有工具结果产出最终结论（不再调工具）。
+        # 避免用户拿到空回复——渗透类任务工具轮次多，常在配额耗尽时才结束。
+        if not forced_conclusion:
+            history.append(
+                ChatMessage(
+                    role="user",
+                    content=(
+                        "工具调用配额已用尽。请基于已完成的工具调用结果，"
+                        "直接用自然语言输出你的最终发现和结论（不再调用工具）。"
+                    ),
+                )
+            )
+            try:
+                result = await self._complete_with_retry(client, history, tool_schemas)
+                if result.content:
+                    self._log_event("agent/response", content=result.content)
+                    return result.content, total
+            except Exception:  # noqa: BLE001
+                logger.warning("配额耗尽后的强制报告请求失败，返回空")
         return "", total
 
     async def _try_auto_refine(self, client, user_message: str, final_text: str) -> None:
