@@ -423,7 +423,7 @@ export function streamMessage(
   console.log(`[SSE] Starting stream for session ${id} → ${apiBase}/sessions/${id}/messages/stream`);
   fetch(`${apiBase}/sessions/${id}/messages/stream`, {
     method: 'POST',
-    headers: { ...authHeaders(), Accept: 'text/event-stream' },
+    headers: { ...authHeaders(), 'Content-Type': 'application/json', Accept: 'text/event-stream' },
     body: JSON.stringify(data),
     signal: controller.signal,
   })
