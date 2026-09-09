@@ -5,6 +5,7 @@ import { BrowserPanel } from './Browser';
 import type { PromptRequest, ReasoningStep, AttachmentInfo } from '../api/client';
 import { ChatMessage } from '../components/ChatMessage';
 import { CreateSessionModal } from '../components/CreateSessionModal';
+import { AttackMap } from '../components/AttackMap';
 import type { ChatMessage as ChatMessageType, IntermediateData } from '../types';
 import { agentNameCN, toolNameCN } from '../i18n/translations';
 import type { JSX } from 'react';
@@ -171,6 +172,7 @@ export function Chat(): JSX.Element {
   const [reasoningPanelOpen, setReasoningPanelOpen] = useState(false);
   // Shared browser side panel (bound to current session)
   const [browserPanelOpen, setBrowserPanelOpen] = useState(false);
+  const [attackMapOpen, setAttackMapOpen] = useState(false);
 
   // Multi-agent tracking
   const [currentAgent, setCurrentAgent] = useState<string | null>(null);
@@ -793,6 +795,17 @@ export function Chat(): JSX.Element {
               >
                 浏览器
               </button>
+              <button
+                onClick={() => setAttackMapOpen(!attackMapOpen)}
+                className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+                  attackMapOpen
+                    ? 'bg-purple-600/10 border-purple-600/20 text-purple-400'
+                    : 'bg-gray-800/50 border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
+                }`}
+                title="攻击地图（黑板 Fact-Intent 图，协作模式会话可用）"
+              >
+                攻击图
+              </button>
             </>
           ) : (
             <div className="flex-1 text-sm text-gray-600">
@@ -1072,6 +1085,13 @@ export function Chat(): JSX.Element {
           <BrowserPanel open={browserPanelOpen} onClose={() => setBrowserPanelOpen(false)} />
         </div>
       )}
+
+      {/* ═══ 攻击地图侧栏（黑板 Fact-Intent 图，协作模式会话可用）═══ */}
+      <AttackMap
+        sessionId={activeSessionId}
+        open={attackMapOpen}
+        onClose={() => setAttackMapOpen(false)}
+      />
 
       {/* Interactive Prompt Dialog */}
       {pendingPrompt && activeSessionId && (

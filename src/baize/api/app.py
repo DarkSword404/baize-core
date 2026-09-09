@@ -111,6 +111,15 @@ class BlackboardHintRequest(BaseModel):
     detail: str = ""
 
 
+# 全局 app state 引用（供编排进程反查会话黑板，见 reason 节点）
+_APP_STATE_REF = None
+
+
+def _get_app_state():
+    """供编排节点（如 Reason）反查 app state，拿 session_manager → 黑板。"""
+    return _APP_STATE_REF
+
+
 class MessageRequest(BaseModel):
     input: str
     agent: Optional[str] = None
@@ -604,6 +613,10 @@ def create_baize_api_app(
     app.state.attachment_store = AttachmentStore()
     app.state.require_auth = cfg.require_auth
     app.state.loaded_modules: dict[str, dict] = {}  # 已加载模块注册表
+
+    # 全局 app state 引用：供编排进程（reason 节点等）反查会话黑板
+    global _APP_STATE_REF
+    _APP_STATE_REF = app.state
     # ── 长期记忆：memory 子系统（Episode/经验/语义事实/时间知识图谱）──
     # 全新实现（baize.memory），取代历史上所有经验引擎。Agent 每回合结束自动
     # 学习（见 sdk.agent._try_auto_refine），此处只负责注册全局服务。
