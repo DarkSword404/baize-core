@@ -18,9 +18,10 @@ from openai import AsyncOpenAI
 
 from baize.config import ModelConfigStore, SingleModelConfig
 
-# LLM 端点的网络超时：connect 30s（容忍网络抖动），read 180s（长生成），
+# LLM 端点的网络超时：connect 30s（容忍网络抖动），read 90s（长生成但需快速失败），
 # 配合 openai SDK 的 max_retries 自动重试连接错误，提高流水线稳定性。
-LLM_TIMEOUT = httpx.Timeout(connect=30.0, read=180.0, write=60.0, pool=30.0)
+# read 从 180s 降到 90s：单轮 LLM 调用不应超过 90s，否则会拖垮 agent 300s 节点超时。
+LLM_TIMEOUT = httpx.Timeout(connect=30.0, read=90.0, write=60.0, pool=30.0)
 LLM_MAX_RETRIES = 3
 
 

@@ -1667,14 +1667,18 @@ def create_baize_api_app(
                             )
                         elif etype == "node_completed":
                             node = node_index.get(edata.get("node_id", ""))
-                            output = edata.get("data", {}) or {}
+                            # 节点文本输出（如 agent 的 final_output）优先于结构化 data 内的字段
+                            node_output = edata.get("output", "") or ""
+                            data = edata.get("data", {}) or {}
                             text = ""
-                            if isinstance(output, dict):
+                            if isinstance(node_output, str) and node_output.strip():
+                                text = node_output
+                            elif isinstance(data, dict):
                                 text = (
-                                    output.get("report")
-                                    or output.get("text")
-                                    or output.get("output")
-                                    or output.get("final_output")
+                                    data.get("report")
+                                    or data.get("text")
+                                    or data.get("output")
+                                    or data.get("final_output")
                                     or ""
                                 )
                             if isinstance(text, str) and text.strip():

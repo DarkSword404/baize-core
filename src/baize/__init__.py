@@ -6,6 +6,9 @@
 
 import pkgutil
 
+# 允许 baize 命名空间被多个包（baize-core / baize-orchestration）共同贡献
+__path__ = pkgutil.extend_path(__path__, __name__)
+
 __version__ = "2.0.1"
 
 # baize 同时作为可扩展的顶层命名空间：扩展发行版（如 baize-orchestration 提供的
