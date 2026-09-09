@@ -1716,16 +1716,13 @@ def create_baize_api_app(
                                 f"data: {json.dumps({'prompt_id': f'run:{run_id}', 'prompt_type': 'confirm', 'title': '人工确认', 'message': confirm_prompt, 'command': '', 'options': confirm_options, 'is_password': False})}\n\n"
                             )
                         elif etype == "pipeline_completed":
-                            # compiler 推送 data={"run_id","data":final_values}；runner 再推送 data={"report":...}
+                            # pipeline 完成：不再重复发送 delta（agent 输出已在 node_completed 中推送）
                             report = (
                                 edata.get("report")
                                 or (edata.get("data") or {}).get("report")
                                 or (edata.get("data") or {}).get("final_output")
                                 or ""
                             )
-                            if isinstance(report, str) and report.strip():
-                                final_text += report
-                                yield f"data: {json.dumps({'type': 'delta', 'content': report})}\n\n"
                             _flush_to_session()
                             yield f"data: {json.dumps({'type': 'done', 'content': report or final_text})}\n\n"
                         elif etype == "pipeline_failed":
