@@ -164,9 +164,25 @@ def cmd_doctor(argv: list[str]) -> int:
 
 def cmd_serve(argv: list[str]) -> int:
     """启动 Baize 后端服务。"""
+    import logging
     import uvicorn
 
     from baize.config import get_server_config
+
+    # 配置 application logger 输出到 stdout：默认 uvicorn 只配 access log，
+    # 业务 logger（reason/agent 节点等）用 getLogger(__name__) 无 handler，
+    # 导致推理日志不可见。此处显式配置，让 baize.* 与 orchestration.* 的
+    # INFO/WARNING 输出到 stdout，便于诊断 agent 卡死/工具调用问题。
+    # 环境变量 BAIZE_LOG_LEVEL 可覆盖（默认 INFO）。
+    log_level = os.environ.get("BAIZE_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+        stream=sys.stdout,
+    )
+    # baize / orchestration 命名空间强制可见（即使 root logger 被其它库改过）
+    for ns in ("baize", "baize.orchestration", "baize.api", "baize.sdk"):
+        logging.getLogger(ns).setLevel(getattr(logging, log_level, logging.INFO))
 
     cfg = get_server_config()
     uvicorn.run(
@@ -174,6 +190,7 @@ def cmd_serve(argv: list[str]) -> int:
         factory=True,
         host=cfg.host,
         port=cfg.port,
+        log_level=log_level.lower(),
         **({"workers": int(os.environ.get("BAIZE_WORKERS", "1"))} if os.environ.get("BAIZE_WORKERS") else {}),
     )
     return 0
