@@ -98,6 +98,17 @@ class CreateSessionRequest(BaseModel):
     stateful: bool = True
     pattern: Optional[str] = None
     browser_collab: bool = False
+    # 协作模式（黑板驱动）：目标范围 + 成功条件
+    # 当 scope/goal 非空时，会话进入协作模式，黑板初始化 origin/goal 节点
+    # agent 可留空，由黑板根据 Fact-Intent 图状态动态派发
+    scope: str = ""
+    goal: str = ""
+
+
+class BlackboardHintRequest(BaseModel):
+    """黑板 Hint 注入请求：人类判断，下次读取被 agent 吸收。"""
+    label: str
+    detail: str = ""
 
 
 class MessageRequest(BaseModel):
@@ -1209,6 +1220,8 @@ def create_baize_api_app(
             stateful=payload.stateful,
             pattern=payload.pattern,
             browser_collab=payload.browser_collab,
+            scope=payload.scope,
+            goal=payload.goal,
         )
         return session.to_dict()
 
@@ -1231,6 +1244,37 @@ def create_baize_api_app(
         if session is None:
             raise HTTPException(status_code=404, detail="会话不存在")
         return {"session": session.to_dict()}
+
+    # ---- 黑板：协作模式攻击图 -----------------------------------------
+    # 前端攻击地图视图拉取 Fact-Intent 图快照，以及人类注入 Hint
+    @app.get(
+        "/api/v1/sessions/{session_id}/blackboard",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def get_blackboard(session_id: str) -> dict:
+        session = app.state.session_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if session.blackboard is None:
+            raise HTTPException(status_code=400, detail="该会话非协作模式，无黑板")
+        return session.blackboard.snapshot()
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/blackboard/hints",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def add_blackboard_hint(session_id: str, payload: BlackboardHintRequest) -> dict:
+        """人类判断注入黑板，下次读取被 agent 吸收。"""
+        session = app.state.session_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="会话不存在")
+        if session.blackboard is None:
+            raise HTTPException(status_code=400, detail="该会话非协作模式，无黑板")
+        hint = session.blackboard.add_hint(label=payload.label, detail=payload.detail)
+        app.state.session_manager._save(session)
+        return {"ok": True, "hint": hint.to_dict()}
 
     @app.delete(
         "/api/v1/sessions/{session_id}",

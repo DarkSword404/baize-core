@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Optional
 
 from baize.config import DEFAULT_BAIZE_DIR
+from baize.pentest.blackboard import Blackboard
 
 SESSION_DIR = DEFAULT_BAIZE_DIR / "sessions"
 
@@ -39,6 +40,11 @@ class Session:
     pattern: Optional[str] = None
     browser_collab: bool = False
     messages: list[dict] = field(default_factory=list)
+    # 协作模式（黑板驱动）：目标范围 + 成功条件
+    scope: str = ""
+    goal: str = ""
+    # 运行时黑板，不在 __init__ 签名里（由 SessionManager 注入或恢复）
+    blackboard: Optional[Blackboard] = field(default=None, repr=False)
 
     @property
     def history_length(self) -> int:
@@ -57,6 +63,9 @@ class Session:
             "metadata": {},
             "pattern": self.pattern,
             "browser_collab": self.browser_collab,
+            "scope": self.scope,
+            "goal": self.goal,
+            "blackboard": self.blackboard.snapshot() if self.blackboard else None,
         }
 
 
@@ -90,7 +99,13 @@ class SessionManager:
                     pattern=data.get("pattern"),
                     browser_collab=data.get("browser_collab", False),
                     messages=data.get("messages", []),
+                    scope=data.get("scope", ""),
+                    goal=data.get("goal", ""),
                 )
+                # 恢复黑板（如有）
+                bb_data = data.get("blackboard")
+                if bb_data:
+                    session.blackboard = Blackboard.from_dict(bb_data)
                 self._sessions[session.id] = session
             except (json.JSONDecodeError, OSError, KeyError):
                 continue
@@ -106,6 +121,9 @@ class SessionManager:
             "pattern": session.pattern,
             "browser_collab": session.browser_collab,
             "messages": session.messages,
+            "scope": session.scope,
+            "goal": session.goal,
+            "blackboard": session.blackboard.to_dict() if session.blackboard else None,
         }
         f = self._dir / f"{session.id}.json"
         tmp = f.with_suffix(".tmp")
@@ -119,6 +137,8 @@ class SessionManager:
         stateful: bool = True,
         pattern: Optional[str] = None,
         browser_collab: bool = False,
+        scope: str = "",
+        goal: str = "",
     ) -> Session:
         session = Session(
             id=secrets.token_hex(12),
@@ -129,7 +149,14 @@ class SessionManager:
             updated_at=_now(),
             pattern=pattern,
             browser_collab=browser_collab,
+            scope=scope,
+            goal=goal,
         )
+        # 协作模式：有 scope/goal 即初始化黑板（agent 可留空，由黑板动态派发）
+        if scope or goal:
+            session.blackboard = Blackboard(
+                session_id=session.id, scope=scope, goal=goal,
+            )
         with self._lock:
             self._sessions[session.id] = session
             self._save(session)

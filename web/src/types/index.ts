@@ -67,10 +67,13 @@ export interface SessionSummary {
   agent_stack?: string[];
   agent_transitions?: Array<{from_agent: string | null; to_agent: string; timestamp: string; reason: string}>;
   browser_collab?: boolean;
+  scope?: string;
+  goal?: string;
 }
 
 export interface SessionDetail extends SessionSummary {
   history: Array<Record<string, unknown>>;
+  blackboard?: BlackboardSnapshot | null;
 }
 
 export interface SessionsResponse {
@@ -88,6 +91,46 @@ export interface CreateSessionRequest {
   metadata?: Record<string, unknown> | null;
   pattern?: string | null;
   browser_collab?: boolean;
+  // 协作模式（黑板驱动）：目标范围 + 成功条件
+  scope?: string;
+  goal?: string;
+}
+
+// ---- 黑板（协作模式攻击图）----
+export interface BlackboardNode {
+  id: string;
+  kind: 'origin' | 'fact' | 'intent' | 'goal' | 'hint';
+  label: string;
+  detail: string;
+  status: string;
+  discovered_by: string;
+  created_at: string;
+  updated_at: string;
+  properties: Record<string, unknown>;
+}
+
+export interface BlackboardEdge {
+  id: string;
+  source: string;
+  target: string;
+  relation: string;
+  created_at: string;
+  properties: Record<string, unknown>;
+}
+
+export interface BlackboardSnapshot {
+  session_id: string;
+  scope: string;
+  goal: string;
+  version: number;
+  nodes: BlackboardNode[];
+  edges: BlackboardEdge[];
+  stats: {
+    facts: number;
+    intents_pending: number;
+    intents_done: number;
+    hints: number;
+  };
 }
 
 export interface RunResultPayload {

@@ -8,6 +8,8 @@ import type {
   SessionSummary,
   SessionDetail,
   CreateSessionRequest,
+  BlackboardSnapshot,
+  BlackboardNode,
   InferenceRequest,
   InferenceResponse,
   UXSummarizeLiteRequest,
@@ -351,6 +353,21 @@ export async function listSessions(): Promise<SessionsResponse> {
 
 export async function createSession(data: CreateSessionRequest): Promise<SessionSummary> {
   return request('/sessions', { method: 'POST', body: JSON.stringify(data) });
+}
+
+// ===== Blackboard（协作模式攻击图）=====
+export async function getBlackboard(sessionId: string): Promise<BlackboardSnapshot> {
+  return request(`/sessions/${sessionId}/blackboard`);
+}
+
+export async function addBlackboardHint(
+  sessionId: string,
+  data: { label: string; detail?: string }
+): Promise<{ ok: boolean; hint: BlackboardNode }> {
+  return request(`/sessions/${sessionId}/blackboard/hints`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
 }
 
 export async function getSession(id: string): Promise<SessionDetail> {
