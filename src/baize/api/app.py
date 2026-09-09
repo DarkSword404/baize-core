@@ -580,6 +580,18 @@ def create_baize_api_app(
     *,
     session_manager: SessionManager | None = None,
 ) -> FastAPI:
+    # 配置 application logger：uvicorn 直接启动时不经过 cli.py，
+    # 需在此显式配置，否则 baize.orchestration 节点的日志不可见。
+    import sys as _sys
+    _log_level = os.environ.get("BAIZE_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=getattr(logging, _log_level, logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s | %(message)s",
+        stream=_sys.stdout,
+    )
+    for _ns in ("baize", "baize.orchestration", "baize.api", "baize.sdk"):
+        logging.getLogger(_ns).setLevel(getattr(logging, _log_level, logging.INFO))
+
     cfg = get_server_config()
     app = FastAPI(title="Baize API", version=__version__)
 
