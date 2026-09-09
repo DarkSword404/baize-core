@@ -809,7 +809,7 @@ export function Chat(): JSX.Element {
             </>
           ) : (
             <div className="flex-1 text-sm text-gray-600">
-              选择一个会话或创建新的渗透会话开始对话
+              选择一个会话或新建对话开始
             </div>
           )}
           <button
@@ -829,15 +829,15 @@ export function Chat(): JSX.Element {
                   <path strokeLinecap="round" strokeLinejoin="round" d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
                 </svg>
               </div>
-              <h3 className="text-lg font-semibold mb-1">白泽·智脑对话渗透</h3>
+              <h3 className="text-lg font-semibold mb-1">白泽·智脑对话</h3>
               <p className="text-sm text-gray-600 max-w-md">
-                选择一个智能体，在对话中引导它执行安全渗透任务。所有AI操作将被完整记录。
+                通用对话窗口：渗透测试、CTF、告警研判、安全问答等任意场景。开启协作模式可多 agent 自主搜索。
               </p>
               <button
                 onClick={() => setShowCreateModal(true)}
                 className="mt-6 px-6 py-2.5 bg-blue-600 hover:bg-blue-500 rounded-xl text-sm font-semibold transition-all"
               >
-                创建你的第一个渗透会话
+                创建你的第一个对话
               </button>
             </div>
           ) : messages.length === 0 ? (

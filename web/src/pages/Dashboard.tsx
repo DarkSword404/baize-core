@@ -57,7 +57,7 @@ export function Dashboard(): JSX.Element {
   const statCards = [
     { label: '安全智能体', value: stats.agentCount, icon: 'M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z', color: 'blue', onClick: () => navigate('/agents') },
     { label: '当前模型', value: stats.modelCount, icon: 'M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z', color: 'amber', onClick: () => navigate('/settings') },
-    { label: '渗透会话', value: stats.sessionCount, icon: 'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z', color: 'emerald', onClick: () => navigate('/sessions') },
+    { label: '对话会话', value: stats.sessionCount, icon: 'M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z', color: 'emerald', onClick: () => navigate('/sessions') },
     { label: '服务器状态', value: health?.status || '—', icon: 'M5 12h14M12 5l7 7-7 7', color: health?.status === 'ok' ? 'emerald' : 'red', sub: health?.version },
   ];
 
@@ -119,7 +119,7 @@ export function Dashboard(): JSX.Element {
       <div className="mb-8">
         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">快捷操作</h2>
         <div className="flex gap-3 flex-wrap">
-          <QuickAction label="新建渗透会话" onClick={() => navigate('/chat')} />
+          <QuickAction label="新建对话" onClick={() => navigate('/chat')} />
           <QuickAction label="浏览智能体库" onClick={() => navigate('/agents')} />
           <QuickAction label="编排平台" onClick={() => navigate('/orchestration')} />
           <QuickAction label="系统设置" onClick={() => navigate('/settings')} />

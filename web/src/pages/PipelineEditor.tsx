@@ -2,7 +2,7 @@
  * 流水线管理页面
  * 正式两级模型：模板（图编排定义，内置 + 自定义）→ 流水线实例（可启用/停用、
  * 绑定接收器、设置并行上限）。实例在调度器内并行消费接收器入站数据，
- * 每次入站 = 一次独立 run/对话；对话保存在该 run 内，不进入渗透对话/会话管理。
+ * 每次入站 = 一次独立 run/对话；对话保存在该 run 内，不进入对话/会话管理。
  * 数据接收器从设置页迁移至此页管理。
  */
 
@@ -506,7 +506,7 @@ export default function PipelineEditor() {
         <div>
           <h1 className="text-2xl font-bold text-slate-900 dark:text-slate-100">流水线管理</h1>
           <p className="text-xs text-gray-500 dark:text-slate-400 mt-1">
-            模板（图编排定义）→ 流水线实例（绑定接收器、可并行处理入站数据，每次入站 = 一次独立对话，不进入渗透对话/会话管理）
+            模板（图编排定义）→ 流水线实例（绑定接收器、可并行处理入站数据，每次入站 = 一次独立对话，不进入对话/会话管理）
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -2162,7 +2162,7 @@ function NodeConfigForm({ node, onChange, agents, allNodes }: {
             <option value="discard">回收删除（不保存本次对话）</option>
             <option value="save">保留归档（保存本次对话）</option>
           </select>
-          <p className="text-[9px] text-gray-600 mt-1">流水线对话仅保留在运行历史中，不进入渗透对话/会话管理。</p>
+          <p className="text-[9px] text-gray-600 mt-1">流水线对话仅保留在运行历史中，不进入对话/会话管理。</p>
         </label>
       )}
       {node.type === 'datatransformer' && (
@@ -2991,7 +2991,7 @@ function CreateInstanceModal(props: {
             </div>
             <p className="text-[10px] text-gray-500 leading-5">
               启用后，实例以最多「并行上限」条同时处理绑定接收器的入站数据；每条入站数据 = 一次独立 run/对话，
-              对话保存在 run 历史中，不进入渗透对话/会话管理。
+              对话保存在 run 历史中，不进入对话/会话管理。
             </p>
 
             <div className="flex gap-3 pt-1">
