@@ -1631,12 +1631,17 @@ def create_baize_api_app(
                     runner.cache_pipeline(pipeline_def)
 
                     # context：把用户输入同时放入 text/input/message，兼容各模板的 context_schema
+                    # 协作模式：注入 session_id / scope / goal，让 reason/agent 节点
+                    # 能反查会话黑板，且 {{ context.scope }}/{{ context.goal }} 能渲染。
                     run_id = await runner.submit(
                         pipeline_def,
                         {
                             "text": payload.input,
                             "input": payload.input,
                             "message": payload.input,
+                            "session_id": session_id,
+                            "scope": getattr(session, "scope", "") or "",
+                            "goal": getattr(session, "goal", "") or "",
                         },
                     )
 
