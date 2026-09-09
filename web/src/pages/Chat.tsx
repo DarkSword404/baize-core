@@ -150,6 +150,8 @@ export function Chat(): JSX.Element {
   const [input, setInput] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  // 删除会话确认：存待删除的会话 id，null 表示不显示确认框
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   // 是否跟随滚动到底部：用户主动上滚阅读思考/工具过程时关闭，回到底部附近时恢复
@@ -295,12 +297,17 @@ export function Chat(): JSX.Element {
     }
   }
 
-  async function handleDeleteSession(id: string, e: React.MouseEvent) {
+  // 点击 X 按钮：只弹出确认框，不直接删除
+  function handleDeleteSession(id: string, e: React.MouseEvent) {
     e.stopPropagation();
-    const confirmed = window.confirm(
-      '删除会话将同时清理该会话上传的附件与解压文件（不可恢复）。确定删除？'
-    );
-    if (!confirmed) return;
+    setPendingDeleteId(id);
+  }
+
+  // 确认删除：用户在 Modal 点"确认"后才真正执行删除
+  async function confirmDeleteSession() {
+    const id = pendingDeleteId;
+    if (!id) return;
+    setPendingDeleteId(null);
     try {
       await deleteSession(id);
       removeSession(id);
@@ -1167,6 +1174,42 @@ export function Chat(): JSX.Element {
           handleSelectSession(id);
         }}
       />
+
+      {/* 删除会话确认 Modal */}
+      {pendingDeleteId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center">
+          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={() => setPendingDeleteId(null)} />
+          <div className="relative bg-gray-900 border border-gray-800 rounded-2xl w-full max-w-sm p-6 shadow-2xl animate-slide-up">
+            <div className="flex items-start gap-3 mb-5">
+              <div className="w-10 h-10 rounded-full bg-red-600/15 flex items-center justify-center flex-shrink-0">
+                <svg className="w-5 h-5 text-red-400" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
+                  <path strokeLinecap="round" d="M12 9v4m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                </svg>
+              </div>
+              <div>
+                <h2 className="text-base font-semibold text-gray-100">删除会话？</h2>
+                <p className="text-xs text-gray-500 mt-1 leading-relaxed">
+                  将同时清理该会话上传的附件与解压文件，操作不可恢复。
+                </p>
+              </div>
+            </div>
+            <div className="flex items-center justify-end gap-2">
+              <button
+                onClick={() => setPendingDeleteId(null)}
+                className="px-4 py-2 text-sm text-gray-400 hover:text-gray-200 rounded-lg hover:bg-gray-800 transition-colors"
+              >
+                取消
+              </button>
+              <button
+                onClick={confirmDeleteSession}
+                className="px-4 py-2 text-sm bg-red-600 hover:bg-red-500 text-white rounded-lg transition-colors"
+              >
+                确认删除
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
