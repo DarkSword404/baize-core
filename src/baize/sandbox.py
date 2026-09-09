@@ -204,8 +204,14 @@ class Sandbox:
             if approved >= self.policy.auto_approve_after:
                 return {"allowed": True, "level": PermissionLevel.ALLOW, "reason": f"已自动审批（{approved}次）"}
 
-            # 6. 需要审批
-            return {"allowed": False, "level": PermissionLevel.APPROVE, "reason": "需要审批"}
+            # 6. 兜底：使用 default_permission
+            default_perm = self.policy.default_permission
+            if default_perm == PermissionLevel.ALLOW:
+                return {"allowed": True, "level": PermissionLevel.ALLOW, "reason": "默认允许"}
+            if default_perm == PermissionLevel.DENY:
+                return {"allowed": False, "level": PermissionLevel.DENY, "reason": "默认禁止"}
+            # APPROVE / CONFIRM：需要审批
+            return {"allowed": False, "level": default_perm, "reason": "需要审批"}
 
     def approve(self, tool_name: str, session_id: str) -> None:
         """审批通过某工具（一次性令牌，执行后失效）。"""

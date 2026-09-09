@@ -604,10 +604,15 @@ def create_baize_api_app(
     app.state.custom_tools = CustomToolStore()
 
     # ── 沙箱边界系统 ──
-    from baize.sandbox import Sandbox, SandboxPolicy
+    from baize.sandbox import Sandbox, SandboxPolicy, PermissionLevel
     from baize import services
 
-    app.state.sandbox = Sandbox(SandboxPolicy(enabled=True))
+    # 默认权限改为 ALLOW：pipeline 路径中无人审批，APPROVE 会导致 agent 阻塞。
+    # 危险工具仍受 max_dangerous_per_turn 配额限制。
+    app.state.sandbox = Sandbox(SandboxPolicy(
+        enabled=True,
+        default_permission=PermissionLevel.ALLOW,
+    ))
 
     app.state.custom_tools.register_all()  # 启动时热注册已有自定义工具
     app.state.attachment_store = AttachmentStore()
