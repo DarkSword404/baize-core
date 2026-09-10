@@ -1513,14 +1513,21 @@ def create_baize_api_app(
         session_log = _get_or_create_session_log(app, session_id)
         agent = _clone_agent_for_session(agent, session_id, session_log)
 
-        # ── pattern 流水线会话：会话绑定了流水线时，走流水线事件源 ──
+        # ── 路由判定 ──
+        # 1. 显式流水线模板（pentest/vuln_scan 等）→ orchestration runner
+        # 2. 对话模式（有黑板 scope/goal 但无对应模板）→ 黑板驱动的动态 agent 自动编排
+        # 3. 其它 → 内置 agent 直接对话
         pipeline_def = None
+        use_conversation_orchestrator = False
         if getattr(session, "pattern", None):
             try:
                 from baize.orchestration.api import _find_pipeline
                 pipeline_def = _find_pipeline(session.pattern)
-            except Exception:  # orchestration 未安装或查找失败 → 回退默认 agent
+            except Exception:  # orchestration 未安装或查找失败 → 回退
                 pipeline_def = None
+        # 对话模式：有黑板（scope/goal 已初始化）且未命中显式流水线模板
+        if pipeline_def is None and getattr(session, "blackboard", None) is not None:
+            use_conversation_orchestrator = True
 
         # 拼接历史（stateful 会话）：将会话已有消息作为上下文传给 Agent。
         # 关键：不能只保留 user/assistant 纯文本消息——已执行的工具调用链
@@ -1740,6 +1747,62 @@ def create_baize_api_app(
                 except Exception as e:  # noqa: BLE001
                     logger.exception("流水线会话处理失败: %s", e)
                     yield f"data: {json.dumps({'type': 'error', 'error': _format_detailed_error(e, '流水线对话')})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+            # ── 对话模式：黑板驱动的动态 agent 自动编排（不使用流水线模板）──
+            if use_conversation_orchestrator:
+                try:
+                    from baize.pentest.conversation_orchestrator import ConversationOrchestrator
+                    orch = ConversationOrchestrator()
+                    # 浏览器协作工具追加到 extra_tools（已在上方组装）
+                    async for ev_type, ev_data in _with_sse_heartbeat(
+                        orch.run(
+                            session.blackboard,
+                            payload.input,
+                            session_id=session_id,
+                            session_log=session_log,
+                            extra_tools=extra_tools,
+                        ),
+                        interval=15.0,
+                    ):
+                        if await request.is_disconnected():
+                            break
+                        if ev_type == "heartbeat":
+                            yield ": keepalive\n\n"
+                            continue
+                        if ev_type == "reasoning":
+                            text = ev_data.get("text", "")
+                            reasoning_parts.append(text)
+                            yield (
+                                f"event: reasoning_step\n"
+                                f"data: {json.dumps({'type': 'reasoning', 'text': text})}\n\n"
+                            )
+                        elif ev_type == "phase":
+                            phase = ev_data.get("phase", 0)
+                            name = ev_data.get("name", "")
+                            agent_name = ev_data.get("agent", "")
+                            yield (
+                                f"event: reasoning_step\n"
+                                f"data: {json.dumps({'type': 'pipeline_step', 'phase': phase, 'phase_name': name, 'agent': agent_name})}\n\n"
+                            )
+                        elif ev_type == "delta":
+                            content = ev_data.get("content", "")
+                            final_text += content
+                            yield f"data: {json.dumps({'type': 'delta', 'content': content})}\n\n"
+                        elif ev_type == "error":
+                            err = ev_data.get("error", "编排执行失败")
+                            yield f"data: {json.dumps({'type': 'error', 'error': err})}\n\n"
+                        elif ev_type == "done":
+                            content = ev_data.get("content", "")
+                            _flush_to_session()
+                            yield f"data: {json.dumps({'type': 'done', 'content': content or final_text})}\n\n"
+                    _flush_to_session()
+                    yield "data: [DONE]\n\n"
+                    return
+                except Exception as e:  # noqa: BLE001
+                    logger.exception("对话自动编排处理失败: %s", e)
+                    yield f"data: {json.dumps({'type': 'error', 'error': _format_detailed_error(e, '对话编排')})}\n\n"
                     yield "data: [DONE]\n\n"
                     return
 

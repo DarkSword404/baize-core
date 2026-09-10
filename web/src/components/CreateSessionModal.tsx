@@ -30,15 +30,14 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
     setCreating(true);
     try {
       // 默认协作模式：黑板驱动的多 agent 自主协作（通用安全助手）
-      // - pattern = security_assistant：通用多场景（告警/CTF/运营/渗透/取证）
+      // - 对话不使用任何预置流水线模板，由后端黑板 + 动态 agent 自动编排
       // - 浏览器协作默认开启
       // - 不在此处预填任务/目标：具体任务由用户在对话中用自然语言描述，
-      //   黑板会据首条消息建立 origin/goal，reason 按任务性质派发对应 agent
+      //   黑板会据首条消息建立 origin/goal，reason 按任务性质派发对应临时 agent
       const session = await createSession({
         model: configuredModel || null,
         stateful: true,
         browser_collab: browserCollab,
-        pattern: 'security_assistant',
         scope: 'TASK',
         goal: '通用安全助手：用户在对话中描述任务，按任务性质协作完成',
       });
