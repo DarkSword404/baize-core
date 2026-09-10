@@ -108,7 +108,7 @@ async def crt_sh_lookup(domain: str, limit: int = 50, timeout: int = 60) -> str:
 async def http_probe(
     target: str,
     follow_redirects: bool = False,
-    timeout: int = 120,
+    timeout: int = 30,
 ) -> str:
     """httpx Web 服务存活探测与指纹。"""
     args = ["-silent", "-title", "-web-server", "-tech-detect", "-status-code"]
