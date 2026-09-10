@@ -560,7 +560,12 @@ def _clone_agent_for_session(agent: Any, session_id: str, session_log: SessionLo
     注册表内的 agent 是全局共享单例，直接写字段会污染并发请求
     （session 互相串台）。通过 dataclasses.replace 产生浅拷贝副本，
     仅替换会话相关字段，其余（tools/memory/hooks 等）仍共享定义。
+
+    内置智能体已废弃：当无任何 agent 注册时返回 None，
+    调用方（stream_message）需自行判定是否走对话自动编排或流水线。
     """
+    if agent is None:
+        return None
     try:
         return _dataclass_replace(
             agent, session_id=session_id, session_log=session_log
@@ -660,6 +665,20 @@ def create_baize_api_app(
     # 模块发现：加载所有 baize.modules entry points
     # ------------------------------------------------------------------
     _discover_and_load_modules(app)
+
+    # ------------------------------------------------------------------
+    # 内置编排模块注册（合并自 baize-orchestration，无 entry point）
+    # ------------------------------------------------------------------
+    try:
+        from baize.orchestration import register as _orch_register
+        _orch_register(app)
+        app.state.loaded_modules["orchestration"] = {
+            "installed": True,
+            "version": __version__,
+        }
+        logger.info("已加载内置模块: orchestration")
+    except Exception:  # noqa: BLE001
+        logger.exception("加载内置 orchestration 模块失败")
 
     # ------------------------------------------------------------------
     # 接收器管理 API + Webhook 路由
@@ -984,162 +1003,11 @@ def create_baize_api_app(
     # 智能体 / 工具
     # ------------------------------------------------------------------
 
-    def _build_custom_agent(custom_agents: CustomAgentStore, name: str):
-        """从自定义智能体存储构造可执行的 Agent 实例（内置注册表查不到时使用）。
-
-        将自定义智能体的指令/模型/工具映射为运行时 Agent。
-        """
-        from baize.sdk.agent import Agent
-        from baize.tools import extended_tools
-
-        custom = custom_agents.find_by_name(name)
-        if custom is None:
-            return None
-        tool_map = {t.name: t for t in extended_tools()}
-        tools = [tool_map[t] for t in (custom.get("tools") or []) if t in tool_map]
-        return Agent(
-            name=custom.get("name", name),
-            description=custom.get("description", ""),
-            instructions=custom.get("instructions", ""),
-            model=custom.get("model") or None,
-            tools=tools,
-        )
-
-    @app.get(
-        "/api/v1/agents",
-        response_model=AgentsResponse,
-        dependencies=[Depends(_require_api_key)],
-    )
-    def agents_list() -> AgentsResponse:
-        # 统一返回内置（过滤已删除）+ 自定义智能体，保证列表数据源唯一
-        deleted = get_deleted_store()
-        builtin = [
-            {**a, "is_custom": False}
-            for a in list_agents()
-            if not deleted.is_agent_deleted(a["name"])
-        ]
-        custom = []
-        for a in app.state.custom_agents.list():
-            custom.append(
-                {
-                    "id": a.get("id", a.get("name", "")),
-                    "name": a.get("name", ""),
-                    "description": a.get("description", ""),
-                    "instructions": a.get("instructions", ""),
-                    "model": a.get("model", ""),
-                    "type": "agent",
-                    "pattern_type": None,
-                    "source": "custom",
-                    "is_custom": True,
-                    "tools": [
-                        {"name": t, "description": ""} for t in (a.get("tools") or [])
-                    ],
-                }
-            )
-        return AgentsResponse(agents=[*builtin, *custom])
-
     # ------------------------------------------------------------------
-    # 自定义智能体 CRUD — 必须注册在 /api/v1/agents/{agent_name} 之前，
-    # 否则 "custom" 会被 {agent_name} 动态路由抢先匹配而返回 404
+    # 智能体 API 已废弃 — 内置智能体已移除，对话走黑板驱动的动态 agent 自动编排。
+    # 自定义智能体 CRUD、列表、详情、删除、重置等端点全部移除。
+    # 保留 CustomAgentStore 仅用于流水线自定义 agent 节点的注册。
     # ------------------------------------------------------------------
-    @app.get(
-        "/api/v1/agents/custom",
-        response_model=dict,
-        dependencies=[Depends(_require_api_key)],
-    )
-    def custom_agents_list() -> dict:
-        return {"agents": app.state.custom_agents.list()}
-
-    @app.post(
-        "/api/v1/agents/custom",
-        response_model=dict,
-        dependencies=[Depends(_require_api_key)],
-    )
-    def custom_agents_create(payload: dict) -> dict:
-        return app.state.custom_agents.create(dict(payload))
-
-    @app.put(
-        "/api/v1/agents/custom/{agent_id}",
-        response_model=dict,
-        dependencies=[Depends(_require_api_key)],
-    )
-    def custom_agents_update(agent_id: str, payload: dict) -> dict:
-        agent = app.state.custom_agents.update(agent_id, dict(payload))
-        if agent is None:
-            raise HTTPException(status_code=404, detail="自定义智能体不存在")
-        return agent
-
-    @app.delete(
-        "/api/v1/agents/custom/{agent_id}",
-        dependencies=[Depends(_require_api_key)],
-    )
-    def custom_agents_delete(agent_id: str) -> dict:
-        ok = app.state.custom_agents.delete(agent_id)
-        if not ok:
-            raise HTTPException(status_code=404, detail="自定义智能体不存在")
-        return {"success": True}
-
-    @app.get(
-        "/api/v1/agents/{agent_name}",
-        dependencies=[Depends(_require_api_key)],
-    )
-    def agent_detail(agent_name: str) -> dict:
-        """获取智能体详情，包含 instructions 等完整信息。"""
-        agent = get_agent(agent_name)
-        if agent is not None:
-            return {
-                "name": agent.name,
-                "id": agent.name,
-                "description": getattr(agent, "description", ""),
-                "instructions": getattr(agent, "instructions", ""),
-                "source": "builtin",
-                "type": "agent",
-                "is_custom": False,
-                "tools": [{"name": t.name, "description": t.description} for t in agent.tools],
-            }
-        # 自定义智能体
-        custom = app.state.custom_agents.find_by_name(agent_name)
-        if custom is None:
-            raise HTTPException(status_code=404, detail=f"智能体 '{agent_name}' 未找到")
-        return {
-            "name": custom.get("name", agent_name),
-            "id": custom.get("id", agent_name),
-            "description": custom.get("description", ""),
-            "instructions": custom.get("instructions", ""),
-            "model": custom.get("model", ""),
-            "source": "custom",
-            "type": "agent",
-            "pattern_type": None,
-            "is_custom": True,
-            "tools": [
-                {"name": t, "description": ""} for t in (custom.get("tools") or [])
-            ],
-        }
-
-    @app.delete(
-        "/api/v1/agents/{agent_name}",
-        dependencies=[Depends(_require_api_key)],
-    )
-    def delete_agent(agent_name: str) -> dict:
-        """删除内置智能体（软删除，可恢复）。"""
-        deleted = get_deleted_store()
-        # 确认智能体存在
-        from baize.agents import list_agents as _raw_agents
-        all_agents = [a["name"] for a in _raw_agents()]
-        if agent_name not in all_agents and deleted.is_agent_deleted(agent_name):
-            return {"error": f"智能体 '{agent_name}' 未找到", "ok": False}
-        deleted.delete_agent(agent_name)
-        return {"ok": True, "agent_name": agent_name, "message": "智能体已删除"}
-
-    @app.post(
-        "/api/v1/agents/reset",
-        dependencies=[Depends(_require_api_key)],
-    )
-    def reset_agents() -> dict:
-        """恢复所有已删除的内置智能体。"""
-        deleted = get_deleted_store()
-        count = deleted.reset_agents()
-        return {"ok": True, "restored": count, "message": f"已恢复 {count} 个智能体"}
 
     @app.get(
         "/api/v1/tools",
@@ -1495,11 +1363,9 @@ def create_baize_api_app(
 
         agent_name = payload.agent or session.agent
         agent = get_agent(agent_name)
+        # 内置智能体已废弃 — 回退到 None，由对话自动编排器处理
         if agent is None:
-            # 内置注册表查不到时，尝试自定义智能体
-            agent = _build_custom_agent(app.state.custom_agents, agent_name)
-        if agent is None:
-            agent = get_agent(None)  # 回退默认
+            agent = get_agent(None)  # 回退到第一个已注册 agent（可能为 None）
 
         # ── TokenJuice 语义压缩：为 agent 挂载工具输出压缩器 ──
         if agent is not None and agent.tool_output_compressor is None:
@@ -1516,7 +1382,7 @@ def create_baize_api_app(
         # ── 路由判定 ──
         # 1. 显式流水线模板（pentest/vuln_scan 等）→ orchestration runner
         # 2. 对话模式（有黑板 scope/goal 但无对应模板）→ 黑板驱动的动态 agent 自动编排
-        # 3. 其它 → 内置 agent 直接对话
+        # 3. 内置智能体已废弃 — 当无任何 agent 注册时，全部回退到对话自动编排
         pipeline_def = None
         use_conversation_orchestrator = False
         if getattr(session, "pattern", None):
@@ -1527,6 +1393,9 @@ def create_baize_api_app(
                 pipeline_def = None
         # 对话模式：有黑板（scope/goal 已初始化）且未命中显式流水线模板
         if pipeline_def is None and getattr(session, "blackboard", None) is not None:
+            use_conversation_orchestrator = True
+        # 内置智能体已废弃 — 无 agent 注册时回退到对话自动编排
+        if pipeline_def is None and not use_conversation_orchestrator and agent is None:
             use_conversation_orchestrator = True
 
         # 拼接历史（stateful 会话）：将会话已有消息作为上下文传给 Agent。
@@ -1754,11 +1623,21 @@ def create_baize_api_app(
             if use_conversation_orchestrator:
                 try:
                     from baize.pentest.conversation_orchestrator import ConversationOrchestrator
+                    # 内置智能体已废弃 — 普通对话无 blackboard 时即时构造一个，
+                    # 让 reason→动态 agent→act 循环对简单问题也能直接 done 回复。
+                    blackboard = getattr(session, "blackboard", None)
+                    if blackboard is None:
+                        from baize.pentest.blackboard import Blackboard
+                        blackboard = Blackboard(session_id=session_id)
+                        try:
+                            session.blackboard = blackboard  # 缓存到会话，后续多轮复用
+                        except Exception:  # noqa: BLE001
+                            pass
                     orch = ConversationOrchestrator()
                     # 浏览器协作工具追加到 extra_tools（已在上方组装）
                     async for kind, event in _with_sse_heartbeat(
                         orch.run(
-                            session.blackboard,
+                            blackboard,
                             payload.input,
                             session_id=session_id,
                             session_log=session_log,

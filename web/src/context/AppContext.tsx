@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect, useCallback, useRef, type ReactNode } from 'react';
-import type { ViewPage, Toast, ToolPermission, AgentMetadata, ChatMessage } from '../types';
+import type { ViewPage, Toast, ToolPermission, ChatMessage } from '../types';
 import type { SessionInfo, ModuleInfo } from '../api/client';
 import { fetchModules } from '../api/client';
 
@@ -50,10 +50,6 @@ interface AppState {
   isStreaming: boolean;
   setIsStreaming: (v: boolean) => void;
 
-  // 智能体列表
-  agents: AgentMetadata[];
-  setAgents: (agents: AgentMetadata[]) => void;
-
   // 设置弹窗
   settingsOpen: boolean;
   setSettingsOpen: (v: boolean) => void;
@@ -93,9 +89,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
   // ─ Messages (per active chat session) ─
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isStreaming, setIsStreaming] = useState(false);
-
-  // ─ Agents ─
-  const [agents, setAgents] = useState<AgentMetadata[]>([]);
 
   // ─ Settings modal ─
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -201,7 +194,6 @@ export function AppProvider({ children }: { children: ReactNode }) {
         serverVersion, setServerVersion,
         currentView, setCurrentView,
         messages, setMessages, isStreaming, setIsStreaming,
-        agents, setAgents,
         settingsOpen, setSettingsOpen,
         toasts, addToast, removeToast,
         sessions, setSessions, addSession, removeSession,

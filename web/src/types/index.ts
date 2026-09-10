@@ -5,27 +5,6 @@ export interface HealthResponse {
   version: string;
 }
 
-export interface AgentTool {
-  name: string;
-  description: string | null;
-}
-
-export interface AgentMetadata {
-  id?: string;
-  name: string;
-  description: string | null;
-  type: 'agent' | 'pattern';
-  pattern_type: string | null;
-  tools: AgentTool[];
-  is_custom?: boolean;
-  source?: 'builtin' | 'custom';
-  instructions?: string;
-}
-
-export interface AgentsResponse {
-  agents: AgentMetadata[];
-}
-
 export interface ModelPricing {
   input_cost_per_token: number | null;
   output_cost_per_token: number | null;

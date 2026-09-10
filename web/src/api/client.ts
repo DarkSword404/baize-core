@@ -2,7 +2,6 @@
 
 import type {
   HealthResponse,
-  AgentsResponse,
   ModelsResponse,
   SessionsResponse,
   SessionSummary,
@@ -109,11 +108,6 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 // ===== Health =====
 export async function healthCheck(): Promise<HealthResponse> {
   return request('/health');
-}
-
-// ===== Agents =====
-export async function listAgents(): Promise<AgentsResponse> {
-  return request('/agents');
 }
 
 // ===== Pipelines =====
@@ -275,36 +269,6 @@ export async function testCustomTool(code: string, args?: Record<string, unknown
   stderr?: string;
 }> {
   return request('/tools/custom/test', { method: 'POST', body: JSON.stringify({ code, args, timeout }) });
-}
-
-export async function listCustomAgents(): Promise<CustomAgentsResponse> {
-  return request('/agents/custom');
-}
-
-export async function createCustomAgent(data: {
-  name: string;
-  display_name?: string;
-  description?: string;
-  instructions?: string;
-  model?: string;
-  tools?: string[];
-}): Promise<CustomAgent> {
-  return request('/agents/custom', { method: 'POST', body: JSON.stringify(data) });
-}
-
-export async function updateCustomAgent(id: string, data: {
-  name?: string;
-  display_name?: string;
-  description?: string;
-  instructions?: string;
-  model?: string;
-  tools?: string[];
-}): Promise<CustomAgent> {
-  return request(`/agents/custom/${id}`, { method: 'PUT', body: JSON.stringify(data) });
-}
-
-export async function deleteCustomAgent(id: string): Promise<{ success: boolean }> {
-  return request(`/agents/custom/${id}`, { method: 'DELETE' });
 }
 
 // ===== Models =====
@@ -735,21 +699,6 @@ export async function deleteBuiltinTemplate(templateId: string): Promise<{ ok: b
 /** 恢复所有已删除的内置流水线模板 */
 export async function resetBuiltinTemplates(): Promise<{ ok: boolean; restored: number; message: string }> {
   return request('/pipelines/templates/reset', { method: 'POST' });
-}
-
-/** 删除内置智能体 */
-export async function deleteBuiltinAgent(agentName: string): Promise<{ ok: boolean; agent_name: string; message: string }> {
-  return request(`/agents/${agentName}`, { method: 'DELETE' });
-}
-
-/** 获取智能体详情（含完整 instructions） */
-export async function getAgentDetail(name: string): Promise<{ name: string; id: string; description: string; instructions: string; source: string; type: string; tools: Array<{ name: string; description: string }> }> {
-  return request(`/agents/${name}`);
-}
-
-/** 恢复所有已删除的内置智能体 */
-export async function resetBuiltinAgents(): Promise<{ ok: boolean; restored: number; message: string }> {
-  return request('/agents/reset', { method: 'POST' });
 }
 
 // ---- 后台执行 Runs API ----

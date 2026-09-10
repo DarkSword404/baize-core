@@ -8,7 +8,6 @@
 
 import { useState, useEffect, useCallback, useRef } from 'react';
 import * as api from '../api/client';
-import type { AgentMetadata } from '../types';
 import type {
   PipelineInstance,
   InstanceStatus,
@@ -1381,7 +1380,6 @@ function CreatePipelineModal({ initial, onClose, onCreated, onUpdated, showFeedb
   const [pipelineType, setPipelineType] = useState<'manual' | 'auto'>(initial?.type === 'auto' ? 'auto' : 'manual');
   const [nodes, setNodes] = useState<CanvasNode[]>([]);
   const [edges, setEdges] = useState<CanvasEdge[]>([]);
-  const [agents, setAgents] = useState<AgentMetadata[]>([]);
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
   const [connectStart, setConnectStart] = useState<string | null>(null);
   const [dragging, setDragging] = useState<{ id: string; sx: number; sy: number } | null>(null);
@@ -1389,11 +1387,6 @@ function CreatePipelineModal({ initial, onClose, onCreated, onUpdated, showFeedb
   const [creating, setCreating] = useState(false);
   const svgRef = useRef<SVGSVGElement>(null);
   const initRef = useRef(false);
-
-  // 加载已有智能体列表
-  useEffect(() => {
-    api.listAgents().then(r => setAgents(r.agents)).catch(() => {});
-  }, []);
 
   // 编辑模板：把模板 nodes 装入画布（自动补坐标 / 推导连线）
   useEffect(() => {
@@ -1955,7 +1948,7 @@ function CreatePipelineModal({ initial, onClose, onCreated, onUpdated, showFeedb
                     </button>
                   </div>
                 </div>
-                <NodeConfigForm node={selectedNode} onChange={updateNode} agents={agents} allNodes={nodes} />
+                <NodeConfigForm node={selectedNode} onChange={updateNode} allNodes={nodes} />
                 <div className="pt-1 border-t border-gray-800 mt-1">
                   <p className="text-[9px] text-gray-600 leading-relaxed">
                     分支类节点（条件/AI决策/确认/并行）：连出线会自动写入右侧分支目标；条件、默认分支可在此配置。
@@ -2000,10 +1993,9 @@ function CreatePipelineModal({ initial, onClose, onCreated, onUpdated, showFeedb
   );
 }
 
-function NodeConfigForm({ node, onChange, agents, allNodes }: {
+function NodeConfigForm({ node, onChange, allNodes }: {
   node: CanvasNode;
   onChange: (u: Partial<CanvasNode>) => void;
-  agents: AgentMetadata[];
   allNodes?: CanvasNode[];
 }) {
   return (
@@ -2022,13 +2014,8 @@ function NodeConfigForm({ node, onChange, agents, allNodes }: {
         <>
           <label className="block">
             <span className="text-[10px] text-gray-500">绑定智能体</span>
-            <select value={node.agent || ''} onChange={e => onChange({ agent: e.target.value })}
-              className="w-full mt-0.5 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500">
-              <option value="">-- 选择智能体 --</option>
-              {agents.map(a => (
-                <option key={a.id || a.name} value={a.id || a.name}>{a.name}{a.description ? ` — ${a.description.slice(0, 40)}` : ''}</option>
-              ))}
-            </select>
+            <input type="text" value={node.agent || ''} onChange={e => onChange({ agent: e.target.value })}
+              className="w-full mt-0.5 px-2 py-1.5 bg-gray-800 border border-gray-700 rounded text-xs text-gray-200 outline-none focus:border-blue-500" placeholder="输入智能体名称" />
           </label>
           <label className="block">
             <span className="text-[10px] text-gray-500">Prompt 模板</span>

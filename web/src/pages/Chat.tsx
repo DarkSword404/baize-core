@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useApp } from '../context/AppContext';
-import { listSessions, getSession, deleteSession, streamMessage, cancelSession, listAgents, respondToPrompt, uploadAttachment, deleteAttachment, switchSessionBrowserCollab } from '../api/client';
+import { listSessions, getSession, deleteSession, streamMessage, cancelSession, respondToPrompt, uploadAttachment, deleteAttachment, switchSessionBrowserCollab } from '../api/client';
 import { BrowserPanel } from './Browser';
 import type { PromptRequest, ReasoningStep, AttachmentInfo } from '../api/client';
 import { ChatMessage } from '../components/ChatMessage';
@@ -144,7 +144,7 @@ export function Chat(): JSX.Element {
   const {
     sessions, setSessions, activeSessionId, setActiveSessionId,
     messages, setMessages, isStreaming, setIsStreaming,
-    addToast, setAgents, removeSession, updateSession,
+    addToast, removeSession, updateSession,
   } = useApp();
 
   const [input, setInput] = useState('');
@@ -185,23 +185,17 @@ export function Chat(): JSX.Element {
     (m.intermediates || []).map((s, si) => ({ ...s, _msgIdx: mi, _stepIdx: si, _ts: m.timestamp }))
   );
 
-  // Load sessions, agents on mount; auto-restore last active session
+  // Load sessions on mount; auto-restore last active session
   useEffect(() => {
-    Promise.all([
-      listSessions().then(r => {
-        setSessions(r.sessions);
-        // Auto-restore last active session from localStorage
-        // 消息加载统一交给下方 activeSessionId effect，避免重复请求
-        const savedSessionId = localStorage.getItem('baize_active_session');
-        if (savedSessionId && r.sessions.some(s => s.id === savedSessionId)) {
-          setActiveSessionId(savedSessionId);
-        }
-      }).catch(() => {}),
-      // 后端 /api/v1/agents 已统一返回内置 + 自定义智能体
-      listAgents().then(r => {
-        setAgents(r.agents);
-      }).catch(() => {}),
-    ]);
+    listSessions().then(r => {
+      setSessions(r.sessions);
+      // Auto-restore last active session from localStorage
+      // 消息加载统一交给下方 activeSessionId effect，避免重复请求
+      const savedSessionId = localStorage.getItem('baize_active_session');
+      if (savedSessionId && r.sessions.some(s => s.id === savedSessionId)) {
+        setActiveSessionId(savedSessionId);
+      }
+    }).catch(() => {});
   }, []);
 
   // 同步 isStreaming 镜像

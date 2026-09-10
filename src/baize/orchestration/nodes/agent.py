@@ -32,16 +32,22 @@ class AgentNodeExecutor(BaseNodeExecutor):
             # 3. 调用 Agent SDK（get_agent 定义于 baize.agents，支持别名解析）
             from baize.agents import get_agent
             agent = get_agent(node.agent)
+
+            # 3b. 内置智能体已废弃 — 找不到时用 DynamicAgentFactory 临时创建
             if agent is None and node.agent:
-                # 模板引用别名失败时降级为模糊匹配（兼容历史模板名）
-                from baize.agents import list_agents
-                _name = node.agent.lower()
-                for info in list_agents():
-                    if _name in info["name"].lower() or _name in info.get("id", "").lower():
-                        agent = get_agent(info["id"])
-                        break
+                from baize.pentest.dynamic_agent import AgentSpec, get_factory
+                factory = get_factory()
+                role = node.agent.replace("_", " ").title()
+                spec = AgentSpec(
+                    role_prompt=f"你是{role}。基于流水线任务指令完成分析，输出客观发现。",
+                    tools=[],
+                    reasoning=f"流水线节点 {node.id} 指派 agent={node.agent}",
+                    confidence=0.7,
+                )
+                agent = factory.create_agent(spec, session_id=state.get("session_id", ""))
+
             if agent is None:
-                raise RuntimeError(f"Agent '{node.agent}' 未注册")
+                raise RuntimeError(f"Agent '{node.agent}' 未注册且无法动态创建")
 
             # 调用 Agent.run(user_message) 执行对话
             result = await agent.run(user_message=prompt)
