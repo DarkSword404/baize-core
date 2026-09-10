@@ -1756,7 +1756,7 @@ def create_baize_api_app(
                     from baize.pentest.conversation_orchestrator import ConversationOrchestrator
                     orch = ConversationOrchestrator()
                     # 浏览器协作工具追加到 extra_tools（已在上方组装）
-                    async for ev_type, ev_data in _with_sse_heartbeat(
+                    async for kind, event in _with_sse_heartbeat(
                         orch.run(
                             session.blackboard,
                             payload.input,
@@ -1764,13 +1764,15 @@ def create_baize_api_app(
                             session_log=session_log,
                             extra_tools=extra_tools,
                         ),
-                        interval=15.0,
+                        interval=10.0,
                     ):
                         if await request.is_disconnected():
                             break
-                        if ev_type == "heartbeat":
+                        if kind == "heartbeat":
                             yield ": keepalive\n\n"
                             continue
+                        # 解包编排器事件 (ev_type, ev_data)
+                        ev_type, ev_data = event
                         if ev_type == "reasoning":
                             text = ev_data.get("text", "")
                             reasoning_parts.append(text)
