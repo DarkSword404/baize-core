@@ -498,8 +498,11 @@ async def _with_sse_heartbeat(agen, interval: float = 15.0):
     - ``("event", event)``：上游生成器产出的原始事件
     - ``("heartbeat", None)``：超过 ``interval`` 秒无事件时产出的心跳标记
 
-    调用方对心跳标记应输出 SSE 注释行（``: keepalive``），不触发前端事件，
-    但能维持 TCP 连接活跃，避免代理/网络设备因空闲超时切断会话。
+    调用方对心跳标记应输出真正的 SSE 事件（``event: ping``），而非注释行。
+    部分反向代理/CDN（如 Trae preview 网关）不把 SSE 注释行（``:`` 开头）视为有效数据，
+    会在首字节/空闲超时后切断连接（ERR_INCOMPLETE_CHUNKED_ENCODING）。
+    用 ``event: ping\ndata: {"type":"ping"}`` 事件能被网关识别为有效数据，维持连接活跃；
+    前端解析后因无 text/content/final_output 字段会安全忽略。
     """
     next_task: asyncio.Task | None = None
     sleep_task: asyncio.Task | None = None
@@ -1480,7 +1483,7 @@ def create_baize_api_app(
             # 部分反向代理/CDN（如 Trae preview 网关）对 POST+SSE 有首字节超时，
             # 若在 LLM/工具执行期间迟迟不发数据，会被网关以 ERR_INCOMPLETE_CHUNKED_ENCODING 切断。
             # 此 SSE 注释行不触发前端任何事件，但维持 TCP/SSE 连接活跃。
-            yield ": stream-started\n\n"
+            yield 'event: ping\ndata: {"type":"ping"}\n\n'
 
             # ── 输入安全护栏（运行时规则即时生效） ──
             ok, guard_message = check_input_guardrail(payload.input)
@@ -1553,7 +1556,7 @@ def create_baize_api_app(
                             break
                         if kind == "heartbeat":
                             # SSE 注释行：仅维持 TCP 连接活跃
-                            yield ": keepalive\n\n"
+                            yield 'event: ping\ndata: {"type":"ping"}\n\n'
                             continue
                         etype = event.get("type", "")
                         edata = event.get("data", {}) or {}
@@ -1654,7 +1657,7 @@ def create_baize_api_app(
                         if await request.is_disconnected():
                             break
                         if kind == "heartbeat":
-                            yield ": keepalive\n\n"
+                            yield 'event: ping\ndata: {"type":"ping"}\n\n'
                             continue
                         # 解包编排器事件 (ev_type, ev_data)
                         ev_type, ev_data = event
@@ -1712,7 +1715,7 @@ def create_baize_api_app(
                         break
                     if kind == "heartbeat":
                         # SSE 注释行：不产生前端事件，仅维持 TCP 连接活跃
-                        yield ": keepalive\n\n"
+                        yield 'event: ping\ndata: {"type":"ping"}\n\n'
                         continue
                     if event.type == "reasoning":
                         reasoning_parts.append(event.content)
@@ -1847,7 +1850,7 @@ def create_baize_api_app(
                     else:
                         # 1 秒无数据：发送 SSE 注释行保活
                         # （注释行不触发前端事件，但维持 TCP/SSE 连接活跃）
-                        yield ": keepalive\n\n"
+                        yield 'event: ping\ndata: {"type":"ping"}\n\n'
                         sleep_task = None
             finally:
                 for t in (next_task, sleep_task):
