@@ -1476,6 +1476,12 @@ def create_baize_api_app(
             # 是否已把本轮内容持久化（正常完成 / 中断都只保存一次）
             saved = False
 
+            # ── 立即发送首字节：避免代理网关因首字节超时切断连接 ──
+            # 部分反向代理/CDN（如 Trae preview 网关）对 POST+SSE 有首字节超时，
+            # 若在 LLM/工具执行期间迟迟不发数据，会被网关以 ERR_INCOMPLETE_CHUNKED_ENCODING 切断。
+            # 此 SSE 注释行不触发前端任何事件，但维持 TCP/SSE 连接活跃。
+            yield ": stream-started\n\n"
+
             # ── 输入安全护栏（运行时规则即时生效） ──
             ok, guard_message = check_input_guardrail(payload.input)
             if not ok:
@@ -1788,10 +1794,78 @@ def create_baize_api_app(
                 except Exception:  # noqa: BLE001
                     pass
 
+        async def _event_source_with_heartbeat():
+            """外层心跳包装：保证 event_source 整个生命周期（含 LLM 首字节等待）
+            都有 SSE 心跳注释行产出，避免代理网关因空闲超时切断连接。
+
+            event_source 内部的 _with_sse_heartbeat 只覆盖到编排器/agent 循环，
+            但循环进入前的护栏检查、用户消息持久化、记忆召回等准备阶段
+            同样可能耗时，需要外层兜底心跳。
+
+            关键：捕获 event_source 抛出的任何异常，转为 SSE error 事件 + [DONE]，
+            确保 chunked 编码正常关闭，避免前端收到 ERR_INCOMPLETE_CHUNKED_ENCODING。
+            """
+            agen = event_source()
+            next_task: Optional[asyncio.Task] = None
+            sleep_task: Optional[asyncio.Task] = None
+            try:
+                while True:
+                    if next_task is None:
+                        next_task = asyncio.ensure_future(agen.__anext__())
+                    if sleep_task is None:
+                        sleep_task = asyncio.ensure_future(asyncio.sleep(1.0))
+                    done, _ = await asyncio.wait(
+                        {next_task, sleep_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if next_task in done:
+                        if sleep_task is not None and not sleep_task.done():
+                            sleep_task.cancel()
+                        sleep_task = None
+                        try:
+                            item = next_task.result()
+                        except StopAsyncIteration:
+                            # event_source 正常结束（内部已发送 [DONE]），直接返回
+                            return
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:  # noqa: BLE001
+                            # event_source 内部未捕获的异常：转为 SSE error 事件，
+                            # 并发送 [DONE] 确保 chunked 编码正常关闭，
+                            # 避免前端收到 ERR_INCOMPLETE_CHUNKED_ENCODING。
+                            logger.exception("SSE event_source 异常: %s", e)
+                            try:
+                                yield (
+                                    f"data: {json.dumps({'type': 'error', 'error': _format_detailed_error(e, 'SSE')})}\n\n"
+                                )
+                                yield "data: [DONE]\n\n"
+                            except Exception:  # noqa: BLE001
+                                pass
+                            return
+                        next_task = None
+                        yield item
+                    else:
+                        # 1 秒无数据：发送 SSE 注释行保活
+                        # （注释行不触发前端事件，但维持 TCP/SSE 连接活跃）
+                        yield ": keepalive\n\n"
+                        sleep_task = None
+            finally:
+                for t in (next_task, sleep_task):
+                    if t is not None and not t.done():
+                        t.cancel()
+                try:
+                    await agen.aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+
         return StreamingResponse(
-            event_source(),
+            _event_source_with_heartbeat(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                "Connection": "keep-alive",
+            },
         )
 
     # ------------------------------------------------------------------
