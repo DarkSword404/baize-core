@@ -44,11 +44,15 @@ interface AppState {
   addToast: (t: Omit<Toast, 'id'>) => void;
   removeToast: (id: string) => void;
 
-  // 会话消息（当前活动会话）
+  // 会话消息（按 sessionId 隔离，messages 为当前活动会话的视图）
   messages: ChatMessage[];
   setMessages: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
+  setMessagesForSession: (sessionId: string, updater: (prev: ChatMessage[]) => ChatMessage[]) => void;
+  messagesBySession: Record<string, ChatMessage[]>;
   isStreaming: boolean;
   setIsStreaming: (v: boolean) => void;
+  setSessionStreaming: (sessionId: string, v: boolean) => void;
+  streamingSessions: Set<string>;
 
   // 设置弹窗
   settingsOpen: boolean;
@@ -86,9 +90,9 @@ export function AppProvider({ children }: { children: ReactNode }) {
   // ─ Navigation (URL-driven, legacy compatibility) ─
   const [currentView, setCurrentView] = useState<ViewPage>('dashboard');
 
-  // ─ Messages (per active chat session) ─
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [isStreaming, setIsStreaming] = useState(false);
+  // ─ Messages (per-session cache; messages 为当前活动会话的视图) ─
+  const [messagesBySession, setMessagesBySession] = useState<Record<string, ChatMessage[]>>({});
+  const [streamingSessions, setStreamingSessions] = useState<Set<string>>(new Set());
 
   // ─ Settings modal ─
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -136,6 +140,44 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const updateSession = useCallback((id: string, updates: Partial<SessionInfo>) => {
     setSessionsState(prev => prev.map(s => s.id === id ? { ...s, ...updates } : s));
   }, []);
+
+  // ─ Messages: per-session cache + active-session view ─
+  // messages 始终指向当前活动会话的消息；切换会话时自动切换视图，
+  // 正在流式生成的会话内容会被保留在缓存中，切回时不丢失。
+  const messages: ChatMessage[] = activeSessionId ? (messagesBySession[activeSessionId] || []) : [];
+
+  const setMessages = useCallback((updater: React.SetStateAction<ChatMessage[]>) => {
+    const sid = activeSessionId;
+    if (!sid) return;
+    setMessagesBySession(prev => {
+      const cur = prev[sid] || [];
+      const next = typeof updater === 'function'
+        ? (updater as (p: ChatMessage[]) => ChatMessage[])(cur)
+        : updater;
+      return { ...prev, [sid]: next };
+    });
+  }, [activeSessionId]);
+
+  /** 流式回调专用：更新指定会话（可能并非当前活动会话）的消息缓存 */
+  const setMessagesForSession = useCallback((sid: string, updater: (prev: ChatMessage[]) => ChatMessage[]) => {
+    setMessagesBySession(prev => {
+      const cur = prev[sid] || [];
+      return { ...prev, [sid]: updater(cur) };
+    });
+  }, []);
+
+  // ─ Streaming state: per-session ─
+  const setSessionStreaming = useCallback((sid: string, v: boolean) => {
+    setStreamingSessions(prev => {
+      const next = new Set(prev);
+      if (v) next.add(sid); else next.delete(sid);
+      return next;
+    });
+  }, []);
+  const isStreaming = activeSessionId ? streamingSessions.has(activeSessionId) : false;
+  const setIsStreaming = useCallback((v: boolean) => {
+    if (activeSessionId) setSessionStreaming(activeSessionId, v);
+  }, [activeSessionId, setSessionStreaming]);
 
   // ─ Tool Permissions ─────────────────────────────────
   const [toolPermissions, setToolPermissionsState] = useState<Map<string, ToolPermission>>(() => {
@@ -193,7 +235,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
         serverConnected, setServerConnected,
         serverVersion, setServerVersion,
         currentView, setCurrentView,
-        messages, setMessages, isStreaming, setIsStreaming,
+        messages, setMessages, setMessagesForSession, messagesBySession,
+        isStreaming, setIsStreaming, setSessionStreaming, streamingSessions,
         settingsOpen, setSettingsOpen,
         toasts, addToast, removeToast,
         sessions, setSessions, addSession, removeSession,

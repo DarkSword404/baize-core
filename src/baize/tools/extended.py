@@ -31,9 +31,16 @@ def _run_shell(command: str, timeout: int = 120, **kwargs: Any) -> str:
     - 进程组级清理（超时/取消时子孙进程不泄漏成孤儿）；
     - 按 ``BAIZE_EXEC_*`` 环境变量可配置的隔离/远程后端。
 
+    **会话工作区隔离**：agent 会话上下文中执行时，命令自动 cd 到
+    本会话工作区并把 HOME/TMPDIR 指向工作区（见 baize.pentest.workspace），
+    避免 sed/脚本产物污染共享目录或误用历史任务遗留文件。
+
     注意 ``timeout<=0`` 表示不限制，交由执行器/Agent 兜底超时管理。
     """
     try:
+        # 会话工作区隔离（无会话上下文时原样执行）
+        from baize.pentest.workspace import workspace_prefix_command
+        command = workspace_prefix_command(command)
         from baize.executors import ExecutorConfig, build_executor
 
         cfg = ExecutorConfig.from_env()
@@ -43,7 +50,11 @@ def _run_shell(command: str, timeout: int = 120, **kwargs: Any) -> str:
         if result.session:
             # 长任务仍在后台 tmux 会话中运行，把会话名与输出文件带给模型，
             # 便于稍后用 generic_linux_command 取回完整结果或确认结束。
-            log_path = f"/tmp/baize-tmux/{result.session}/output.log"
+            from baize.pentest.workspace import is_container_mode
+            if is_container_mode():
+                log_path = f"/workspace/.baize-tmux/{result.session}/output.log"
+            else:
+                log_path = f"/tmp/baize-tmux/{result.session}/output.log"
             text = (
                 f"{text}\n[长任务] 命令超过单次执行时限后仍在后台 tmux 会话 "
                 f"`{result.session}` 中运行（不会被杀死）。"
@@ -57,13 +68,23 @@ def _run_shell(command: str, timeout: int = 120, **kwargs: Any) -> str:
 
 
 def _execute_code(code: str, timeout: int = 60) -> str:
-    """在隔离的临时环境中执行 Python 代码。"""
+    """在隔离的临时环境中执行 Python 代码（会话上下文中落工作区）。"""
     try:
+        from baize.pentest.workspace import is_container_mode
+        if is_container_mode():
+            # 容器模式：通过 SessionContainerExecutor 在容器内执行 python
+            from baize.executors import ExecutorConfig, build_executor
+            executor = build_executor(ExecutorConfig.from_env())
+            result = asyncio.run(executor.run(f"python3 -c {shlex.quote(code)}", timeout=timeout))
+            return result.text
+        from baize.pentest.workspace import get_current_workspace
+        cwd = str(get_current_workspace()) if get_current_workspace() else None
         proc = subprocess.run(
             ["python3", "-c", code],
             capture_output=True,
             text=True,
             timeout=timeout,
+            cwd=cwd,
         )
         out = (proc.stdout or "") + (proc.stderr or "")
         return out.strip() or f"(exit {proc.returncode}, 无输出)"

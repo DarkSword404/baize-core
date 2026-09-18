@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useApp } from '../context/AppContext';
-import { listSessions, deleteSession, getSession } from '../api/client';
+import { listSessions, archiveSession, getSession } from '../api/client';
 import type { SessionDetail } from '../types';
 import type { JSX } from 'react';
 
@@ -27,17 +27,17 @@ export function Sessions(): JSX.Element {
     }
   }
 
-  async function handleDelete(id: string) {
-    if (!window.confirm('确定删除该会话？\n将同时删除该会话的附件、解压文件与附件索引。\n（本次对话已沉淀的记忆不受影响，可在「记忆库」查看）')) {
+  async function handleArchive(id: string) {
+    if (!window.confirm('结束该任务？\n对话内容将归档到「任务记录」，绑定的容器（如有）将释放回容器池供复用。')) {
       return;
     }
     try {
-      await deleteSession(id);
+      await archiveSession(id);
       removeSession(id);
       if (selectedSession?.id === id) setSelectedSession(null);
-      addToast({ type: 'info', title: '会话已删除' });
+      addToast({ type: 'info', title: '任务已归档', message: '对话已备份到任务记录，容器已释放回池' });
     } catch (err: any) {
-      addToast({ type: 'error', title: '删除失败', message: err.message });
+      addToast({ type: 'error', title: '归档失败', message: err.message });
     }
   }
 
@@ -144,10 +144,10 @@ export function Sessions(): JSX.Element {
                         详情
                       </button>
                       <button
-                        onClick={() => handleDelete(s.id)}
-                        className="px-3 py-1.5 text-xs bg-red-600/10 hover:bg-red-600/20 text-red-400 rounded-lg border border-red-600/20 transition-colors"
+                        onClick={() => handleArchive(s.id)}
+                        className="px-3 py-1.5 text-xs bg-amber-600/10 hover:bg-amber-600/20 text-amber-400 rounded-lg border border-amber-600/20 transition-colors"
                       >
-                        删除
+                        归档
                       </button>
                     </div>
                   </td>

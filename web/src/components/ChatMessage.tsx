@@ -68,7 +68,7 @@ export function ChatMessage({ msg }: { msg: ChatMessageType }): JSX.Element {
         }`}
       >
         {msg.content ? (
-          <div className="prose-chat whitespace-pre-wrap break-words" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+          <div className="prose-chat break-words space-y-0.5" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
         ) : msg.isStreaming ? (
           <span className="text-gray-500 italic">思考中...</span>
         ) : (
@@ -163,13 +163,43 @@ function ThinkingBlock({ item, timestamp, isLast }: { item: IntermediateData; ti
       </button>
       {expanded && (
         <div className={`mt-1 mx-1 px-3 py-2 rounded-lg border ${ico.border} bg-gray-800/40 max-h-60 overflow-y-auto`}>
-          <pre className="text-xs text-gray-300 whitespace-pre-wrap font-mono break-all">
-            {item.detail}
-          </pre>
+          <div className="text-xs whitespace-pre-wrap break-words font-mono"
+               dangerouslySetInnerHTML={{ __html: renderThinkingDetail(item.detail) }} />
         </div>
       )}
     </div>
   );
+}
+
+/** 渲染思考块详情：在纯文本基础上，对证实/证否行着色 */
+function renderThinkingDetail(text: string): string {
+  // Escape HTML
+  let html = text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  // 逐行处理，对含 ✓/✅ 的行标绿，含 ❌/✗/失败 的行标红
+  const lines = html.split('\n');
+  const out: string[] = [];
+  for (const line of lines) {
+    if (/[✅✓]/.test(line) && !/[❌✗]/.test(line)) {
+      // 证实行：绿色
+      out.push(`<span class="text-green-400">${line}</span>`);
+    } else if (/[❌✗]/.test(line)) {
+      // 证否行：红色
+      out.push(`<span class="text-red-400">${line}</span>`);
+    } else if (/^\[?(失败|超时|异常|死路)\]?/.test(line.trim()) || /\b(failed|error|timeout)\b/i.test(line)) {
+      out.push(`<span class="text-red-400">${line}</span>`);
+    } else if (/^\[?(成功|完成|已确认|已验证)\]?/.test(line.trim()) || /\b(success|confirmed|verified)\b/i.test(line)) {
+      out.push(`<span class="text-green-400">${line}</span>`);
+    } else {
+      out.push(`<span class="text-gray-300">${line}</span>`);
+    }
+  }
+  return out.join('<br/>');
 }
 
 function renderMarkdown(text: string): string {
@@ -181,29 +211,134 @@ function renderMarkdown(text: string): string {
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
 
-  // Code blocks: ```...```
+  // Code blocks: ```...```（先提取，避免内部被其他规则误伤）
+  const codeBlocks: string[] = [];
   html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) => {
-    return `<pre>${code.trim()}</pre>`;
+    const placeholder = `\x00CODEBLOCK${codeBlocks.length}\x00`;
+    codeBlocks.push(`<pre class="code-block">${code.trim()}</pre>`);
+    return placeholder;
   });
 
-  // Inline code: `code`
-  html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // 逐行处理块级元素
+  const lines = html.split('\n');
+  const outLines: string[] = [];
+  let inTable = false;
+  let inList = false;
+  let listType = ''; // 'ul' | 'ol'
+  let inQuote = false;
 
-  // Bold/italic
-  html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
+  function flushList() {
+    if (inList) { outLines.push(`</${listType}>`); inList = false; }
+  }
+  function flushQuote() {
+    if (inQuote) { outLines.push('</blockquote>'); inQuote = false; }
+  }
+  function flushTable() {
+    if (inTable) { outLines.push('</tbody></table>'); inTable = false; }
+  }
 
-  // Links（协议白名单：仅 http/https/mailto；javascript:/data:/相对路径一律降级为纯文本）
-  html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label, url) => {
-    const target = url.trim();
-    if (/^(https?:|mailto:)/i.test(target)) {
-      return `<a href="${target}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Codeblock placeholder（整行）
+    if (/^\x00CODEBLOCK\d+\x00$/.test(line.trim())) {
+      flushList(); flushQuote(); flushTable();
+      outLines.push(line.trim());
+      continue;
     }
-    return label;
-  });
 
-  // Line breaks
-  html = html.replace(/\n/g, '<br/>');
+    // 水平分隔线
+    if (/^---+\s*$/.test(line.trim())) {
+      flushList(); flushQuote(); flushTable();
+      outLines.push('<hr class="border-gray-700 my-2"/>');
+      continue;
+    }
+
+    // 标题 # ~ ######
+    const hMatch = line.match(/^(#{1,6})\s+(.+)$/);
+    if (hMatch) {
+      flushList(); flushQuote(); flushTable();
+      const level = hMatch[1].length;
+      const sizes = ['text-base', 'text-sm', 'text-sm', 'text-xs', 'text-xs', 'text-xs'];
+      outLines.push(`<h${level} class="font-bold text-gray-100 mt-2 mb-1 ${sizes[level-1]}">${hMatch[2]}</h${level}>`);
+      continue;
+    }
+
+    // 表格行（含 | 分隔）
+    if (line.includes('|') && line.trim().startsWith('|')) {
+      // 分隔行（|---|---|）跳过
+      if (/^\|[\s:|-]+$/.test(line.trim())) continue;
+      if (!inTable) {
+        flushList(); flushQuote();
+        outLines.push('<table class="w-full text-xs my-2 border-collapse">');
+        outLines.push('<tbody>');
+        inTable = true;
+      }
+      const cleanCells = line.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+      outLines.push('<tr>' + cleanCells.map(c => `<td class="border border-gray-700 px-2 py-1 text-gray-300">${c}</td>`).join('') + '</tr>');
+      continue;
+    } else if (inTable) {
+      flushTable();
+    }
+
+    // 引用块 > 
+    if (line.trim().startsWith('&gt;')) {
+      if (!inQuote) {
+        flushList(); flushTable();
+        outLines.push('<blockquote class="border-l-2 border-gray-600 pl-3 my-1 text-gray-400 italic">');
+        inQuote = true;
+      }
+      outLines.push(line.replace(/^\s*&gt;\s?/, '') + '<br/>');
+      continue;
+    } else if (inQuote) {
+      flushQuote();
+    }
+
+    // 无序列表 - 或 *
+    if (/^\s*[-*]\s+/.test(line)) {
+      if (!inList || listType !== 'ul') { flushList(); outLines.push('<ul class="list-disc list-inside my-1 space-y-0.5">'); inList = true; listType = 'ul'; }
+      outLines.push(`<li class="text-gray-300">${line.replace(/^\s*[-*]\s+/, '')}</li>`);
+      continue;
+    }
+    // 有序列表 1.
+    if (/^\s*\d+\.\s+/.test(line)) {
+      if (!inList || listType !== 'ol') { flushList(); outLines.push('<ol class="list-decimal list-inside my-1 space-y-0.5">'); inList = true; listType = 'ol'; }
+      outLines.push(`<li class="text-gray-300">${line.replace(/^\s*\d+\.\s+/, '')}</li>`);
+      continue;
+    }
+    // 空行
+    if (!line.trim()) {
+      flushList(); flushQuote(); flushTable();
+      outLines.push('<div class="h-1"></div>');
+      continue;
+    }
+
+    // 普通行
+    flushList(); flushQuote(); flushTable();
+    // Inline code: `code`
+    let processed = line.replace(/`([^`]+)`/g, '<code class="bg-gray-800/60 px-1 py-0.5 rounded text-emerald-300 text-xs">$1</code>');
+    // Bold/italic
+    processed = processed.replace(/\*\*(.+?)\*\*/g, '<strong class="font-bold text-gray-100">$1</strong>');
+    processed = processed.replace(/\*(.+?)\*/g, '<em class="italic">$1</em>');
+    // Links
+    processed = processed.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_m, label, url) => {
+      const target = url.trim();
+      if (/^(https?:|mailto:)/i.test(target)) {
+        return `<a href="${target}" target="_blank" rel="noopener noreferrer" class="text-blue-400 underline hover:text-blue-300">${label}</a>`;
+      }
+      return label;
+    });
+    outLines.push(`<span class="text-gray-300">${processed}</span><br/>`);
+  }
+
+  flushList(); flushQuote(); flushTable();
+
+  html = outLines.join('\n');
+
+  // 还原代码块
+  codeBlocks.forEach((block, i) => {
+    html = html.replace(`\x00CODEBLOCK${i}\x00`, block);
+  });
 
   return html;
 }

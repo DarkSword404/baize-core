@@ -697,6 +697,155 @@ class TmuxExecutor(BaseExecutor):
 
 
 # ---------------------------------------------------------------------------
+# 会话级持久容器执行器（每会话一个常驻容器，所有命令 exec 进入）
+# ---------------------------------------------------------------------------
+
+class SessionContainerExecutor(BaseExecutor):
+    """会话级容器执行器。
+
+    每个会话拥有一个持久容器 ``baize-sandbox-{session_id}``，所有命令
+    通过 ``{runtime} exec`` 进入该容器执行。容器内以 root 运行，
+    可直接 apt 安装工具；文件系统/进程与其他会话完全隔离。
+
+    安全：命令进入 exec 前先过 ``container_guard`` 逃逸扫描；
+    容器本身由运行时加固参数（cap-drop / no-new-privs / read-only）
+    提供主防线，门禁为纵深防御。
+    """
+
+    name = "container"
+    default_enforcement = EnforcementLevel.FULL
+
+    def __init__(self, session_id: Optional[str] = None) -> None:
+        from baize.pentest.workspace import get_current_session, get_container_manager
+        self.session_id = session_id or get_current_session()
+        if not self.session_id:
+            raise SandboxUnavailableError(
+                "SessionContainerExecutor 需要 session_id（任务未绑定容器）。"
+            )
+        self._manager = get_container_manager()
+        # 构造时校验 registry 已绑定（任务-容器解耦后，executor 只服务已绑定任务）
+        if not _session_has_container(self.session_id):
+            raise SandboxUnavailableError(
+                f"任务 {self.session_id} 未在 ContainerRegistry 中绑定容器，"
+                "无法使用 SessionContainerExecutor。"
+            )
+
+    def _deny_result(self, command: str, reason: str) -> ExecResult:
+        return ExecResult(
+            command=command,
+            stdout="",
+            stderr=reason,
+            returncode=126,
+            executor=self.name,
+            enforcement=EnforcementLevel.FULL.value,
+            error_kind="sandbox_denied",
+        )
+
+    async def run(self, command: str, timeout: int = 120, **kwargs: Any) -> ExecResult:
+        from baize.pentest.container_guard import scan_command
+        from baize.pentest.workspace import ContainerRuntimeError, get_workspace
+
+        # 1) 安全门禁扫描
+        guard = scan_command(command)
+        if guard.denied:
+            msg = (
+                f"[container_guard denied] {guard.reason} (rule={guard.rule})。"
+                "该操作可能用于容器逃逸，已拒绝执行。"
+            )
+            return self._deny_result(command, msg)
+
+        if not self._manager.runtime_available:
+            raise SandboxUnavailableError(
+                "容器模式已启用但宿主无可用容器运行时（podman/docker），"
+                "且未触发降级。"
+            )
+
+        # 2) 长任务自动检测：超时阈值 > 60s 的命令在容器内用 tmux 后台运行，
+        #    避免单次 exec 超时被杀、结果丢失（渗透扫描/爆破等长任务场景）。
+        if kwargs.get("long_running") or (timeout and timeout > 60):
+            return await self._run_long(command, timeout)
+
+        # 3) 普通命令：exec 进入容器
+        started = asyncio.get_event_loop().time()
+        try:
+            rc, out, err = await self._manager.exec(
+                self.session_id, command, timeout=timeout,
+            )
+        except ContainerRuntimeError as exc:
+            return _finish_result(
+                started, command, self.name,
+                SandboxMode.WORKSPACE_WRITE, EnforcementLevel.FULL,
+                "", str(exc), -1, False,
+            )
+        except asyncio.TimeoutError:
+            return _finish_result(
+                started, command, self.name,
+                SandboxMode.WORKSPACE_WRITE, EnforcementLevel.FULL,
+                "", "timeout", -1, True,
+            )
+        return _finish_result(
+            started, command, self.name,
+            SandboxMode.WORKSPACE_WRITE, EnforcementLevel.FULL,
+            out, err, rc, False,
+        )
+
+    async def _run_long(self, command: str, timeout: int) -> ExecResult:
+        """长任务：容器内 tmux detached 运行，输出落盘到 /workspace/.baize-tmux/。"""
+        import secrets
+        from baize.pentest.workspace import get_workspace
+
+        session_name = f"baize-{secrets.token_hex(6)}"
+        ws = get_workspace(self.session_id)
+        # 宿主侧路径（写脚本用）
+        sdir = ws / ".baize-tmux" / session_name
+        sdir.mkdir(parents=True, exist_ok=True)
+        run_script = sdir / "run.sh"
+        # 容器内路径（脚本在容器内执行，工作区挂载在 /workspace）
+        container_sdir = f"/workspace/.baize-tmux/{session_name}"
+        out_path = f"{container_sdir}/output.log"
+        rc_path = f"{container_sdir}/exitcode"
+        # 脚本在宿主侧写好（工作区已挂载进容器 /workspace），容器内 tmux 执行
+        run_script.write_text(
+            "#!/bin/bash\n"
+            f"exec >> {out_path} 2>&1\n"
+            f"trap 'echo 130 > {rc_path}' INT TERM\n"
+            f"{command}\n"
+            f"echo $? > {rc_path}\n",
+            encoding="utf-8",
+        )
+        run_script.chmod(0o755)
+
+        started = asyncio.get_event_loop().time()
+        tmux_cmd = (
+            f"tmux new-session -d -s {session_name} 'bash {container_sdir}/run.sh'"
+        )
+        try:
+            rc, out, err = await self._manager.exec(
+                self.session_id, tmux_cmd, timeout=min(timeout, 30),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return _finish_result(
+                started, command, self.name,
+                SandboxMode.WORKSPACE_WRITE, EnforcementLevel.FULL,
+                "", str(exc), -1, False,
+            )
+
+        result = _finish_result(
+            started, command, self.name,
+            SandboxMode.WORKSPACE_WRITE, EnforcementLevel.FULL,
+            out, err, rc, rc != 0,
+        )
+        # tmux 启动成功（rc==0）才返回会话名；启动失败不设 session，避免误导 agent
+        if rc == 0:
+            result.session = session_name
+        result.timed_out = False
+        return result
+
+
+# 注册到执行器表（在下方 _EXECUTORS 定义完成后进行）
+
+
+# ---------------------------------------------------------------------------
 # 执行器注册表与工厂
 # ---------------------------------------------------------------------------
 _EXECUTORS: dict[str, type[BaseExecutor]] = {
@@ -704,6 +853,7 @@ _EXECUTORS: dict[str, type[BaseExecutor]] = {
     "docker": DockerExecutor,
     "ssh": SSHExecutor,
     "tmux": TmuxExecutor,
+    "container": SessionContainerExecutor,
 }
 
 
@@ -751,6 +901,42 @@ class ExecutorConfig:
         )
 
 
+def _session_has_container(session_id: str) -> bool:
+    """检查任务是否已绑定容器（查 ContainerRegistry）。
+
+    registry 在 app.state.container_registry 上；如未初始化（CLI/测试场景）
+    或查询失败，返回 False（视为未绑定，走本地执行）。
+    """
+    try:
+        from baize.pentest.container_registry import ContainerRegistry
+        # 优先从 app.state 读取（Web 场景）
+        try:
+            from baize.api.app import _get_app_state
+            state = _get_app_state()
+            if state is not None and hasattr(state, "container_registry"):
+                return state.container_registry.is_bound(session_id)
+        except Exception:  # noqa: BLE001
+            pass
+        # CLI/测试场景：用全局单例（惰性创建）
+        registry = _get_global_registry()
+        return registry.is_bound(session_id)
+    except Exception:  # noqa: BLE001
+        logger.debug("查询容器绑定失败 session=%s", session_id, exc_info=True)
+        return False
+
+
+_GLOBAL_REGISTRY = None
+
+
+def _get_global_registry():
+    """CLI/测试场景的全局 registry 单例（Web 场景从 app.state 读取）。"""
+    global _GLOBAL_REGISTRY
+    if _GLOBAL_REGISTRY is None:
+        from baize.pentest.container_registry import ContainerRegistry
+        _GLOBAL_REGISTRY = ContainerRegistry()
+    return _GLOBAL_REGISTRY
+
+
 def build_executor(config: Optional[ExecutorConfig] = None, **kwargs: Any) -> BaseExecutor:
     """根据配置构建执行器。
 
@@ -760,9 +946,20 @@ def build_executor(config: Optional[ExecutorConfig] = None, **kwargs: Any) -> Ba
 
     Returns:
         BaseExecutor: 对应后端的执行器实例。
+
+    任务-容器解耦：``build_executor`` 不再依赖全局 ``BAIZE_SANDBOX`` 开关
+    路由，改为按 ``session_id`` 查 ``ContainerRegistry``：
+    - 任务已绑定容器（registry 中存在 active 记录）→ SessionContainerExecutor
+    - 未绑定 → LocalExecutor（默认本地运行工具）
+    这样简单任务默认走本地，复杂任务由用户主动绑定容器后切换为容器执行。
     """
     config = config or ExecutorConfig.from_env()
     backend = kwargs.pop("backend", config.backend)
+
+    # 任务-容器解耦：按 session_id 查 registry 决定是否走容器执行器
+    session_id = kwargs.pop("session_id", None)
+    if session_id and backend != "tmux" and _session_has_container(session_id):
+        return SessionContainerExecutor(session_id=session_id)
 
     if backend == "docker":
         return DockerExecutor(

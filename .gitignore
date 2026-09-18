@@ -27,3 +27,11 @@ api_auth.json.key
 .env.*
 !*.env.example
 web/.vite/
+
+# 本地 IDE 配置（含记忆/会话，勿提交）
+.trae/
+
+# 本地测试残留（含 cookie/凭据，勿提交）
+cj.txt
+*.cookie
+*.cookies

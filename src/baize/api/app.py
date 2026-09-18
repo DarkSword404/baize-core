@@ -103,6 +103,9 @@ class CreateSessionRequest(BaseModel):
     # agent 可留空，由黑板根据 Fact-Intent 图状态动态派发
     scope: str = ""
     goal: str = ""
+    # 任务类型（用户创建时选择）：general | pentest | ctf | forensics
+    # 非空时 orchestrator 直接采用，跳过 LLM 自动分类
+    task_type: str = ""
 
 
 class BlackboardHintRequest(BaseModel):
@@ -118,6 +121,12 @@ _APP_STATE_REF = None
 def _get_app_state():
     """供编排节点（如 Reason）反查 app state，拿 session_manager → 黑板。"""
     return _APP_STATE_REF
+
+
+def _now_iso() -> str:
+    """当前 UTC 时间的 ISO 字符串（用于响应体 started_at 等）。"""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 
 class MessageRequest(BaseModel):
@@ -316,6 +325,17 @@ class SharedBrowserNavRequest(BaseModel):
     """共享浏览器导航动作。"""
 
     action: str = Field(..., description="back / forward / reload")
+
+
+class BindContainerRequest(BaseModel):
+    """任务绑定容器请求：可指定已有池容器名，或不传创建新容器。"""
+    container_name: Optional[str] = None
+
+
+class CreateContainerRequest(BaseModel):
+    """创建独立池容器请求：name 留空时自动生成。"""
+    name: Optional[str] = None
+    image_tag: Optional[str] = None
 
 
 # ----------------------------------------------------------------------
@@ -647,6 +667,26 @@ def create_baize_api_app(
     app.state.require_auth = cfg.require_auth
     app.state.loaded_modules: dict[str, dict] = {}  # 已加载模块注册表
 
+    # ── 任务-容器解耦：容器注册表 + 任务归档管理 ──
+    from baize.pentest.container_registry import ContainerRegistry
+    from baize.api.archives import ArchiveManager
+    app.state.container_registry = ContainerRegistry()
+    app.state.archive_manager = ArchiveManager()
+    # 启动时对账：扫描运行中 baize-sandbox-* 容器，重建注册表（孤儿/停止状态）
+    try:
+        from baize.pentest.workspace import get_container_manager
+        mgr = get_container_manager()
+        if mgr.runtime_available:
+            stats = app.state.container_registry.reconcile(mgr)
+            if stats.get("orphan", 0) > 0:
+                logger.warning(
+                    "检测到 %d 个孤儿容器（session 已归档/删除但容器仍在），"
+                    "可在容器管理页面清理。",
+                    stats["orphan"],
+                )
+    except Exception:  # noqa: BLE001
+        logger.debug("容器注册表对账失败", exc_info=True)
+
     # 全局 app state 引用：供编排进程（reason 节点等）反查会话黑板
     global _APP_STATE_REF
     _APP_STATE_REF = app.state
@@ -690,6 +730,20 @@ def create_baize_api_app(
         logger.info("已加载内置模块: orchestration")
     except Exception:  # noqa: BLE001
         logger.exception("加载内置 orchestration 模块失败")
+
+    # ------------------------------------------------------------------
+    # 内置报告管理模块注册（报告模板 + 报告 CRUD + agent 报告工具）
+    # ------------------------------------------------------------------
+    try:
+        from baize.reports import register as _reports_register
+        _reports_register(app)
+        app.state.loaded_modules["reports"] = {
+            "installed": True,
+            "version": __version__,
+        }
+        logger.info("已加载内置模块: reports")
+    except Exception:  # noqa: BLE001
+        logger.exception("加载内置 reports 模块失败")
 
     # ------------------------------------------------------------------
     # 接收器管理 API + Webhook 路由
@@ -1131,6 +1185,7 @@ def create_baize_api_app(
             browser_collab=payload.browser_collab,
             scope=payload.scope,
             goal=payload.goal,
+            task_type=payload.task_type,
         )
         return session.to_dict()
 
@@ -1195,6 +1250,17 @@ def create_baize_api_app(
             raise HTTPException(status_code=404, detail="会话不存在")
         # 修复：删除会话时同步清理该会话的附件、解压文件与索引
         app.state.attachment_store.delete_session(session_id)
+        # 任务-容器解耦：删除任务时容器解绑回池（保留容器供其他任务复用，不停止/删除）
+        try:
+            app.state.container_registry.unbind_keep(session_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("注册表 unbind_keep 失败 %s", session_id, exc_info=True)
+        # 清理会话工作区（workspace 隔离的产物目录）
+        try:
+            from baize.pentest.workspace import cleanup_workspace
+            cleanup_workspace(session_id)
+        except Exception:  # noqa: BLE001
+            logger.debug("清理会话工作区失败 %s", session_id, exc_info=True)
         # 会话删除：释放进程内 SessionLog 缓存（JSONL 审计文件保留，
         # 作为 append-only 事实源；SQLite 镜像 events 亦保留可回溯）
         app.state.session_logs.pop(session_id, None)
@@ -1202,6 +1268,418 @@ def create_baize_api_app(
         derived = [e for e in app.state.memory_service.list_experiences()
                    if e.get("source_session_id") == session_id]
         return {"ok": True, "derived_experiences": len(derived)}
+
+    # ---- 任务-容器绑定 / 解绑 / 归档 / 恢复 ----------------------------
+    @app.post(
+        "/api/v1/sessions/{session_id}/bind-container",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def bind_container(session_id: str, req: BindContainerRequest) -> dict:
+        """为任务绑定容器（≤60s）。
+
+        - 传 ``container_name``：绑定已有池容器（重建挂载 session 工作区）
+        - 不传 ``container_name``：创建新容器并立即绑定（旧路径）
+        """
+        import asyncio
+        from baize.pentest.container_registry import ContainerRegistry
+        from baize.pentest.workspace import get_container_manager, ContainerRuntimeError
+        session = app.state.session_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        mgr = get_container_manager()
+        if not mgr.runtime_available:
+            raise HTTPException(
+                status_code=503,
+                detail="宿主无可用容器运行时（podman/docker），无法绑定容器",
+            )
+        from baize.pentest.container_runtime import image_exists, get_image
+        if not image_exists(mgr.runtime, get_image()):
+            raise HTTPException(
+                status_code=503,
+                detail=f"镜像 {get_image()} 不存在，请先构建：podman build -t {get_image()} -f docker/baize-sandbox/Dockerfile .",
+            )
+        registry = app.state.container_registry
+
+        # 分支 A：绑定已有池容器
+        if req.container_name:
+            container_name = req.container_name.strip()
+            try:
+                # 1) 重建容器挂载 session 工作区（同名 stop+run）
+                asyncio.run(mgr.rebind_to_session(container_name, session_id))
+            except ContainerRuntimeError as exc:
+                raise HTTPException(status_code=503, detail=f"容器重建失败：{exc}") from exc
+            # 2) 注册表绑定关系
+            try:
+                registry.bind_existing(container_name, session_id)
+            except ContainerRegistry.NotFound as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except ContainerRegistry.AlreadyBound as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except ContainerRegistry.ContainerLimitExceeded as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            # 3) 更新 session.container_id
+            with app.state.session_manager._lock:
+                s = app.state.session_manager._sessions.get(session_id)
+                if s is not None:
+                    s.container_id = container_name
+                    s.container_bound_at = _now_iso()
+                    app.state.session_manager._save(s)
+            return {"container_name": container_name, "started_at": _now_iso()}
+
+        # 分支 B：旧路径——创建新容器并立即绑定
+        try:
+            name = app.state.session_manager.bind_container(
+                session_id=session_id,
+                mgr=mgr,
+                registry=registry,
+            )
+        except ContainerRegistry.AlreadyBound as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ContainerRegistry.ContainerLimitExceeded as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except KeyError:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        except ContainerRuntimeError as exc:
+            raise HTTPException(status_code=503, detail=f"容器创建失败：{exc}") from exc
+        return {"container_name": name, "started_at": _now_iso()}
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/unbind-container",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def unbind_container(session_id: str) -> dict:
+        from baize.pentest.workspace import get_container_manager
+        session = app.state.session_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        mgr = get_container_manager()
+        try:
+            ok = app.state.session_manager.unbind_container(
+                session_id=session_id, mgr=mgr,
+                registry=app.state.container_registry,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        if not ok:
+            raise HTTPException(status_code=404, detail="任务未绑定容器")
+        return {"ok": True}
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/archive",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def archive_session(session_id: str) -> dict:
+        """结束任务：停止容器 + 归档对话到 ~/.baize/archives/ + 从任务管理移除。"""
+        from baize.pentest.workspace import get_container_manager
+        session = app.state.session_manager.get_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        mgr = get_container_manager()
+        try:
+            archived_at = app.state.session_manager.archive_session(
+                session_id=session_id,
+                mgr=mgr,
+                registry=app.state.container_registry,
+                archive_manager=app.state.archive_manager,
+            )
+        except KeyError:
+            raise HTTPException(status_code=404, detail="任务不存在")
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        # 释放进程内 SessionLog 缓存
+        app.state.session_logs.pop(session_id, None)
+        return {"ok": True, "archived_at": archived_at}
+
+    # ---- 容器管理 -----------------------------------------------------
+    @app.post(
+        "/api/v1/containers",
+        response_model=dict,
+        status_code=201,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def create_container(req: CreateContainerRequest) -> dict:
+        """创建独立池容器（不绑定任何 session）。
+
+        - body ``{name?: str, image_tag?: str}``
+        - ``name`` 为前端显示名，**可含中文**；仅存入 registry.display_name
+        - Docker 实际容器名始终自动生成 ``baize-sandbox-pool-{ts}``
+        - 成功返回 201 + ContainerInfo（asdict，含 display_name）
+        """
+        import asyncio
+        import time
+        from dataclasses import asdict
+        from baize.pentest.container_runtime import (
+            pool_container_name, get_image, image_exists,
+        )
+        from baize.pentest.workspace import get_container_manager, ContainerRuntimeError
+        mgr = get_container_manager()
+        if not mgr.runtime_available:
+            raise HTTPException(
+                status_code=503,
+                detail="宿主无可用容器运行时（podman/docker），无法创建容器",
+            )
+        # Docker 实际容器名始终自动生成（保证合法 + 唯一）
+        name = pool_container_name(f"{int(time.time())}")
+        # 前端显示名（可中文）；留空则前端回退显示 container_name
+        display_name = (req.name or "").strip()
+        # image_tag：传入则覆盖环境变量；不传用默认
+        image = req.image_tag or get_image()
+        if not image_exists(mgr.runtime, image):
+            raise HTTPException(
+                status_code=503,
+                detail=f"镜像 {image} 不存在，请先构建：podman build -t {image} -f docker/baize-sandbox/Dockerfile .",
+            )
+        registry = app.state.container_registry
+        # 预检并发上限（避免无谓创建）
+        if registry.count_active() >= registry.max_concurrency:
+            raise HTTPException(
+                status_code=409,
+                detail=f"已达容器并发上限 {registry.max_concurrency}",
+            )
+        # 创建容器（阻塞 ≤60s）
+        try:
+            asyncio.run(mgr.ensure_pool_container(name))
+        except ContainerRuntimeError as exc:
+            raise HTTPException(status_code=503, detail=f"容器创建失败：{exc}") from exc
+        # 注册到 registry（session_id="" 表示池中待选）
+        from baize.pentest.container_registry import ContainerRegistry
+        try:
+            rec = registry.create_standalone(
+                container_name=name,
+                runtime=mgr.runtime or "",
+                image=image,
+                display_name=display_name,
+            )
+        except ContainerRegistry.AlreadyBound as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ContainerRegistry.ContainerLimitExceeded as exc:
+            # 并发竞争：刚创建的容器需清理
+            try:
+                asyncio.run(mgr.stop_by_name(name))
+            except Exception:  # noqa: BLE001
+                pass
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.info(
+            "独立容器已创建 name=%s display=%s", name, display_name or "(auto)",
+        )
+        return asdict(rec)
+
+    @app.get(
+        "/api/v1/containers",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def list_containers() -> dict:
+        records = app.state.container_registry.list_all()
+        from dataclasses import asdict
+        stats = app.state.container_registry.stats()
+        return {
+            "containers": [asdict(r) for r in records],
+            "active_count": stats["active_count"],
+            "available_count": stats.get("available_count", 0),
+            "max": stats["max"],
+            "available": stats["available"],
+        }
+
+    @app.get(
+        "/api/v1/containers/stats",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def container_stats() -> dict:
+        return app.state.container_registry.stats()
+
+    @app.post(
+        "/api/v1/containers/{container_name}/unbind",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def unbind_container_keep(container_name: str) -> dict:
+        """解绑容器但保留（容器回到池中 available 状态）。
+
+        - 容器不存在   → 404
+        - 容器未绑定   → 400
+        - 已绑定则解绑，session.container_id 同步清空
+        """
+        registry = app.state.container_registry
+        rec = registry.get_by_name(container_name)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="容器不在注册表")
+        if not rec.session_id:
+            raise HTTPException(status_code=400, detail="容器未绑定任务，无需解绑")
+        session_id = rec.session_id
+        # 1) 注册表解绑保留（session_id 设回 ""）
+        registry.unbind_keep(session_id)
+        # 2) 清空 session.container_id
+        with app.state.session_manager._lock:
+            s = app.state.session_manager._sessions.get(session_id)
+            if s is not None:
+                s.container_id = None
+                s.container_bound_at = None
+                app.state.session_manager._save(s)
+        logger.info("容器解绑保留 container=%s session=%s", container_name, session_id)
+        return {"ok": True}
+
+    @app.delete(
+        "/api/v1/containers/{container_name}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def delete_container(container_name: str) -> dict:
+        """清理任意状态容器（active/orphan/stopped），停止+移除+删除记录。"""
+        import asyncio
+        from baize.pentest.workspace import get_container_manager
+        mgr = get_container_manager()
+        if not mgr.runtime_available:
+            raise HTTPException(status_code=503, detail="无可用容器运行时")
+        # 用 stop_by_name 清理（不依赖 session_id）
+        try:
+            asyncio.run(mgr.stop_by_name(container_name))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("清理容器失败 %s: %s", container_name, exc)
+        # 从注册表移除（若存在）
+        removed = app.state.container_registry.remove_orphan(container_name)
+        if not removed:
+            raise HTTPException(status_code=404, detail="容器不在注册表")
+        return {"ok": True}
+
+    @app.post(
+        "/api/v1/containers/{container_name}/start",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def start_container(container_name: str) -> dict:
+        """启动已停止的容器（保留原配置与绑定关系）。
+
+        - 容器不在注册表 → 404
+        - 容器非 stopped → 400（active/orphan 无需启动）
+        - 达到并发上限   → 409
+        - 容器已消失（被 rm）→ 503
+        """
+        import asyncio
+        from dataclasses import asdict
+        from baize.pentest.workspace import get_container_manager, ContainerRuntimeError
+        from baize.pentest.container_registry import ContainerRegistry
+        registry = app.state.container_registry
+        rec = registry.get_by_name(container_name)
+        if rec is None:
+            raise HTTPException(status_code=404, detail="容器不在注册表")
+        if rec.status != "stopped":
+            raise HTTPException(
+                status_code=400,
+                detail=f"容器状态为 {rec.status}，无需启动（仅 stopped 可启动）",
+            )
+        mgr = get_container_manager()
+        if not mgr.runtime_available:
+            raise HTTPException(status_code=503, detail="无可用容器运行时")
+        # 预检并发上限
+        if registry.count_active() >= registry.max_concurrency:
+            raise HTTPException(
+                status_code=409,
+                detail=f"已达容器并发上限 {registry.max_concurrency}",
+            )
+        # 启动容器
+        try:
+            asyncio.run(mgr.start_container(container_name))
+        except ContainerRuntimeError as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"容器启动失败：{exc}（可能容器已被删除，请直接删除记录）",
+            ) from exc
+        # 更新注册表状态
+        try:
+            updated = registry.mark_active(container_name)
+        except ContainerRegistry.NotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except ContainerRegistry.ContainerLimitExceeded as exc:
+            # 竞争失败：停止刚启动的容器回滚
+            try:
+                asyncio.run(mgr.stop_by_name(container_name))
+            except Exception:  # noqa: BLE001
+                pass
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        logger.info("容器已启动 container=%s", container_name)
+        return asdict(updated)
+
+    # ---- 任务记录（归档）---------------------------------------------
+    @app.get(
+        "/api/v1/archives",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def list_archives() -> dict:
+        items = app.state.archive_manager.list_archives()
+        return {"archives": items}
+
+    @app.get(
+        "/api/v1/archives/{session_id}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def get_archive(session_id: str) -> dict:
+        data = app.state.archive_manager.get_archive(session_id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="归档不存在")
+        return {"session": data}
+
+    @app.post(
+        "/api/v1/archives/{session_id}/restore",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def restore_archive(session_id: str, payload: dict | None = None) -> dict:
+        """从归档恢复为任务。可选 body ``{"bind_container": true}`` 同时绑定容器。"""
+        bind = bool((payload or {}).get("bind_container"))
+        try:
+            session = app.state.session_manager.restore_session(
+                session_id=session_id,
+                archive_manager=app.state.archive_manager,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        bind_error: str | None = None
+        if bind:
+            from baize.pentest.workspace import get_container_manager, ContainerRuntimeError
+            from baize.pentest.container_registry import ContainerRegistry
+            from baize.pentest.container_runtime import image_exists, get_image
+            mgr = get_container_manager()
+            if not mgr.runtime_available:
+                bind_error = "宿主无可用容器运行时"
+            elif not image_exists(mgr.runtime, get_image()):
+                bind_error = f"镜像 {get_image()} 不存在"
+            else:
+                try:
+                    app.state.session_manager.bind_container(
+                        session_id=session_id,
+                        mgr=mgr,
+                        registry=app.state.container_registry,
+                    )
+                except (ContainerRegistry.AlreadyBound,
+                        ContainerRegistry.ContainerLimitExceeded,
+                        ContainerRuntimeError) as exc:
+                    bind_error = str(exc)
+        result = {"session": session.to_dict()}
+        if bind_error:
+            result["bind_container_error"] = bind_error
+        return result
+
+    @app.delete(
+        "/api/v1/archives/{session_id}",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def delete_archive(session_id: str) -> dict:
+        ok = app.state.archive_manager.delete_archive(session_id)
+        if not ok:
+            raise HTTPException(status_code=404, detail="归档不存在")
+        return {"ok": True}
 
     @app.post(
         "/api/v1/sessions/{session_id}/reset",
@@ -1428,6 +1906,15 @@ def create_baize_api_app(
         ] if requested_ids else session_attachments
         # 附件访问工具（绑定当前会话）
         extra_tools = attachment_tools(attachment_store, session_id)
+        # 报告生成工具（绑定当前会话，生成的报告自动关联会话）
+        try:
+            from baize.reports.tools import build_report_tools
+            from baize.reports.store import get_report_store
+            extra_tools.extend(
+                build_report_tools(get_report_store(), session_id)
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("注入报告工具失败", exc_info=True)
         # 判断节点：仅当会话开启浏览器协作时才注入共享浏览器工具，
         # 避免 AI 在普通对话中胡乱调用浏览器导致 token 消耗
         if getattr(session, "browser_collab", False):
@@ -1695,8 +2182,31 @@ def create_baize_api_app(
                     if blackboard is None:
                         from baize.pentest.blackboard import Blackboard
                         blackboard = Blackboard(session_id=session_id)
+                        # 纳入会话管理：挂黑板自动落盘回调（重启不丢证据图）
                         try:
-                            session.blackboard = blackboard  # 缓存到会话，后续多轮复用
+                            sm.attach_blackboard(session_id, blackboard)
+                        except Exception:  # noqa: BLE001
+                            session.blackboard = blackboard
+                    elif blackboard.on_change is None:
+                        # 历史会话的黑板可能未挂回调（老数据/老代码创建），补挂
+                        try:
+                            sm._bind_blackboard_autosave(session_id, blackboard)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # 用户在创建任务时选择的 task_type：非空时直接写入 goal 节点，
+                    # 跳过 orchestrator 内部的 LLM 自动分类，避免分类错误。
+                    _user_task_type = getattr(session, "task_type", "") or ""
+                    if _user_task_type:
+                        try:
+                            _goal = blackboard.goal_node()
+                            _existing_props = (_goal.properties if _goal else {}) or {}
+                            if not _existing_props.get("task_type"):
+                                blackboard.add_plan_properties(
+                                    task_type=_user_task_type,
+                                    goal_summary="",
+                                    success_patterns=[],
+                                    max_rounds=3,
+                                )
                         except Exception:  # noqa: BLE001
                             pass
                     orch = ConversationOrchestrator()

@@ -513,6 +513,13 @@ class Agent:
     load_tool 自取的工具。每次 LLM 请求前合并，因此 agent 在第 N 轮
     加载的工具，第 N+1 轮的请求立即带上完整 schema。
     """
+    progress_guard: Optional[Any] = None
+    """执行期进度看门狗（鸭子类型：record_tool_call/should_abort/abort_reason）。
+
+    由上层（pentest 编排器）注入 ProgressGuard：按信息增量检测工具
+    空转；与"按实际工具调用数计数"的 max_tool_calls 预算共同防止
+    agent 在 read→load→probe 循环里耗尽上百次调用而无产出。
+    """
 
     def mount_dynamic_tool(self, tool: "AgentTool") -> bool:
         """挂载一个运行时加载的工具。已存在（核心层/已加载）则返回 False。"""
@@ -1655,6 +1662,7 @@ class Agent:
             forced_conclusion = False  # 是否已强制要求模型继续任务（避免无限追加）
             tool_turns_since_conclusion = 0  # 连续纯工具调用轮数（用于阶段性结论提示）
             conclusion_hint_added = False     # 是否已追加阶段性结论提示（避免重复）
+            guard_forced_conclusion = False   # ProgressGuard 已给过最后结论机会
             turn_index = 0
 
             for _ in range(self.max_tool_calls):
@@ -1845,6 +1853,10 @@ class Agent:
                                     logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
                             duration = asyncio.get_running_loop().time() - started_at
                             self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
+                        # 进度看门狗：每个工具调用（含被拦截/未注册）都计一步；
+                        # write_fact 成功写入时由工具内部 mark_fact() 清零计数。
+                        if self.progress_guard is not None:
+                            self.progress_guard.record_tool_call(name)
                         await self._emit("on_tool_result", self, name, output)
                         yield AgentEvent(type="tool_result", tool_name=name, tool_result=output, tool_call_id=tc_id)
                         history.append(
@@ -1892,21 +1904,58 @@ class Agent:
                             )
                         )
                     elif (
-                        turn_index >= self.max_tool_calls - 3
+                        (
+                            turn_index >= self.max_tool_calls - 3
+                            or tool_calls_executed >= self.max_tool_calls - 8
+                        )
                         and not conclusion_hint_added
                     ):
-                        # 接近上限（剩余 3 轮）：二次提示，强制收敛
+                        # 接近上限（按 LLM 轮数或实际工具调用数，二者先到为准）：
+                        # 二次提示，强制收敛
                         conclusion_hint_added = True
                         history.append(
                             ChatMessage(
                                 role="user",
                                 content=(
-                                    "（注意：即将达到工具调用次数上限（剩余约 3 轮）。"
+                                    "（注意：即将达到工具调用次数上限。"
                                     "请立即停止调用新工具，基于已有结果给出最终结论与建议，"
                                     "不要继续探索。）"
                                 ),
                             )
                         )
+                    # ── 零增量硬停（ProgressGuard）──────────────────────────
+                    # 第一次触发：给模型一次强制结论机会；仍继续调工具则硬停。
+                    _guard = self.progress_guard
+                    if _guard is not None and _guard.should_abort:
+                        if not guard_forced_conclusion:
+                            guard_forced_conclusion = True
+                            history.append(
+                                ChatMessage(
+                                    role="user",
+                                    content=(
+                                        f"（停止信号：{_guard.abort_reason}。"
+                                        "请立即停止发起新的探测/攻击步骤，"
+                                        "把已经确认的观察用 write_fact 写入黑板，"
+                                        "并给出阶段性结论。）"
+                                    ),
+                                )
+                            )
+                            continue
+                        final_text = (
+                            f"（已达工具调用次数上限 {self.max_tool_calls} 轮，本轮未产出最终文本。"
+                            f"空转保护：{_guard.abort_reason}，已强制中止以避免重复探测。"
+                            "已确认发现已写入黑板，后续波次将基于黑板继续。）"
+                        )
+                        yield AgentEvent(type="text", content=final_text)
+                        break
+                    # ── 实际工具调用预算（一个 LLM 轮次可含多个并发调用）──
+                    if tool_calls_executed >= self.max_tool_calls:
+                        final_text = (
+                            f"（已达工具调用次数上限 {self.max_tool_calls} 轮，本轮未产出最终文本。"
+                            "以上为已完成的工具调用过程，如需继续请重新提问或调整策略。）"
+                        )
+                        yield AgentEvent(type="text", content=final_text)
+                        break
                     continue  # 继续请求模型，获取工具执行后的最终回复
 
                 # 无工具调用：最终文本即为累积的 content

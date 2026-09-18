@@ -48,6 +48,12 @@ export interface SessionSummary {
   browser_collab?: boolean;
   scope?: string;
   goal?: string;
+  task_type?: string;        // general | pentest | ctf | forensics
+  // 任务-容器解耦：容器绑定 + 任务生命周期
+  container_id?: string | null;
+  container_bound_at?: string | null;
+  status?: string;          // active | archived
+  archived_at?: string | null;
 }
 
 export interface SessionDetail extends SessionSummary {
@@ -73,12 +79,24 @@ export interface CreateSessionRequest {
   // 协作模式（黑板驱动）：目标范围 + 成功条件
   scope?: string;
   goal?: string;
+  // 任务类型（用户创建时选择）：general | pentest | ctf | forensics
+  // 非空时后端直接采用，跳过 LLM 自动分类
+  task_type?: string;
 }
+
+/** 任务类型选项 */
+export type TaskType = 'general' | 'pentest' | 'ctf' | 'forensics';
+
+export const TASK_TYPE_OPTIONS: { value: TaskType; label: string; desc: string }[] = [
+  { value: 'general', label: '通用对话', desc: '普通问答、闲聊、信息查询' },
+  { value: 'pentest', label: '渗透测试', desc: '授权安全评估、漏洞挖掘、Web/内网渗透' },
+  { value: 'ctf', label: 'CTF 夺旗', desc: '解题夺旗：Web/Pwn/Misc/Reverse/Crypto' },
+  { value: 'forensics', label: '取证分析', desc: '内存/流量/磁盘镜像取证、溯源分析' },
+];
 
 // ---- 黑板（证据攻击图：target/hypothesis/evidence/action/handoff）----
 export type BlackboardNodeKind =
-  | 'origin' | 'goal' | 'target' | 'hypothesis'
-  | 'intent' | 'action' | 'evidence' | 'fact' | 'handoff' | 'hint';
+  | 'origin' | 'goal' | 'fact' | 'intent' | 'hint';
 
 export interface BlackboardNode {
   id: string;
@@ -112,15 +130,8 @@ export interface BlackboardSnapshot {
     facts: number;
     intents_pending: number;
     intents_done: number;
+    intents_failed?: number;
     hints: number;
-    targets_active?: number;
-    hypotheses_pending?: number;
-    hypotheses_confirmed?: number;
-    hypotheses_refuted?: number;
-    evidence?: number;
-    actions?: number;
-    handoffs?: number;
-    branches?: number;
   };
 }
 
@@ -225,7 +236,99 @@ export interface Toast {
   message?: string;
 }
 
-export type ViewPage = 'dashboard' | 'chat' | 'agents' | 'tools' | 'sessions' | 'guardrails' | 'settings' | 'orchestration' | 'experiences' | 'browser';
+export type ViewPage = 'dashboard' | 'chat' | 'agents' | 'tools' | 'sessions' | 'guardrails' | 'settings' | 'orchestration' | 'experiences' | 'browser' | 'reports' | 'containers' | 'archives';
+
+// ===== 任务-容器解耦：容器管理 + 任务记录 =====
+export interface ContainerInfo {
+  container_name: string;       // Docker 实际容器名（自动生成，合法）
+  display_name?: string;        // 前端显示名（可中文）；为空时回退显示 container_name
+  session_id: string;
+  runtime: string;
+  image: string;
+  started_at: string;
+  status: 'active' | 'stopped' | 'orphan' | string;
+}
+
+export interface ContainersResponse {
+  containers: ContainerInfo[];
+  active_count: number;
+  available_count?: number;
+  max: number;
+  available: number;
+}
+
+export interface ContainerStats {
+  active_count: number;
+  available_count?: number;
+  max: number;
+  available: number;
+}
+
+/** 创建独立池容器请求：name 留空自动生成 */
+export interface CreateContainerRequest {
+  name?: string;
+  image_tag?: string;
+}
+
+/** 任务绑定容器请求：传 container_name 绑定已有池容器，不传则创建新容器 */
+export interface BindContainerRequest {
+  container_name?: string;
+}
+
+export interface ArchivesResponse {
+  archives: SessionSummary[];
+}
+
+export interface ArchiveDetailResponse {
+  session: SessionDetail;
+}
+
+export interface RestoreArchiveRequest {
+  bind_container?: boolean;
+}
+
+export interface RestoreArchiveResponse {
+  session: SessionSummary;
+  bind_container_error?: string;
+}
+
+export interface BindContainerResponse {
+  container_name: string;
+  started_at: string;
+}
+
+// ===== 报告管理（reports 模块）=====
+/** 报告模板章节定义 */
+export interface ReportTemplateSection {
+  title: string;
+  guidance: string;
+}
+
+/** 内置报告模板 */
+export interface ReportTemplate {
+  id: string;
+  name: string;
+  description: string;
+  keywords: string[];
+  sections: ReportTemplateSection[];
+  /** 仅模板详情接口返回 */
+  skeleton?: string;
+}
+
+/** 报告元数据 */
+export interface ReportRecord {
+  id: string;
+  title: string;
+  template_id: string;
+  template_name: string;
+  session_id: string;
+  status: 'draft' | 'done';
+  created_at: string;
+  updated_at: string;
+  size: number;
+  /** 仅详情接口返回 */
+  content?: string;
+}
 
 /** 共享协作浏览器状态 */
 export interface SharedBrowserStatus {

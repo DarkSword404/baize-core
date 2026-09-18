@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { useApp } from '../context/AppContext';
-import { listSessions, getSession, deleteSession, streamMessage, cancelSession, respondToPrompt, uploadAttachment, deleteAttachment, switchSessionBrowserCollab } from '../api/client';
+import { listSessions, getSession, streamMessage, cancelSession, respondToPrompt, uploadAttachment, deleteAttachment, switchSessionBrowserCollab, bindContainer, unbindContainer, archiveSession } from '../api/client';
 import { BrowserPanel } from './Browser';
 import type { PromptRequest, ReasoningStep, AttachmentInfo } from '../api/client';
 import { ChatMessage } from '../components/ChatMessage';
@@ -160,12 +160,14 @@ export function Chat(): JSX.Element {
   const {
     sessions, setSessions, activeSessionId, setActiveSessionId,
     messages, setMessages, isStreaming, setIsStreaming,
+    setMessagesForSession, setSessionStreaming, messagesBySession,
     addToast, removeSession, updateSession,
   } = useApp();
 
   const [input, setInput] = useState('');
   const [showCreateModal, setShowCreateModal] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [containerBusy, setContainerBusy] = useState(false);
   // 删除会话确认：存待删除的会话 id，null 表示不显示确认框
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -173,10 +175,9 @@ export function Chat(): JSX.Element {
   // 是否跟随滚动到底部：用户主动上滚阅读思考/工具过程时关闭，回到底部附近时恢复
   const autoScrollRef = useRef(true);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const abortRef = useRef<AbortController | null>(null);
+  // per-session abort controller：支持多个会话同时流式生成、互不干扰
+  const abortRefs = useRef<Map<string, AbortController>>(new Map());
   const fileInputRef = useRef<HTMLInputElement>(null);
-  // isStreaming 镜像：供不希望随其变化而触发的 effect 读取
-  const isStreamingRef = useRef(false);
   // 待发送附件（用户选择后先上传到会话，随下一条消息发送）
   const [pendingFiles, setPendingFiles] = useState<AttachmentInfo[]>([]);
   const [uploading, setUploading] = useState(false);
@@ -214,19 +215,12 @@ export function Chat(): JSX.Element {
     }).catch(() => {});
   }, []);
 
-  // 同步 isStreaming 镜像
-  useEffect(() => {
-    isStreamingRef.current = isStreaming;
-  }, [isStreaming]);
-
-  // 会话切换时加载对应历史消息。
-  // Chat 常驻挂载后不再随路由卸载重建，所以从其他页面（会话管理 / 仪表盘）
-  // 切换 activeSessionId 再进入聊天页时，需要据此加载消息。
-  // 单纯切走再切回时 activeSessionId 不变，不会触发本 effect，
-  // 因此不会用后端历史覆盖仍在流式生成中的内容。
+  // 会话切换时加载对应历史消息（缓存优先）。
+  // 已有缓存的会话（包括正在流式生成中的会话）直接复用，避免后端历史覆盖实时内容；
+  // 无缓存时才从后端拉取。这样多个会话可并行流式、互不覆盖。
   useEffect(() => {
     if (!activeSessionId) return;
-    if (isStreamingRef.current) return; // 流式进行中不覆盖正在生成的消息
+    if (messagesBySession[activeSessionId]) return;
     let cancelled = false;
     getSession(activeSessionId)
       .then(detail => {
@@ -236,11 +230,13 @@ export function Chat(): JSX.Element {
           .filter(Boolean) as ChatMessageType[];
         setMessages(msgs);
       })
-      .catch(() => {});
+      .catch((err: any) => {
+        addToast({ type: 'error', title: '加载会话失败', message: err.message });
+      });
     return () => {
       cancelled = true;
     };
-  }, [activeSessionId]);
+  }, [activeSessionId, messagesBySession]);
 
   // Persist activeSessionId to localStorage
   useEffect(() => {
@@ -290,21 +286,59 @@ export function Chat(): JSX.Element {
     }
   }
 
-  async function handleSelectSession(id: string) {
+  /** 为当前任务绑定容器（同步等待 ≤60s）。 */
+  async function handleBindContainer() {
+    if (!activeSessionId) return;
+    setContainerBusy(true);
+    try {
+      const r = await bindContainer(activeSessionId);
+      updateSession(activeSessionId, { container_id: r.container_name, container_bound_at: r.started_at });
+      addToast({ type: 'success', title: '容器已绑定', message: r.container_name });
+    } catch (err: any) {
+      addToast({ type: 'error', title: '绑定容器失败', message: err.message });
+    } finally {
+      setContainerBusy(false);
+    }
+  }
+
+  /** 解除当前任务的容器绑定。 */
+  async function handleUnbindContainer() {
+    if (!activeSessionId || !activeSession?.container_id) return;
+    if (!window.confirm('解除容器绑定？\n容器将停止并移除，任务切换为本地运行工具。')) return;
+    setContainerBusy(true);
+    try {
+      await unbindContainer(activeSessionId);
+      updateSession(activeSessionId, { container_id: null, container_bound_at: null });
+      addToast({ type: 'info', title: '容器已解绑', message: '任务切换为本地运行' });
+    } catch (err: any) {
+      addToast({ type: 'error', title: '解绑失败', message: err.message });
+    } finally {
+      setContainerBusy(false);
+    }
+  }
+
+  /** 结束任务：归档对话 + 清理容器 + 跳转任务记录。 */
+  async function handleArchiveSession() {
+    if (!activeSessionId) return;
+    if (!window.confirm('结束当前任务？\n对话内容将归档到「任务记录」，绑定的容器（如有）将释放回容器池供复用。')) return;
+    setContainerBusy(true);
+    try {
+      await archiveSession(activeSessionId);
+      removeSession(activeSessionId);
+      addToast({ type: 'info', title: '任务已归档', message: '对话已备份到任务记录' });
+    } catch (err: any) {
+      addToast({ type: 'error', title: '归档失败', message: err.message });
+    } finally {
+      setContainerBusy(false);
+    }
+  }
+
+  function handleSelectSession(id: string) {
     setActiveSessionId(id);
     // Reset multi-agent tracking on session switch
     setCurrentAgent(null);
     setPipelinePhases([]);
-    try {
-      const detail = await getSession(id);
-      // 保留全部条目：user/assistant 正常渲染，中间产物（tool_call/tool_output等）折叠展示
-      const msgs: ChatMessageType[] = detail.history
-        .map((h: any) => buildChatMessage(h, detail.created_at))
-        .filter(Boolean) as ChatMessageType[];
-      setMessages(msgs);
-    } catch (err: any) {
-      addToast({ type: 'error', title: '加载会话失败', message: err.message });
-    }
+    // 消息加载由 activeSessionId effect 统一处理（缓存优先，不覆盖流式内容）
   }
 
   // 点击 X 按钮：只弹出确认框，不直接删除
@@ -313,17 +347,17 @@ export function Chat(): JSX.Element {
     setPendingDeleteId(id);
   }
 
-  // 确认删除：用户在 Modal 点"确认"后才真正执行删除
+  // 确认归档：用户在 Modal 点"确认"后执行归档（保留任务记录，容器释放回池）
   async function confirmDeleteSession() {
     const id = pendingDeleteId;
     if (!id) return;
     setPendingDeleteId(null);
     try {
-      await deleteSession(id);
+      await archiveSession(id);
       removeSession(id);
-      addToast({ type: 'info', title: '会话已删除' });
+      addToast({ type: 'info', title: '任务已归档', message: '对话已备份到任务记录，容器已释放回池' });
     } catch (err: any) {
-      addToast({ type: 'error', title: '删除失败', message: err.message });
+      addToast({ type: 'error', title: '归档失败', message: err.message });
     }
   }
 
@@ -334,18 +368,18 @@ export function Chat(): JSX.Element {
     } catch {}
   }
 
-  /** 通用：发送消息并启动 SSE 流 */
-  function startInference(content: string, assistantId: string, attachmentIds?: string[]) {
-    abortRef.current = streamMessage(
-      activeSessionId!,
+  /** 通用：发送消息并启动 SSE 流（sid 为流所属会话，可能并非当前活动会话） */
+  function startInference(content: string, assistantId: string, attachmentIds: string[] | undefined, sid: string) {
+    const controller = streamMessage(
+      sid,
       { input: content, attachments: attachmentIds && attachmentIds.length ? attachmentIds : undefined },
       (text) => {
-        setMessages(prev => prev.map((m: ChatMessageType) =>
+        setMessagesForSession(sid, prev => prev.map((m: ChatMessageType) =>
           m.id === assistantId ? { ...m, content: m.content + text } : m
         ));
       },
       () => {
-        setMessages(prev => prev.map((m: ChatMessageType) => {
+        setMessagesForSession(sid, prev => prev.map((m: ChatMessageType) => {
           if (m.id !== assistantId) return m;
           const hasText = (m.content || '').trim().length > 0;
           if (hasText) return { ...m, isStreaming: false };
@@ -361,16 +395,18 @@ export function Chat(): JSX.Element {
               : '\n\n> ⚠️ 本轮未产出回复，请重试或换一种问法。',
           };
         }));
-        setIsStreaming(false);
+        setSessionStreaming(sid, false);
+        abortRefs.current.delete(sid);
         handleRefreshSessions();
       },
       (err) => {
-        setMessages(prev => prev.map((m: ChatMessageType) =>
+        setMessagesForSession(sid, prev => prev.map((m: ChatMessageType) =>
           m.id === assistantId
             ? { ...m, content: m.content + `\n\n⚠️ 错误: ${err.message}`, isStreaming: false }
             : m
         ));
-        setIsStreaming(false);
+        setSessionStreaming(sid, false);
+        abortRefs.current.delete(sid);
         addToast({ type: 'error', title: '推理错误', message: err.message });
       },
       (prompt) => {
@@ -381,7 +417,7 @@ export function Chat(): JSX.Element {
       (step: ReasoningStep) => {
         if (step.type === 'stream_reset') {
           // 断流恢复：清空已渲染的思考内容，重试内容从干净状态重新渲染
-          setMessages(prev => prev.map((m: ChatMessageType) => {
+          setMessagesForSession(sid, prev => prev.map((m: ChatMessageType) => {
             if (m.id !== assistantId) return m;
             return {
               ...m,
@@ -393,7 +429,7 @@ export function Chat(): JSX.Element {
         let intermediate: IntermediateData | null = null;
         if (step.type === 'reasoning' && step.text) {
           // 累积模型实时思考内容到 assistant 消息的一个 reasoning 中间产物
-          setMessages(prev => prev.map((m: ChatMessageType) => {
+          setMessagesForSession(sid, prev => prev.map((m: ChatMessageType) => {
             if (m.id !== assistantId) return m;
             const steps = m.intermediates || [];
             const existing = steps.findIndex(s => s.itemType === 'reasoning');
@@ -474,7 +510,7 @@ export function Chat(): JSX.Element {
           };
         } else if (step.type === 'message') {
           if (step.text) {
-            setMessages(prev => prev.map((m: ChatMessageType) =>
+            setMessagesForSession(sid, prev => prev.map((m: ChatMessageType) =>
               m.id === assistantId && !m.content ? { ...m, content: step.text! } : m
             ));
           }
@@ -488,7 +524,7 @@ export function Chat(): JSX.Element {
           };
         }
         if (intermediate) {
-          setMessages(prev => prev.map((m: ChatMessageType) =>
+          setMessagesForSession(sid, prev => prev.map((m: ChatMessageType) =>
             m.id === assistantId ? {
               ...m,
               intermediates: [...(m.intermediates || []), intermediate!],
@@ -497,6 +533,7 @@ export function Chat(): JSX.Element {
         }
       }
     );
+    abortRefs.current.set(sid, controller);
   }
 
   async function handleIntervene() {
@@ -507,7 +544,7 @@ export function Chat(): JSX.Element {
     console.log('[Chat] Intervening:', { sessionId: activeSessionId, content: content.substring(0, 40) });
 
     // 1. Abort current stream + cancel backend task
-    abortRef.current?.abort();
+    abortRefs.current.get(activeSessionId)?.abort();
     try { await cancelSession(activeSessionId); } catch {}
 
     // 2. Mark current assistant message as intervened
@@ -553,7 +590,7 @@ export function Chat(): JSX.Element {
     };
     setMessages(prev => [...prev, assistantMsg]);
     setIsStreaming(true);
-    startInference(content, assistantId);
+    startInference(content, assistantId, undefined, activeSessionId);
   }
 
   async function handleSend() {
@@ -603,7 +640,7 @@ export function Chat(): JSX.Element {
     setMessages(prev => [...prev, assistantMsg]);
     setIsStreaming(true);
 
-    startInference(content, assistantId, attachIds);
+    startInference(content, assistantId, attachIds, activeSessionId);
   }
 
   /** 选择附件文件：先上传到会话，成功后将附件信息加入待发送列表 */
@@ -642,7 +679,8 @@ export function Chat(): JSX.Element {
 
   async function handleCancel() {
     if (!activeSessionId) return;
-    abortRef.current?.abort();
+    abortRefs.current.get(activeSessionId)?.abort();
+    abortRefs.current.delete(activeSessionId);
     try { await cancelSession(activeSessionId); } catch {}
     setMessages(prev => prev.map(m => m.isStreaming ? { ...m, isStreaming: false } : m));
     setIsStreaming(false);
@@ -678,14 +716,14 @@ export function Chat(): JSX.Element {
       {/* Session Sidebar */}
       <div className={`${sidebarOpen ? 'w-64 min-w-[256px]' : 'w-0 min-w-0'} border-r border-gray-800 bg-gray-900/50 flex flex-col transition-all duration-200 overflow-hidden`}>
         <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-gray-400">会话记录</h2>
+          <h2 className="text-sm font-semibold text-gray-400">任务</h2>
           <div className="flex gap-1">
             <button onClick={handleRefreshSessions} className="p-1.5 rounded-lg hover:bg-gray-800 text-gray-500 hover:text-gray-300 transition-colors" title="刷新">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={1.5} viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
               </svg>
             </button>
-            <button onClick={() => setShowCreateModal(true)} className="p-1.5 rounded-lg hover:bg-gray-800 text-blue-400 hover:text-blue-300 transition-colors" title="新建会话">
+            <button onClick={() => setShowCreateModal(true)} className="p-1.5 rounded-lg hover:bg-gray-800 text-blue-400 hover:text-blue-300 transition-colors" title="新建任务">
               <svg className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth={2} viewBox="0 0 24 24">
                 <path strokeLinecap="round" d="M12 4v16m8-8H4" />
               </svg>
@@ -694,7 +732,7 @@ export function Chat(): JSX.Element {
         </div>
         <div className="flex-1 overflow-y-auto p-2">
           {sessions.length === 0 ? (
-            <p className="text-xs text-gray-600 text-center py-8 px-4">暂无会话，点击 + 创建</p>
+            <p className="text-xs text-gray-600 text-center py-8 px-4">暂无任务，点击 + 创建</p>
           ) : (
             sessions.map(s => (
               <div
@@ -765,6 +803,39 @@ export function Chat(): JSX.Element {
                       浏览器协作 · 开
                     </button>
                   )}
+                  {/* 任务-容器解耦：容器状态徽章 + 绑定/解绑/结束任务按钮 */}
+                  {activeSession.container_id ? (
+                    <>
+                      <span className="px-1.5 py-0.5 rounded bg-emerald-600/10 text-emerald-400 flex-shrink-0" title={activeSession.container_id}>
+                        容器 · 已绑定
+                      </span>
+                      <button
+                        onClick={handleUnbindContainer}
+                        disabled={containerBusy}
+                        title="停止并移除绑定的容器，任务切换为本地运行"
+                        className="px-1.5 py-0.5 rounded bg-amber-600/10 text-amber-400 hover:bg-amber-600/20 flex-shrink-0 cursor-pointer disabled:opacity-50"
+                      >
+                        {containerBusy ? '解绑中...' : '解绑容器'}
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={handleBindContainer}
+                      disabled={containerBusy}
+                      title="为任务同步绑定容器（≤60s），复杂任务（渗透/CTF）建议绑定"
+                      className="px-1.5 py-0.5 rounded bg-gray-700/40 text-gray-400 hover:bg-gray-700/60 flex-shrink-0 cursor-pointer disabled:opacity-50"
+                    >
+                      {containerBusy ? '绑定中...' : '本地 · 绑定容器'}
+                    </button>
+                  )}
+                  <button
+                    onClick={handleArchiveSession}
+                    disabled={containerBusy}
+                    title="结束任务：归档对话到任务记录 + 清理容器"
+                    className="px-1.5 py-0.5 rounded bg-red-600/10 text-red-400 hover:bg-red-600/20 flex-shrink-0 cursor-pointer disabled:opacity-50"
+                  >
+                    结束任务
+                  </button>
                   {activeSession.pattern && activeSession.agent_stack && activeSession.agent_stack.length > 1 && (
                     <span className="text-purple-500">
                       {' · '}{activeSession.agent_stack.join(' → ')}
@@ -819,21 +890,21 @@ export function Chat(): JSX.Element {
                     ? 'bg-purple-600/10 border-purple-600/20 text-purple-400'
                     : 'bg-gray-800/50 border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
                 }`}
-                title="攻击证据图（目标多版本 · 假设分支泳道 · 证据/动作 · 轮末交接卡）"
+                title="证据攻击图（Fact → Intent → Fact DAG · 交接卡）"
               >
                 攻击图
               </button>
             </>
           ) : (
             <div className="flex-1 text-sm text-gray-600">
-              选择一个会话或新建对话开始
+              选择一个任务或新建任务开始
             </div>
           )}
           <button
             onClick={() => setShowCreateModal(true)}
             className="px-3 py-1.5 bg-blue-600 hover:bg-blue-500 rounded-lg text-xs font-medium transition-colors flex-shrink-0"
           >
-            + 新建会话
+            + 新建任务
           </button>
         </div>
 

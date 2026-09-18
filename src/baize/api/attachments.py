@@ -323,8 +323,41 @@ class AttachmentStore:
         except OSError as e:
             return f"(读取失败: {e})"
 
+    def stage_to_workspace(self, session_id: str, file_id: str) -> dict:
+        """把附件（原始文件）复制到会话 workspace 的 uploads/ 目录，供容器内直接访问。
+
+        返回 ``{ok, path}``，其中 path 为容器内可见路径（``/workspace/uploads/{file_id}/{filename}``）。
+        非压缩包附件使用此方法；压缩包用 ``extract_archive`` 自动投放。
+        """
+        from baize.pentest.workspace import get_workspace
+
+        att = self.get_attachment(session_id, file_id)
+        if att is None:
+            return {"ok": False, "error": "附件不存在", "path": ""}
+        p = self.original_path(session_id, file_id)
+        if p is None:
+            return {"ok": False, "error": "附件文件缺失", "path": ""}
+        ws = get_workspace(session_id)
+        target_dir = ws / "uploads" / file_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = Path(att.filename.replace("\\", "/")).name.strip()
+        target = target_dir / safe_name
+        try:
+            shutil.copy2(p, target)
+        except OSError as e:  # noqa: BLE001
+            return {"ok": False, "error": f"复制失败: {e}", "path": ""}
+        # 容器内路径：workspace 挂载到 /workspace
+        container_path = f"/workspace/uploads/{file_id}/{safe_name}"
+        return {"ok": True, "path": container_path}
+
     def extract_archive(self, session_id: str, file_id: str) -> dict:
-        """解压压缩包并返回文件清单。返回 {ok, entries: [{name, size}], error}。"""
+        """解压压缩包并返回文件清单。返回 {ok, entries, error, workspace_dir}。
+
+        解压后自动把全部文件复制到会话 workspace 的 ``uploads/{file_id}/`` 目录，
+        容器内可直接通过 ``/workspace/uploads/{file_id}/`` 访问，无需额外工具往返。
+        """
+        from baize.pentest.workspace import get_workspace
+
         att = self.get_attachment(session_id, file_id)
         if att is None or att.file_type != "archive":
             return {"ok": False, "error": "不是压缩包类型", "entries": []}
@@ -381,7 +414,20 @@ class AttachmentStore:
                         entries.append({"name": member.name, "size": member.size})
             else:
                 return {"ok": False, "error": "不支持的压缩格式", "entries": []}
-            return {"ok": True, "entries": entries, "extract_dir": str(extract_dir)}
+
+            # 自动投放：把解压目录整体复制到 workspace/uploads/{file_id}/
+            ws = get_workspace(session_id)
+            ws_target = ws / "uploads" / file_id
+            if ws_target.exists():
+                shutil.rmtree(ws_target, ignore_errors=True)
+            shutil.copytree(extract_dir, ws_target)
+            workspace_dir = f"/workspace/uploads/{file_id}"
+            return {
+                "ok": True,
+                "entries": entries,
+                "extract_dir": str(extract_dir),
+                "workspace_dir": workspace_dir,
+            }
         except Exception as e:  # noqa: BLE001
             return {"ok": False, "error": f"解压失败: {e}", "entries": entries}
 
@@ -451,10 +497,23 @@ def attachment_tools(
         if not r["ok"]:
             return f"(解压失败: {r.get('error')})"
         names = [e["name"] for e in r["entries"]]
-        return "压缩包内容:\n" + ("\n".join(names) if names else "(压缩包为空)")
+        ws_dir = r.get("workspace_dir", "")
+        lines = ["压缩包内容:"]
+        lines.extend(names if names else ["(压缩包为空)"])
+        if ws_dir:
+            lines.append("")
+            lines.append(f"文件已自动投放至容器工作区，可直接用命令行工具访问: {ws_dir}/")
+        return "\n".join(lines)
 
     def _read_extracted(file_id: str, path: str) -> str:
         return store.read_extracted_file(session_id, file_id, path)
+
+    def _stage(file_id: str) -> str:
+        """把非压缩包附件复制到 workspace，返回容器内路径。"""
+        r = store.stage_to_workspace(session_id, file_id)
+        if not r["ok"]:
+            return f"(投放失败: {r.get('error')})"
+        return f"附件已投放至容器工作区，可直接用命令行工具访问: {r['path']}"
 
     return [
         AgentTool(
@@ -477,7 +536,11 @@ def attachment_tools(
         ),
         AgentTool(
             name="extract_attachment_archive",
-            description="解压压缩包附件并列出其中文件清单（支持 zip/tar/tar.gz）。",
+            description=(
+                "解压压缩包附件并列出文件清单（支持 zip/tar/tar.gz）。"
+                "解压后文件会自动复制到容器工作区 /workspace/uploads/{file_id}/，"
+                "可直接用 identify/convert/binwalk 等命令行工具分析。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -499,6 +562,22 @@ def attachment_tools(
                 "required": ["file_id", "path"],
             },
             handler=_read_extracted,
+        ),
+        AgentTool(
+            name="stage_attachment_to_workspace",
+            description=(
+                "把非压缩包附件（图片/文档/代码等）复制到容器工作区，"
+                "返回容器内路径 /workspace/uploads/{file_id}/{filename}，"
+                "之后可直接用 file/identify/steghide/binwalk 等命令行工具分析。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "file_id": {"type": "string", "description": "附件 id（用 list_attachments 获取）"},
+                },
+                "required": ["file_id"],
+            },
+            handler=_stage,
         ),
     ]
 

@@ -9,6 +9,8 @@ import type {
   CreateSessionRequest,
   BlackboardSnapshot,
   BlackboardNode,
+  ReportTemplate,
+  ReportRecord,
   InferenceRequest,
   InferenceResponse,
   UXSummarizeLiteRequest,
@@ -36,6 +38,16 @@ import type {
   GuardrailTestResult,
   SandboxPolicyConfig,
   SharedBrowserStatus,
+  BindContainerResponse,
+  ContainersResponse,
+  ContainerStats,
+  ContainerInfo,
+  CreateContainerRequest,
+  BindContainerRequest,
+  ArchivesResponse,
+  ArchiveDetailResponse,
+  RestoreArchiveRequest,
+  RestoreArchiveResponse,
 } from '../types';
 
 export type SessionInfo = SessionSummary;
@@ -332,6 +344,48 @@ export async function addBlackboardHint(
     method: 'POST',
     body: JSON.stringify(data),
   });
+}
+
+// ===== Reports（报告模板 + 报告管理）=====
+export async function listReportTemplates(): Promise<{ templates: ReportTemplate[] }> {
+  return request('/reports/templates');
+}
+
+export async function getReportTemplate(id: string): Promise<ReportTemplate> {
+  return request(`/reports/templates/${id}`);
+}
+
+export async function listReports(sessionId = ''): Promise<{ reports: ReportRecord[]; total: number }> {
+  const qs = sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : '';
+  return request(`/reports${qs}`);
+}
+
+export async function getReport(id: string): Promise<ReportRecord> {
+  return request(`/reports/${id}`);
+}
+
+export async function deleteReport(id: string): Promise<{ deleted: string }> {
+  return request(`/reports/${id}`, { method: 'DELETE' });
+}
+
+/** 下载报告 .md（带认证头，触发浏览器保存） */
+export async function downloadReport(id: string, filename: string): Promise<void> {
+  const url = `${apiBase}/reports/${id}/download`;
+  const res = await fetch(url, { headers: { ...authHeaders() } });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try { detail = JSON.parse(await res.text()).detail || detail; } catch {}
+    throw new Error(`[${res.status}] ${detail}`);
+  }
+  const blob = await res.blob();
+  const objectUrl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = objectUrl;
+  a.download = filename.endsWith('.md') ? filename : `${filename}.md`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(objectUrl);
 }
 
 export async function getSession(id: string): Promise<SessionDetail> {
@@ -1319,6 +1373,102 @@ export async function getMemoryGraph(): Promise<MemoryGraphSnapshot> {
 /** 拒绝沙箱工具执行 */
 export async function sandboxDeny(toolName: string, sessionId: string): Promise<{ status: string; tool: string }> {
   return request('/sandbox/deny', { method: 'POST', body: JSON.stringify({ tool_name: toolName, session_id: sessionId }) });
+}
+
+// ===== 任务-容器解耦：容器绑定 / 解绑 / 归档 / 恢复 =====
+
+/**
+ * 为任务绑定容器（≤60s）。
+ * - 传 containerName：绑定已有池容器（重建挂载 session 工作区）
+ * - 不传 containerName：创建新容器并立即绑定（旧路径）
+ */
+export async function bindContainer(
+  sessionId: string,
+  containerName?: string,
+): Promise<BindContainerResponse> {
+  const body: BindContainerRequest = containerName
+    ? { container_name: containerName }
+    : {};
+  return request(`/sessions/${sessionId}/bind-container`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+}
+
+/** 解除任务绑定的容器（停止+移除容器+清空 container_id）。 */
+export async function unbindContainer(sessionId: string): Promise<{ ok: boolean }> {
+  return request(`/sessions/${sessionId}/unbind-container`, { method: 'POST' });
+}
+
+/** 结束任务：停止容器 + 归档对话到 ~/.baize/archives/。 */
+export async function archiveSession(sessionId: string): Promise<{ ok: boolean; archived_at: string }> {
+  return request(`/sessions/${sessionId}/archive`, { method: 'POST' });
+}
+
+/**
+ * 创建独立池容器（不绑定 session）。
+ * - name 留空时后端自动生成 `baize-sandbox-pool-{ts}`
+ * - 成功返回 201 + ContainerInfo
+ */
+export async function createContainer(req: CreateContainerRequest): Promise<ContainerInfo> {
+  return request('/containers', {
+    method: 'POST',
+    body: JSON.stringify(req),
+  });
+}
+
+/** 列出所有容器（含池中 available + 已绑定 + 孤儿）。 */
+export async function listContainers(): Promise<ContainersResponse> {
+  return request('/containers');
+}
+
+/** 容器并发统计。 */
+export async function containerStats(): Promise<ContainerStats> {
+  return request('/containers/stats');
+}
+
+/**
+ * 解绑容器但保留（容器回到池中 available 状态）。
+ * 调用此接口后，容器的 session_id 被清空，可被其他任务绑定。
+ */
+export async function unbindContainerKeep(containerName: string): Promise<{ ok: boolean }> {
+  return request(`/containers/${encodeURIComponent(containerName)}/unbind`, { method: 'POST' });
+}
+
+/** 清理任意状态容器（active/orphan/stopped）。 */
+export async function deleteContainer(containerName: string): Promise<{ ok: boolean }> {
+  return request(`/containers/${encodeURIComponent(containerName)}`, { method: 'DELETE' });
+}
+
+/** 启动已停止的容器（保留原配置与绑定关系）。 */
+export async function startContainer(containerName: string): Promise<ContainerInfo> {
+  return request(`/containers/${encodeURIComponent(containerName)}/start`, { method: 'POST' });
+}
+
+/** 列出已归档任务。 */
+export async function listArchives(): Promise<ArchivesResponse> {
+  return request('/archives');
+}
+
+/** 获取归档详情。 */
+export async function getArchive(sessionId: string): Promise<ArchiveDetailResponse> {
+  return request(`/archives/${sessionId}`);
+}
+
+/** 恢复归档为任务（可选同时绑定容器）。 */
+export async function restoreArchive(
+  sessionId: string,
+  payload: RestoreArchiveRequest = {},
+): Promise<RestoreArchiveResponse> {
+  return request(`/archives/${sessionId}/restore`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+/** 永久删除归档。 */
+export async function deleteArchive(sessionId: string): Promise<{ ok: boolean }> {
+  return request(`/archives/${sessionId}`, { method: 'DELETE' });
 }
 
 

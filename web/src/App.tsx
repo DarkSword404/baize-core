@@ -6,9 +6,11 @@ import { Layout } from './components/Layout';
 import { Dashboard } from './pages/Dashboard';
 import { Tools } from './pages/Tools';
 import PipelineEditor from './pages/PipelineEditor';
-import { Sessions } from './pages/Sessions';
+import { TaskArchives } from './pages/TaskArchives';
+import { Containers } from './pages/Containers';
 import { Guardrails } from './pages/Guardrails';
 import { Experiences } from './pages/Experiences';
+import { Reports } from './pages/Reports';
 import { Settings } from './pages/Settings';
 import type { JSX } from 'react';
 
@@ -33,11 +35,15 @@ export default function App(): JSX.Element {
                 <Route path="dashboard" element={<Dashboard />} />
                 {/* Chat 由 Layout 常驻渲染（切页不卸载，保持流式状态），此处仅保留路由可达性 */}
                 <Route path="chat" element={null} />
+                <Route path="containers" element={<Containers />} />
                 <Route path="tools" element={<Tools />} />
                 <Route path="orchestration" element={<OrchestrationRoute />} />
-                <Route path="sessions" element={<Sessions />} />
+                {/* 旧 /sessions 路径重定向到 /archives（任务记录） */}
+                <Route path="sessions" element={<Navigate to="/archives" replace />} />
+                <Route path="archives" element={<TaskArchives />} />
                 <Route path="guardrails" element={<Guardrails />} />
                 <Route path="experiences" element={<Experiences />} />
+                <Route path="reports" element={<Reports />} />
                 <Route path="settings" element={<Settings />} />
               </Route>
               <Route path="*" element={<Navigate to="/dashboard" replace />} />
