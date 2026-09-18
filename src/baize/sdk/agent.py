@@ -283,13 +283,20 @@ class AgentTool:
     async def execute(self, arguments: str) -> str:
         try:
             args = json.loads(arguments) if arguments else {}
-        except json.JSONDecodeError:
-            args = {}
+        except json.JSONDecodeError as exc:
+            # JSON 解析失败不再静默退化为无参调用——把错误反馈给模型，
+            # 让其修正参数格式后重试，避免以默认参数误执行（可能命中错误目标）。
+            return (
+                f"工具 `{self.name}` 的参数不是合法 JSON: {exc}。"
+                f"原始参数: {arguments!r}。请按 JSON Schema 重新生成参数后调用。"
+            )
         # 防御：LLM 可能生成非法参数形态（"null"、"[1,2]""、"字符串"等），
         # json.loads 不报错但结果非 dict，后续 `name in args` 会抛 TypeError。
-        # 一律归一为 dict，保持调用链健壮。
         if not isinstance(args, dict):
-            args = {}
+            return (
+                f"工具 `{self.name}` 的参数必须是 JSON 对象，收到: {arguments!r}。"
+                "请按 JSON Schema 重新生成参数后调用。"
+            )
         # 防御：handler 必填参数缺失时返回友好错误而非抛 TypeError，
         # 避免 LLM 省略参数导致整个对话流 500 中断。
         missing = _missing_required_params(self.handler, args)

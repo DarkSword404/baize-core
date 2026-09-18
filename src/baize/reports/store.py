@@ -86,13 +86,18 @@ class ReportStore:
             return
         try:
             data = json.loads(idx.read_text(encoding="utf-8"))
-            for item in data.get("reports", []):
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("报告索引文件损坏，整体跳过: %s", exc)
+            return
+        for item in data.get("reports", []):
+            try:
                 rec = ReportRecord.from_dict(item)
                 # 仅加载正文仍存在的报告
                 if self._md_path(rec.id).exists():
                     self._records[rec.id] = rec
-        except (json.JSONDecodeError, OSError, KeyError):
-            logger.warning("报告索引加载失败，忽略损坏数据", exc_info=True)
+            except (KeyError, TypeError, ValueError) as exc:
+                # 单条记录损坏不影响其他报告加载
+                logger.warning("跳过损坏的报告索引条目: %s", exc)
 
     def _save_index(self) -> None:
         payload = {
@@ -132,13 +137,15 @@ class ReportStore:
             return self._records.get(report_id)
 
     def get_content(self, report_id: str) -> Optional[str]:
+        # 锁内完成存在性检查 + 读取，避免与删除竞态导致 FileNotFoundError
         with self._lock:
             if report_id not in self._records:
                 return None
-        path = self._md_path(report_id)
-        if not path.exists():
-            return None
-        return path.read_text(encoding="utf-8")
+            path = self._md_path(report_id)
+            try:
+                return path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None
 
     # ── 写入 ──
 

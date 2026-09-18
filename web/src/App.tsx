@@ -2,6 +2,7 @@ import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { AppProvider, useApp } from './context/AppContext';
 import { ThemeProvider } from './context/ThemeContext';
 import { AuthGuard } from './components/AuthGuard';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { Layout } from './components/Layout';
 import { Dashboard } from './pages/Dashboard';
 import { Tools } from './pages/Tools';
@@ -28,27 +29,29 @@ export default function App(): JSX.Element {
     <BrowserRouter>
       <ThemeProvider>
         <AppProvider>
-          <AuthGuard>
-            <Routes>
-              <Route path="/" element={<Layout />}>
-                <Route index element={<Navigate to="/dashboard" replace />} />
-                <Route path="dashboard" element={<Dashboard />} />
-                {/* Chat 由 Layout 常驻渲染（切页不卸载，保持流式状态），此处仅保留路由可达性 */}
-                <Route path="chat" element={null} />
-                <Route path="containers" element={<Containers />} />
-                <Route path="tools" element={<Tools />} />
-                <Route path="orchestration" element={<OrchestrationRoute />} />
-                {/* 旧 /sessions 路径重定向到 /archives（任务记录） */}
-                <Route path="sessions" element={<Navigate to="/archives" replace />} />
-                <Route path="archives" element={<TaskArchives />} />
-                <Route path="guardrails" element={<Guardrails />} />
-                <Route path="experiences" element={<Experiences />} />
-                <Route path="reports" element={<Reports />} />
-                <Route path="settings" element={<Settings />} />
-              </Route>
-              <Route path="*" element={<Navigate to="/dashboard" replace />} />
-            </Routes>
-          </AuthGuard>
+          <ErrorBoundary title="应用初始化失败">
+            <AuthGuard>
+              <Routes>
+                <Route path="/" element={<Layout />}>
+                  <Route index element={<Navigate to="/dashboard" replace />} />
+                  <Route path="dashboard" element={<ErrorBoundary><Dashboard /></ErrorBoundary>} />
+                  {/* Chat 由 Layout 常驻渲染（切页不卸载，保持流式状态），此处仅保留路由可达性 */}
+                  <Route path="chat" element={null} />
+                  <Route path="containers" element={<ErrorBoundary><Containers /></ErrorBoundary>} />
+                  <Route path="tools" element={<ErrorBoundary><Tools /></ErrorBoundary>} />
+                  <Route path="orchestration" element={<ErrorBoundary><OrchestrationRoute /></ErrorBoundary>} />
+                  {/* 旧 /sessions 路径重定向到 /archives（任务记录） */}
+                  <Route path="sessions" element={<Navigate to="/archives" replace />} />
+                  <Route path="archives" element={<ErrorBoundary><TaskArchives /></ErrorBoundary>} />
+                  <Route path="guardrails" element={<ErrorBoundary><Guardrails /></ErrorBoundary>} />
+                  <Route path="experiences" element={<ErrorBoundary><Experiences /></ErrorBoundary>} />
+                  <Route path="reports" element={<ErrorBoundary><Reports /></ErrorBoundary>} />
+                  <Route path="settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
+                </Route>
+                <Route path="*" element={<Navigate to="/dashboard" replace />} />
+              </Routes>
+            </AuthGuard>
+          </ErrorBoundary>
         </AppProvider>
       </ThemeProvider>
     </BrowserRouter>

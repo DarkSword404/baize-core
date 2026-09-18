@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import shlex
@@ -381,7 +382,9 @@ class DockerExecutor(BaseExecutor):
 
     async def run(self, command: str, timeout: int = 120, **kwargs: Any) -> ExecResult:
         sandbox, _ = _resolve_sandbox(kwargs)
-        args = [self.docker_cmd, "run"]
+        # 为容器命名，超时后可主动 docker rm -f 清理孤儿容器
+        container_name = f"baize-run-{uuid.uuid4().hex[:10]}"
+        args = [self.docker_cmd, "run", "--name", container_name]
         if self.remove:
             args.append("--rm")
         args += ["-i", "--network", self.network]
@@ -389,7 +392,8 @@ class DockerExecutor(BaseExecutor):
             args.append("--read-only")
         args += self.extra_args
         args.append(self.image)
-        args += shlex.split(command)
+        # 用 sh -c 包裹，保留管道/重定向/变量展开等 shell 语义，与 LocalExecutor 行为一致
+        args += ["sh", "-c", command]
 
         started = asyncio.get_event_loop().time()
         try:
@@ -406,8 +410,16 @@ class DockerExecutor(BaseExecutor):
                 returncode = proc.returncode
                 timed_out = False
             except asyncio.TimeoutError:
+                # 杀本地 docker 客户端进程
                 proc.kill()
                 await proc.wait()
+                # 关键：主动移除容器，防止 dockerd 端容器变孤儿占用资源
+                with contextlib.suppress(Exception):
+                    await asyncio.create_subprocess_exec(
+                        self.docker_cmd, "rm", "-f", container_name,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
                 stdout, stderr = b"", "timeout".encode()
                 returncode = -1
                 timed_out = True

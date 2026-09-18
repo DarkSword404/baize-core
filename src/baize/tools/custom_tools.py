@@ -208,6 +208,7 @@ class CustomToolStore:
         if record is None:
             raise KeyError(f"自定义工具 {tool_id} 不存在")
 
+        old_name = record["name"]
         if "name" in data:
             name = sanitize_tool_name(data["name"])
             conflict = self.find_by_name(name)
@@ -215,6 +216,8 @@ class CustomToolStore:
                 raise ValueError(f"自定义工具 '{name}' 已存在")
             record["name"] = name
             record["display_name"] = data.get("display_name") or data.get("name") or name
+        else:
+            name = old_name
         if "description" in data:
             record["description"] = data.get("description", "")
         if "category" in data:
@@ -232,6 +235,9 @@ class CustomToolStore:
         record["updated_at"] = datetime.now(timezone.utc).isoformat()
 
         record = self._write(record)
+        # 改名时先注销旧名，避免 registry 里残留过期注册项
+        if name != old_name:
+            self._unregister(old_name)
         if record["enabled"]:
             self._register(record)
         else:

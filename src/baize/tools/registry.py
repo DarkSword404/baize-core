@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import inspect
 import logging
+import threading
 from dataclasses import dataclass, field
 from importlib.metadata import entry_points
 from typing import Any, Callable, Optional, Union, get_type_hints
@@ -155,6 +156,7 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolSpec] = {}
         self._loaded_plugins: set[str] = set()
+        self._lock = threading.RLock()
 
     # ---- 注册 / 注销 -------------------------------------------------
     def register(self, spec: ToolSpec, *, override: bool = False) -> None:
@@ -169,37 +171,44 @@ class ToolRegistry:
         """
         if not spec.name:
             raise ValueError("工具名称不能为空")
-        if spec.name in self._tools and not override:
-            raise ValueError(
-                f"工具 '{spec.name}' 已注册（来源: {self._tools[spec.name].author}），"
-                "如确需覆盖请使用 override=True"
-            )
-        self._tools[spec.name] = spec
+        with self._lock:
+            if spec.name in self._tools and not override:
+                raise ValueError(
+                    f"工具 '{spec.name}' 已注册（来源: {self._tools[spec.name].author}），"
+                    "如确需覆盖请使用 override=True"
+                )
+            self._tools[spec.name] = spec
 
     def unregister(self, name: str) -> None:
         """注销一个工具。"""
-        self._tools.pop(name, None)
+        with self._lock:
+            self._tools.pop(name, None)
 
     # ---- 查询 ---------------------------------------------------------
     def get(self, name: str) -> Optional[ToolSpec]:
         """按名称获取工具定义。"""
-        return self._tools.get(name)
+        with self._lock:
+            return self._tools.get(name)
 
     def all(self) -> list[ToolSpec]:
         """返回全部工具（按注册顺序）。"""
-        return list(self._tools.values())
+        with self._lock:
+            return list(self._tools.values())
 
     def names(self) -> list[str]:
         """返回全部工具名。"""
-        return list(self._tools.keys())
+        with self._lock:
+            return list(self._tools.keys())
 
     def by_category(self, category: str) -> list[ToolSpec]:
         """按分类返回工具。"""
-        return [t for t in self._tools.values() if t.category == category]
+        with self._lock:
+            return [t for t in self._tools.values() if t.category == category]
 
     def categories(self) -> list[str]:
         """返回全部分类。"""
-        return sorted({t.category for t in self._tools.values()})
+        with self._lock:
+            return sorted({t.category for t in self._tools.values()})
 
     # ---- 兼容层 -------------------------------------------------------
     def to_agent_tools(self) -> list[AgentTool]:

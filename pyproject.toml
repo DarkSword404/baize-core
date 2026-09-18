@@ -3,7 +3,7 @@ name = "baize-core"
 version = "4.0.0"
 description = "Baize (白泽) core — single-agent AI cybersecurity chat framework"
 readme = { file = "README.md", content-type = "text/markdown" }
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [
   { name = "Baize Contributors" },

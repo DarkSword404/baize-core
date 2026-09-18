@@ -15,7 +15,9 @@ import copy
 import json
 import logging
 import os
+import shutil
 import sys
+from pathlib import Path
 from dataclasses import replace as _dataclass_replace
 from importlib.metadata import entry_points
 from typing import Any, Optional
@@ -67,6 +69,7 @@ from baize.memory import MemoryService
 class HealthResponse(BaseModel):
     status: str
     version: str
+    checks: Optional[dict[str, bool]] = None
 
 
 class ModelConfigRequest(BaseModel):
@@ -771,9 +774,48 @@ def create_baize_api_app(
     # ------------------------------------------------------------------
     # 健康检查
     # ------------------------------------------------------------------
+    @app.get("/api/v1/live", response_model=HealthResponse)
+    def live() -> HealthResponse:
+        """存活探针：仅检查进程是否响应，不做依赖巡检。"""
+        return HealthResponse(status="ok", version=__version__)
+
     @app.get("/api/v1/health", response_model=HealthResponse)
     def health() -> HealthResponse:
-        return HealthResponse(status="ok", version=__version__)
+        """健康检查（含依赖巡检）：模型配置、SQLite 可写、关键目录可访问。"""
+        checks: dict[str, bool] = {}
+        # 1. 模型配置是否存在
+        try:
+            mgr = getattr(app.state, "model_manager", None)
+            checks["model_config"] = bool(mgr and mgr.get_config())
+        except Exception:  # noqa: BLE001
+            checks["model_config"] = False
+        # 2. 认证数据库可写（SQLite）
+        try:
+            auth = getattr(app.state, "auth_manager", None)
+            checks["auth_db"] = bool(auth and auth.db_path and Path(auth.db_path).exists())
+        except Exception:  # noqa: BLE001
+            checks["auth_db"] = False
+        # 3. 数据目录可写
+        try:
+            from baize.config import DATA_DIR
+            checks["data_dir"] = Path(DATA_DIR).is_dir() and os.access(DATA_DIR, os.W_OK)
+        except Exception:  # noqa: BLE001
+            checks["data_dir"] = False
+        # 4. 容器运行时可用（若已配置）
+        try:
+            runtime = os.environ.get("BAIZE_SANDBOX_RUNTIME", "")
+            if runtime:
+                checks["container_runtime"] = shutil.which(runtime) is not None
+            else:
+                checks["container_runtime"] = True  # 未启用则视为通过
+        except Exception:  # noqa: BLE001
+            checks["container_runtime"] = False
+        all_ok = all(checks.values()) if checks else True
+        return HealthResponse(
+            status="ok" if all_ok else "degraded",
+            version=__version__,
+            checks=checks,
+        )
 
     # ------------------------------------------------------------------
     # 已安装模块列表
@@ -905,14 +947,37 @@ def create_baize_api_app(
 
     # ---- 共享浏览器 CDP 实时帧流 + 输入注入（WebSocket 双向）----------
     async def _require_ws_api_key(ws: WebSocket) -> bool:
-        """WebSocket 鉴权：query `token` 或 `X-Baize-API-Key` 头。失败 close(4401)。"""
+        """WebSocket 鉴权，优先级：X-Baize-API-Key 头 > 首帧 token > query token。
+
+        浏览器原生 WebSocket 无法设置自定义 header，故支持首帧 ``{"token":"..."}``
+        鉴权；query token 仅作兼容回退（会写入 access log，不推荐）。
+        鉴权失败 close(4401)。
+        """
         if not ws.app.state.require_auth:
+            await ws.accept()
             return True
-        token = ws.query_params.get("token") or ws.headers.get("x-baize-api-key")
-        if not ws.app.state.auth_manager.validate_token(token or ""):
-            await ws.close(code=4401)
-            return False
-        return True
+        # 1. 自定义 header（非浏览器客户端、curl）
+        token = ws.headers.get("x-baize-api-key")
+        if token and ws.app.state.auth_manager.validate_token(token):
+            await ws.accept()
+            return True
+        # 2. 首帧 token（浏览器 WebSocket）
+        await ws.accept()
+        try:
+            first = await asyncio.wait_for(ws.receive_json(), timeout=5.0)
+            if isinstance(first, dict):
+                ft = first.get("token")
+                if ft and ws.app.state.auth_manager.validate_token(str(ft)):
+                    return True
+        except (asyncio.TimeoutError, ValueError, TypeError):
+            pass
+        # 3. query token（兼容回退，不推荐——token 会进入 access log）
+        qt = ws.query_params.get("token")
+        if qt and ws.app.state.auth_manager.validate_token(qt):
+            logger.warning("WebSocket 使用 query token 鉴权（不推荐，请改用首帧或 header）")
+            return True
+        await ws.close(code=4401)
+        return False
 
     async def _sb_dispatch(
         sb: Any, msg: dict, send_frame: Any, send_status: Any
@@ -1275,13 +1340,12 @@ def create_baize_api_app(
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    def bind_container(session_id: str, req: BindContainerRequest) -> dict:
+    async def bind_container(session_id: str, req: BindContainerRequest) -> dict:
         """为任务绑定容器（≤60s）。
 
         - 传 ``container_name``：绑定已有池容器（重建挂载 session 工作区）
         - 不传 ``container_name``：创建新容器并立即绑定（旧路径）
         """
-        import asyncio
         from baize.pentest.container_registry import ContainerRegistry
         from baize.pentest.workspace import get_container_manager, ContainerRuntimeError
         session = app.state.session_manager.get_session(session_id)
@@ -1306,7 +1370,7 @@ def create_baize_api_app(
             container_name = req.container_name.strip()
             try:
                 # 1) 重建容器挂载 session 工作区（同名 stop+run）
-                asyncio.run(mgr.rebind_to_session(container_name, session_id))
+                await mgr.rebind_to_session(container_name, session_id)
             except ContainerRuntimeError as exc:
                 raise HTTPException(status_code=503, detail=f"容器重建失败：{exc}") from exc
             # 2) 注册表绑定关系
@@ -1329,7 +1393,7 @@ def create_baize_api_app(
 
         # 分支 B：旧路径——创建新容器并立即绑定
         try:
-            name = app.state.session_manager.bind_container(
+            name = await app.state.session_manager.bind_container(
                 session_id=session_id,
                 mgr=mgr,
                 registry=registry,
@@ -1349,14 +1413,14 @@ def create_baize_api_app(
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    def unbind_container(session_id: str) -> dict:
+    async def unbind_container(session_id: str) -> dict:
         from baize.pentest.workspace import get_container_manager
         session = app.state.session_manager.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="任务不存在")
         mgr = get_container_manager()
         try:
-            ok = app.state.session_manager.unbind_container(
+            ok = await app.state.session_manager.unbind_container(
                 session_id=session_id, mgr=mgr,
                 registry=app.state.container_registry,
             )
@@ -1632,7 +1696,7 @@ def create_baize_api_app(
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    def restore_archive(session_id: str, payload: dict | None = None) -> dict:
+    async def restore_archive(session_id: str, payload: dict | None = None) -> dict:
         """从归档恢复为任务。可选 body ``{"bind_container": true}`` 同时绑定容器。"""
         bind = bool((payload or {}).get("bind_container"))
         try:
@@ -1656,7 +1720,7 @@ def create_baize_api_app(
                 bind_error = f"镜像 {get_image()} 不存在"
             else:
                 try:
-                    app.state.session_manager.bind_container(
+                    await app.state.session_manager.bind_container(
                         session_id=session_id,
                         mgr=mgr,
                         registry=app.state.container_registry,
@@ -1973,6 +2037,8 @@ def create_baize_api_app(
             final_text = ""
             # 是否已把本轮内容持久化（正常完成 / 中断都只保存一次）
             saved = False
+            # 是否已发送 SSE 终止帧 [DONE]，避免 finally 重复 yield 触发部分客户端协议错误
+            done_sent = False
 
             # ── 立即发送首字节：避免代理网关因首字节超时切断连接 ──
             # 部分反向代理/CDN（如 Trae preview 网关）对 POST+SSE 有首字节超时，
@@ -2115,11 +2181,13 @@ def create_baize_api_app(
                         elif etype == "done":
                             break
                     _flush_to_session()
+                    done_sent = True
                     yield "data: [DONE]\n\n"
                     return
                 except Exception as e:  # noqa: BLE001
                     logger.exception("流水线会话处理失败: %s", e)
                     yield f"data: {json.dumps({'type': 'error', 'error': _format_detailed_error(e, '流水线对话')})}\n\n"
+                    done_sent = True
                     yield "data: [DONE]\n\n"
                     return
 
@@ -2269,6 +2337,7 @@ def create_baize_api_app(
                             note="\n\n_（任务在此处中断，已保留以上执行过程；"
                                  "回复「继续」可从黑板状态接着执行。）_" if not final_text.strip() else "",
                         )
+                    done_sent = True
                     yield "data: [DONE]\n\n"
                     return
                 except asyncio.CancelledError:
@@ -2287,6 +2356,7 @@ def create_baize_api_app(
                         note=f"\n\n⚠️ **执行中断**：{_format_detailed_error(e, '对话编排')}",
                     )
                     yield f"data: {json.dumps({'type': 'error', 'error': _format_detailed_error(e, '对话编排')})}\n\n"
+                    done_sent = True
                     yield "data: [DONE]\n\n"
                     return
                 finally:
@@ -2392,10 +2462,13 @@ def create_baize_api_app(
                 # 关键：无论正常完成、连接断开（GeneratorExit/CancelledError）、还是异常，
                 # 只要本轮产生了内容，就持久化，避免切换页面/刷新后对话丢失。
                 _flush_to_session()
-                try:
-                    yield "data: [DONE]\n\n"
-                except Exception:  # noqa: BLE001
-                    pass
+                # 仅在尚未发送 [DONE] 时发送，避免与正常路径的 done 帧重复
+                if not done_sent:
+                    done_sent = True
+                    try:
+                        yield "data: [DONE]\n\n"
+                    except Exception:  # noqa: BLE001
+                        pass
 
         async def _event_source_with_heartbeat():
             """外层心跳包装：保证 event_source 整个生命周期（含 LLM 首字节等待）
@@ -2966,17 +3039,49 @@ def _print_credentials(app: FastAPI, cfg) -> None:
     username = auth.default_username
     separator = "=" * 44
     if auth.default_password and auth.default_token:
-        lines = [
-            f"\n{separator}",
-            "  白泽·智脑 (Baize) 登录凭证（首次启动自动生成，请妥善保存）",
-            f"  用户名:   {username}",
-            f"  密码:     {auth.default_password}",
-            f"  Token:    {auth.default_token}",
-            f"  前端地址: {cfg.frontend_url or 'http://<host>:<port>/'}",
-            "  使用方式: 登录页输入用户名/密码，或请求头携带 X-Baize-API-Key",
-            "  (Token 请勿放入 URL，避免泄露到浏览器历史/日志)",
-            f"{separator}\n",
-        ]
+        # 凭证默认写入 ~/.baize/credentials.txt（权限 0600），stdout 仅显示路径，
+        # 避免明文密码/Token 进入容器日志被运维平台永久存档。
+        # 设 BAIZE_PRINT_TOKENS=1 才在 stdout 回显明文。
+        cred_path = Path.home() / ".baize" / "credentials.txt"
+        try:
+            cred_path.parent.mkdir(parents=True, exist_ok=True)
+            cred_path.write_text(
+                f"username: {username}\n"
+                f"password: {auth.default_password}\n"
+                f"token: {auth.default_token}\n",
+                encoding="utf-8",
+            )
+            try:
+                os.chmod(cred_path, 0o600)
+            except OSError:
+                pass
+            cred_note = f"  凭证文件: {cred_path} (权限 0600)"
+        except OSError as exc:
+            cred_note = f"  凭证文件写入失败: {exc}"
+        if os.getenv("BAIZE_PRINT_TOKENS", "0").lower() in ("1", "true", "yes"):
+            lines = [
+                f"\n{separator}",
+                "  白泽·智脑 (Baize) 登录凭证（首次启动自动生成，请妥善保存）",
+                f"  用户名:   {username}",
+                f"  密码:     {auth.default_password}",
+                f"  Token:    {auth.default_token}",
+                cred_note,
+                f"  前端地址: {cfg.frontend_url or 'http://<host>:<port>/'}",
+                "  使用方式: 登录页输入用户名/密码，或请求头携带 X-Baize-API-Key",
+                "  (Token 请勿放入 URL，避免泄露到浏览器历史/日志)",
+                f"{separator}\n",
+            ]
+        else:
+            lines = [
+                f"\n{separator}",
+                "  白泽·智脑 (Baize) 登录凭证（首次启动自动生成）",
+                f"  用户名:   {username}",
+                cred_note,
+                "  （明文密码/Token 已写入凭证文件，未在 stdout 输出；",
+                "   如需 stdout 回显请设 BAIZE_PRINT_TOKENS=1）",
+                f"  前端地址: {cfg.frontend_url or 'http://<host>:<port>/'}",
+                f"{separator}\n",
+            ]
     else:
         from baize.config import AUTH_DB_FILE
 

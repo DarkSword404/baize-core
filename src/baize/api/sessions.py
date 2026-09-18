@@ -173,8 +173,16 @@ class SessionManager:
                     session.blackboard = Blackboard.from_dict(bb_data)
                     self._bind_blackboard_autosave(session.id, session.blackboard)
                 self._sessions[session.id] = session
-            except (json.JSONDecodeError, OSError, KeyError):
-                continue
+            except (json.JSONDecodeError, OSError, KeyError) as exc:
+                # 损坏的 session 文件不再静默跳过：记录日志并隔离到 .broken/，
+                # 避免用户历史任务"凭空消失"且无从排查。
+                logger.error("会话文件损坏，已隔离: %s (%s)", f.name, exc)
+                broken_dir = self._dir / ".broken"
+                try:
+                    broken_dir.mkdir(exist_ok=True)
+                    f.rename(broken_dir / f.name)
+                except OSError:
+                    pass
 
     def _save(self, session: Session) -> None:
         payload = {
@@ -248,28 +256,26 @@ class SessionManager:
         return sorted(items, key=lambda s: s.updated_at, reverse=True)
 
     # ---- 任务-容器绑定 / 归档 / 恢复 -----------------------------------
-    def bind_container(
+    async def bind_container(
         self,
         session_id: str,
         mgr,
         registry,
     ) -> str:
-        """为任务同步绑定容器（≤60s）。成功返回容器名。
+        """为任务异步绑定容器（≤60s）。成功返回容器名。
 
         - 任务不存在 → KeyError
         - 已绑定 → registry.AlreadyBound（调用方返回 409）
         - 超并发上限 → registry.ContainerLimitExceeded（409）
         - 容器创建失败 → ContainerRuntimeError（503，session 不受影响）
         """
-        import asyncio
-
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 raise KeyError(session_id)
             if session.status != "active":
                 raise RuntimeError(f"session {session_id} not active: {session.status}")
-        # 同步等待容器创建（≤60s）；预检查并发上限，避免无谓创建
+        # 等待容器创建（≤60s）；预检查并发上限，避免无谓创建
         from baize.pentest.container_registry import ContainerRegistry
         if registry.count_active() >= registry.max_concurrency:
             raise ContainerRegistry.ContainerLimitExceeded(
@@ -277,8 +283,8 @@ class SessionManager:
             )
         if registry.is_bound(session_id):
             raise ContainerRegistry.AlreadyBound(f"session {session_id} 已绑定容器")
-        # 真正创建容器（阻塞）
-        name = asyncio.run(mgr.ensure_container(session_id))
+        # 真正创建容器
+        name = await mgr.ensure_container(session_id)
         # 落地绑定关系（registry.bind 内部再次检查上限，线程安全）
         from baize.pentest.container_runtime import get_image
         try:
@@ -290,7 +296,7 @@ class SessionManager:
             )
         except (ContainerRegistry.AlreadyBound, ContainerRegistry.ContainerLimitExceeded):
             # 并发竞争：刚创建的容器需清理
-            asyncio.run(mgr.stop(session_id))
+            await mgr.stop(session_id)
             raise
         with self._lock:
             session = self._sessions.get(session_id)
@@ -301,10 +307,8 @@ class SessionManager:
         logger.info("任务绑定容器 session=%s container=%s", session_id, name)
         return name
 
-    def unbind_container(self, session_id: str, mgr, registry) -> bool:
+    async def unbind_container(self, session_id: str, mgr, registry) -> bool:
         """解除容器绑定：停止容器 + 注册表 unbind + 清 session.container_id。"""
-        import asyncio
-
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
@@ -312,7 +316,7 @@ class SessionManager:
             if not session.container_id:
                 return False
         # 停止 + 移除容器
-        asyncio.run(mgr.stop(session_id))
+        await mgr.stop(session_id)
         registry.unbind(session_id)
         with self._lock:
             session = self._sessions.get(session_id)

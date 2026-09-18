@@ -3,6 +3,7 @@ Receiver Manager — 接收器生命周期管理 & 高并发数据缓冲
 """
 
 import asyncio
+import contextlib
 import logging
 import threading
 import time
@@ -50,6 +51,7 @@ class ReceiverManager:
         self._queues: dict[str, asyncio.Queue] = {}       # receiver_id → Queue
         self._handlers: dict[str, Callable] = {}           # pipeline_id → handler
         self._listeners: list[Callable[[str, ReceivedData], None]] = []  # 全局监听
+        self._tasks: dict[str, asyncio.Task] = {}          # receiver_id → 运行中 task（持引用防 GC，便于 cancel）
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
@@ -72,6 +74,12 @@ class ReceiverManager:
         self._running = False
         self._handlers.clear()
         self._listeners.clear()
+        # 取消所有运行中的接收器任务，否则 stop 后端口仍占用、重启后任务重叠
+        for task in self._tasks.values():
+            task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+        self._tasks.clear()
         # 清空队列
         for q in self._queues.values():
             while not q.empty():
@@ -85,15 +93,19 @@ class ReceiverManager:
     async def _start_receiver(self, cfg: ReceiverConfig):
         """根据类型启动具体接收器"""
         kind = cfg.kind
+        receiver = None
         if kind == "syslog":
             from .syslog_receiver import SyslogReceiver
             receiver = SyslogReceiver(cfg)
-            asyncio.create_task(receiver.run(self._on_data))
         elif kind == "file":
             from .file_watcher import FileWatcherReceiver
             receiver = FileWatcherReceiver(cfg)
-            asyncio.create_task(receiver.run(self._on_data))
         # webhook 不在这里启动，由 FastAPI 路由处理
+        if receiver is not None:
+            task = asyncio.create_task(receiver.run(self._on_data))
+            # 持引用防止被 GC，完成后自动从字典移除
+            self._tasks[cfg.id] = task
+            task.add_done_callback(lambda _t, _id=cfg.id: self._tasks.pop(_id, None))
 
     async def _on_data(self, receiver_id: str, data: ReceivedData):
         """接收器回调：写入持久化收件箱（唯一事实源）+ 入内存队列 + 更新统计"""
@@ -191,6 +203,11 @@ class ReceiverManager:
         logger.info(f"Receiver [{receiver_id}] enabled")
 
     async def disable_receiver(self, receiver_id: str):
-        """动态停用接收器"""
+        """动态停用接收器（取消运行中的任务，释放端口）"""
         self._store.update(receiver_id, enabled=False)
+        task = self._tasks.pop(receiver_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         logger.info(f"Receiver [{receiver_id}] disabled")
