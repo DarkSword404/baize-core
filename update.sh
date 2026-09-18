@@ -16,6 +16,7 @@ cd "$SCRIPT_DIR"
 # 远程仓库
 REMOTE="origin"
 BRANCH="main"
+EXPECTED_REMOTE_URL="https://github.com/DarkSword404/baize-dev.git"
 
 echo "=============================================="
 echo "  Baize 更新脚本"
@@ -31,7 +32,7 @@ fi
 # 2. 检查远程是否配置
 if ! git remote get-url "$REMOTE" >/dev/null 2>&1; then
   echo "❌ 未配置远程仓库 '$REMOTE'。"
-  echo "   请执行: git remote add $REMOTE https://github.com/DarkSword404/baize-core.git"
+  echo "   请执行: git remote add $REMOTE $EXPECTED_REMOTE_URL"
   exit 1
 fi
 
@@ -137,5 +138,8 @@ echo "=============================================="
 echo ""
 echo "  ⚠️ 如果服务正在运行，请重启服务使更新生效："
 echo "     ./stop.sh && ./start.sh"
+echo ""
+echo "  大版本升级（如 v4.0.0 引入容器沙箱）后建议："
+echo "     ./setup.sh --with-sandbox   # 构建/刷新 baize-sandbox:base 镜像"
 echo ""
 echo "  如需恢复本次更新前的本地改动: git stash pop"
