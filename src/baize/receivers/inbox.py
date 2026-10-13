@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from baize.config import DEFAULT_BAIZE_DIR
+
 logger = None  # lazy import 避免重名冲突
 
 _ACTIVE_STATUSES = ("queued", "processing", "failed")
@@ -55,7 +57,7 @@ CREATE INDEX IF NOT EXISTS idx_inbox_claim
     ON alert_inbox(status, receiver_id, seq);
 """
 
-_DEFAULT_DB_PATH = Path.home() / ".baize" / "orchestration" / "alerts.db"
+_DEFAULT_DB_PATH = DEFAULT_BAIZE_DIR / "orchestration" / "alerts.db"
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_LEASE_SECONDS = 900.0
 

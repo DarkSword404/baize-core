@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# 白泽·智脑 (Baize) — v4.0.0 环境安装脚本
+# 白泽·智脑 (Baize) — v5.0.0 环境安装脚本
 #
 # 安装内容：
 #   1. 创建 .venv 虚拟环境并 pip install baize-core
@@ -43,7 +43,7 @@ log "创建虚拟环境..."
 "$PYTHON" -m venv "$VENV_DIR"
 "$PYTHON_BIN" -m pip install --upgrade pip >/dev/null 2>&1 || true
 
-log "安装 baize-core（核心模块，v4.0.0）..."
+log "安装 baize-core（核心模块，v5.0.0）..."
 "$PYTHON_BIN" -m pip install -e "$CORE_DIR" 2>&1 | tail -3
 
 if [[ -d "$ORCH_DIR" ]]; then
@@ -96,7 +96,7 @@ fi
 
 echo ""
 echo -e "${C_CYAN}═══════════════════════════════════════════════════════${C_RESET}"
-echo -e "${C_CYAN}  白泽·智脑 (Baize) v4.0.0 环境就绪${C_RESET}"
+echo -e "${C_CYAN}  白泽·智脑 (Baize) v5.0.0 环境就绪${C_RESET}"
 echo -e "${C_CYAN}  启动服务: ./start.sh${C_RESET}"
 echo -e "${C_CYAN}  停止服务: ./stop.sh${C_RESET}"
 echo -e "${C_CYAN}═══════════════════════════════════════════════════════${C_RESET}"

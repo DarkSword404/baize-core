@@ -70,11 +70,17 @@ class SingleModelConfig:
 
     ``enable_context_summary``: 超预算时是否用 LLM 把最旧的一批轮次
     压缩为语义摘要（比机械截断更保信息，但会多消耗一次模型调用）。
+
+    ``embedding_model``: 长期记忆语义检索用的向量模型，与聊天模型 ``model``
+    是两回事（聊天模型做不了 embedding）。留空则回退到
+    ``baize.memory.embed.DEFAULT_EMBEDDING_MODEL``；环境变量
+    BAIZE_EMBEDDING_MODEL 优先级高于此配置，便于运维临时覆盖。
     """
 
     base_url: str = ""
     api_key: str = ""
     model: str = ""
+    embedding_model: str = ""
     context_max_turns: int = 0
     context_window: int | None = None
     max_context_tokens: int | None = None
@@ -101,6 +107,7 @@ class ModelConfigStore:
                 base_url=_normalize_base_url(str(data.get("base_url", ""))),
                 api_key=str(data.get("api_key", "")),
                 model=str(data.get("model", "")),
+                embedding_model=str(data.get("embedding_model", "") or ""),
                 context_max_turns=int(data.get("context_max_turns", 0) or 0),
                 context_window=_opt_int(data.get("context_window")),
                 max_context_tokens=_opt_int(data.get("max_context_tokens")),

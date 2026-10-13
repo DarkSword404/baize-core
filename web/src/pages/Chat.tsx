@@ -12,6 +12,16 @@ import type { JSX } from 'react';
 
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
 
+/**
+ * 流式期间单条 reasoning 中间产物在内存中保留的字符上限。
+ * 根因：CTF/渗透长任务中模型思考经 SSE 无上限累积（实测 400KB+），
+ * 配合每次增量全量重渲染形成 O(n²) 开销，最终导致页面崩溃。
+ * 60000 字符约 1.5 万~3 万 token，足够回看当前推理上下文；
+ * 渲染窗口（12000）由 ChatMessage 组件再裁一层。
+ * 完整思考过程由后端持久化，任务结束后可在历史中回看。
+ */
+const MAX_STREAM_REASONING_CHARS = 60000;
+
 /** 从各种 content 格式中提取纯文本（兼容 OpenAI Responses API content blocks） */
 function extractContentText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -469,8 +479,15 @@ export function Chat(): JSX.Element {
             const steps = m.intermediates || [];
             const existing = steps.findIndex(s => s.itemType === 'reasoning');
             if (existing >= 0) {
+              // 尾部窗口截断：长任务（十余分钟）reasoning 实测可达 400KB+，
+              // 无上限累积会让每次增量触发的重渲染成本 O(n²) 增长，最终撑崩页面。
+              // 保留最近 MAX_STREAM_REASONING_CHARS 字符（完整内容后端已持久化）。
               const updated = [...steps];
-              updated[existing] = { ...updated[existing], detail: updated[existing].detail + step.text! };
+              let merged = updated[existing].detail + step.text!;
+              if (merged.length > MAX_STREAM_REASONING_CHARS) {
+                merged = merged.slice(-MAX_STREAM_REASONING_CHARS);
+              }
+              updated[existing] = { ...updated[existing], detail: merged };
               return { ...m, intermediates: updated };
             }
             return {

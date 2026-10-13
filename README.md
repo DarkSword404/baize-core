@@ -8,11 +8,11 @@
 
 > 证据黑板编排 · 树状任务调度 · 会话级容器沙箱 · 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
 
-[![Version](https://img.shields.io/badge/version-v4.0.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-dev/releases/tag/v4.0.0)
+[![Version](https://img.shields.io/badge/version-v5.0.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core/releases/tag/v5.0.0)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
-**白泽·智脑** 是一个基于大型语言模型的本地化 AI 安全助手，面向 **Web 渗透、移动安全、无线/射频、红蓝对抗、应急响应与合规审计** 等场景，提供 30+ 个开箱即用的专用智能体。v4.0.0 引入 **证据黑板（Blackboard）+ 树状任务调度 + CVSS 式威胁评分 + 会话级容器沙箱 + 报告系统**，让自动化渗透过程可解释、可收敛、边界可控。
+**白泽·智脑** 是一个基于大型语言模型的本地化 AI 安全助手，面向 **Web 渗透、移动安全、无线/射频、红蓝对抗、应急响应与合规审计** 等场景，提供 30+ 个开箱即用的专用智能体。v4.0.0 引入 **证据黑板（Blackboard）+ 树状任务调度 + CVSS 式威胁评分 + 会话级容器沙箱 + 报告系统**，让自动化渗透过程可解释、可收敛、边界可控；v5.0.0 在此基础上引入 **语义记忆检索（向量召回 + 重排）+ 自治式编排（工具与并行度交由 AI 决策）+ 失败经验沉淀与跨波学习 + 共享浏览器流式稳定性修复**，进一步提升解题效率并显著降低 token 消耗。
 
 </div>
 
@@ -70,8 +70,8 @@
 ### 安装
 
 ```bash
-git clone https://github.com/DarkSword404/baize-dev.git
-cd baize-dev
+git clone https://github.com/DarkSword404/baize-core.git
+cd baize-core
 
 ./setup.sh                 # 创建 .venv + 安装后端 + 安装前端依赖
 ./setup.sh --with-tools    # 推荐：一并预装 nmap/sqlmap/nuclei 等系统工具
@@ -412,7 +412,30 @@ PID 文件中的进程命令行不含本项目标识（可能是 PID 复用的�
 
 ## 📝 更新日志
 
-### v4.0.0（当前）
+### v5.0.0（当前）
+
+- 🧠 **语义记忆检索**：新增 `memory/embed`、`memory/rerank`、`memory/taxonomy` 模块，
+  在关键词检索之外引入向量召回 + 交叉重排 + 自动分类，跨会话经验召回更准
+- 🎛️ **自治式编排**：Reason 产出的 intent 可携带 `tools` / `max_steps` / `confidence` /
+  `ctx_budget`，**并行度、工具清单、步数、上下文预算由 AI 自主决策**（硬上限仅作安全护栏，
+  不再强制"所有工具全绑、所有流程全跑"），兼顾通用性与成本
+- 🔁 **失败经验沉淀与跨波学习**：新增 `_extract_failure_lesson`，波末无产出 / 被证伪 /
+  异常三类失败统一沉淀为 `fail_kind`；Reason 下一波提示注入"历史失败方向"，
+  避免反复重提同一条死路
+- 🧭 **goal 防回退**：自动续行不再改写任务目标，改为记录当前子任务并把已完成子任务
+  归档，修复"子任务反客为主、已完成工作被反复重做"的问题
+- 💰 **token 成本优化**：上下文预算显式化（`context_window` / `max_context_tokens`）
+  并按波确定性裁剪；实测简单任务 LLM 调用从 24+ 次降至 8 次、耗时从 15+ 分钟降至 31 秒
+- ⏱️ **调度可靠性**：Reason 调度与报告章节改用长读超时、提升 `max_tokens`，
+  修复思考型模型推理预算被占满导致"重试 3 次仍无有效 JSON"的调度停摆
+- 🌐 **共享浏览器稳定性**：修复 screencast 事件 handler 泄漏、增加帧背压防 asyncio 任务堆积、
+  补导航日志、前端 WebSocket 重连指数退避
+- 🖥️ **前端大记录性能**：思考内容尾部窗口渲染 + 流式累积上限 + memo/useMemo 缓存，
+  修复长任务下浏览器主线程崩溃（"页面发生错误"）
+- 🔧 **运维修复**：修复沙箱环境下归档 / 删除会话接口的 PermissionError
+- 🚀 **升级**：版本号统一为 5.0.0（pyproject.toml / package.json / package-lock.json / __init__.py / cli.py / 文档）
+
+### v4.0.0（历史）
 
 - 📋 **产出-状态联动（P0 止血）**：修复 `add_fact` 只建派生边不回写 properties 导致编排器
   把有产出的意图全部误标 failed；产出查询双证据源兼容历史数据
@@ -472,8 +495,8 @@ v1.2 会话管理 · v1.1 工具调用+多模型热切换 · v1.0 多智能体�
 
 <div align="center">
 
-**白泽·智脑 (Baize) v4.0.0** · 仅供安全研究与授权测试使用
+**白泽·智脑 (Baize) v5.0.0** · 仅供安全研究与授权测试使用
 
-[![Version](https://img.shields.io/badge/version-v4.0.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-dev)
+[![Version](https://img.shields.io/badge/version-v5.0.0-4C9F38?style=flat-square)](https://github.com/DarkSword404/baize-core)
 
 </div>

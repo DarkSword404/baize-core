@@ -21,6 +21,11 @@ logger = logging.getLogger("baize.compressor")
 # ---- 压缩 prompt ----------------------------------------------------------
 # 目标：把大体积工具输出压缩为 < 1/5 长度的结构化摘要，保留渗透关键信息。
 
+# 单次压缩请求可携带的原文字符上限，超过则先折衷截断（保留头尾再交给 LLM）。
+# 没有它时，nmap 全端口扫描这类 500KB 输出会被整段塞进压缩请求，必然触发
+# provider 413 / input token 超限；compress() 捕获异常后回退原文，反而放大上下文。
+_MAX_COMPRESS_INPUT_CHARS = 24000
+
 _COMPRESS_SYSTEM = (
     "你是一个安全工具输出压缩器。把大体积输出压缩为简短的结构化摘要，"
     "保留所有安全关键信息，丢弃冗余的格式化、重复内容和无关输出。"
@@ -160,10 +165,22 @@ class ToolOutputCompressor:
             # 复用主模型配置
             client = LLMClient()
 
+        # 大输出保护：把整段原文塞进压缩请求本身会制造一个必然失败的超大请求
+        # （provider 413 / input token 超限）；compress() 捕获异常后回退原文，
+        # 上下文反而被放大。这里先按字符上限折衷截断（保留头尾），再交给 LLM。
+        output_for_prompt = output
+        if len(output_for_prompt) > _MAX_COMPRESS_INPUT_CHARS:
+            half = _MAX_COMPRESS_INPUT_CHARS // 2
+            omitted = len(output_for_prompt) - _MAX_COMPRESS_INPUT_CHARS
+            output_for_prompt = (
+                f"{output_for_prompt[:half]}\n\n"
+                f"...[中间约 {omitted} 字符已省略]...\n\n"
+                f"{output_for_prompt[-half:]}"
+            )
         prompt = _COMPRESS_TEMPLATE.format(
             tool_name=tool_name,
             original_len=len(output),
-            output=output,
+            output=output_for_prompt,
         )
 
         messages = [

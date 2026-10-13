@@ -13,7 +13,8 @@ interface Props {
   onClose: () => void;
 }
 
-// ── 节点视觉规格 ──
+// ── 节点视觉规格（对齐 ARTEX 探索链路图）──
+// goal 绿 / intent 蓝 / fact 琥珀 / finding 红 / hint 紫 / origin 灰 / digest 灰
 interface Vis {
   color: string;
   fill: string;
@@ -23,42 +24,62 @@ interface Vis {
 }
 
 const KIND_VIS: Record<string, Vis> = {
-  origin:     { color: '#e5e7eb', fill: '#374151',  stroke: '#6b7280', icon: '⊙', label: '起点' },
-  goal:       { color: '#e9d5ff', fill: '#4c1d95',  stroke: '#a855f7', icon: '◎', label: '目标' },
-  intent:     { color: '#a5f3fc', fill: '#164e63',  stroke: '#0891b2', icon: '◇', label: '探索' },
-  fact:       { color: '#dbeafe', fill: '#1e40af',  stroke: '#3b82f6', icon: '✓', label: '结论' },
-  hint:       { color: '#fde68a', fill: '#78350f',  stroke: '#d97706', icon: '!', label: '提示' },
+  goal:    { color: '#d1fae5', fill: '#064e3b', stroke: '#10b981', icon: '🎯', label: '目标' },
+  intent:  { color: '#dbeafe', fill: '#1e3a8a', stroke: '#3b82f6', icon: '🧭', label: '探索' },
+  fact:    { color: '#fef3c7', fill: '#78350f', stroke: '#f59e0b', icon: '🧪', label: '事实' },
+  finding: { color: '#ffe4e6', fill: '#881337', stroke: '#f43f5e', icon: '🐛', label: '漏洞' },
+  hint:    { color: '#ede9fe', fill: '#4c1d95', stroke: '#8b5cf6', icon: '💡', label: '提示' },
+  digest:  { color: '#e5e7eb', fill: '#374151', stroke: '#64748b', icon: '🗜', label: '摘要' },
 };
 
+// 起点节点（fact + properties.state === 'origin'）
+const ORIGIN_VIS: Vis = { color: '#e5e7eb', fill: '#334155', stroke: '#64748b', icon: '🚩', label: '起点' };
+
 // Fact role 子类型视觉覆盖
-const FACT_ROLE_VIS: Record<string, { icon: string; stroke: string; label: string }> = {
-  handoff:   { icon: '📋', stroke: '#d97706', label: '交接' },
-  target:    { icon: '⌖', stroke: '#f97316', label: '端点' },
-  evidence:  { icon: '≡', stroke: '#60a5fa', label: '证据' },
+const FACT_ROLE_VIS: Record<string, { icon: string; label: string }> = {
+  handoff:   { icon: '📋', label: '交接' },
+  target:    { icon: '⌖', label: '端点' },
+  evidence:  { icon: '≡', label: '证据' },
+};
+
+// ── Finding 按 severity 分级着色（critical 最深红 → info 浅粉）──
+const FINDING_SEVERITY_VIS: Record<string, { fill: string; stroke: string; label: string }> = {
+  critical: { fill: '#7f1d1d', stroke: '#ef4444', label: '严重' },
+  high:     { fill: '#881337', stroke: '#f43f5e', label: '高危' },
+  medium:   { fill: '#9f1239', stroke: '#fb7185', label: '中危' },
+  low:      { fill: '#4c0519', stroke: '#fda4af', label: '低危' },
+  info:     { fill: '#374151', stroke: '#9ca3af', label: '信息' },
 };
 
 // ── Fact 按威胁分着色（与后端 scoring.py 的 severity 对齐）──
-// 高分（已确认 RCE/凭据）→ 红系；中分（普通发现）→ 蓝系
+// 高分（已确认 RCE/凭据）→ 红系；中分（普通发现）→ 琥珀基色加深
 // 低分（侦察指纹）→ 青系；排除性结论 → 灰系
 const SEVERITY_VIS: Record<string, { fill: string; stroke: string; label: string }> = {
   critical: { fill: '#7f1d1d', stroke: '#ef4444', label: '高危' },
-  normal:   { fill: '#1e3a8a', stroke: '#3b82f6', label: '发现' },
+  normal:   { fill: '#78350f', stroke: '#f59e0b', label: '发现' },
   info:     { fill: '#164e63', stroke: '#0891b2', label: '侦察' },
   excluded: { fill: '#374151', stroke: '#6b7280', label: '排除' },
 };
 
 // ── Intent 按 phase 着色（与后端 _VALID_PHASES 对齐）──
-const PHASE_VIS: Record<string, { fill: string; stroke: string; icon: string; label: string }> = {
-  recon:    { fill: '#155e75', stroke: '#06b6d4', icon: '🔍', label: '侦察' },
-  vuln:     { fill: '#92400e', stroke: '#f59e0b', icon: '⚠', label: '漏洞' },
-  exploit:  { fill: '#7f1d1d', stroke: '#ef4444', icon: '⚔', label: '利用' },
-  post:     { fill: '#581c87', stroke: '#a855f7', icon: '⬆', label: '后利用' },
-  general:  { fill: '#164e63', stroke: '#0891b2', icon: '◇', label: '通用' },
+const PHASE_VIS: Record<string, { stroke: string; icon: string; label: string }> = {
+  recon:    { stroke: '#06b6d4', icon: '🔍', label: '侦察' },
+  vuln:     { stroke: '#f59e0b', icon: '⚠', label: '漏洞' },
+  exploit:  { stroke: '#ef4444', icon: '⚔', label: '利用' },
+  post:     { stroke: '#a855f7', icon: '⬆', label: '后利用' },
+  general:  { stroke: '#3b82f6', icon: '🧭', label: '通用' },
 };
 
-const EDGE_COLORS: Record<string, string> = {
-  precondition: '#5eead4',
-  derived: '#60a5fa',
+// ── 血缘边配色（对齐 ARTEX）──
+// spawns: goal→intent 绿实线；derived_from: fact→intent 靛蓝虚线
+// yields: intent→fact/finding 琥珀实线；proves: finding→goal 红实线
+// covers: digest→member 灰虚线
+const EDGE_VIS: Record<string, { color: string; dashed: boolean; label: string }> = {
+  spawns:       { color: '#10b981', dashed: false, label: '派生' },
+  derived_from: { color: '#6366f1', dashed: true,  label: '触发' },
+  yields:       { color: '#f59e0b', dashed: false, label: '产出' },
+  proves:       { color: '#ef4444', dashed: false, label: '证明' },
+  covers:       { color: '#64748b', dashed: true,  label: '包含' },
 };
 
 // 截断标签
@@ -81,13 +102,15 @@ function buildElements(snap: BlackboardSnapshot): ElementDefinition[] {
   const visibleNodes = snap.nodes;
   const elements: ElementDefinition[] = [];
 
-  // ── BFS 计算每个节点到 origin 的深度（树状层级）──
-  // origin depth=0；其余节点按派生边算 depth = max(前驱 depth) + 1
-  // goal 强制为 max(fact depth) + 1，确保始终在最底层
-  // 孤立 fact（无入边且 BFS 未到达）按 created_at 时间分层，避免同级
+  // ── BFS 分层：沿血缘边从根节点向外扩张（ARTEX 血缘链布局）──
+  // 根：origin fact（fact + properties.state='origin'）与 goal 都置 depth=0
+  // 其余节点 depth = max(前驱 depth) + 1；proves 边回指 goal 不影响 goal 层级
+  const isOrigin = (n: BBNode) =>
+    n.kind === 'fact' && (n.properties?.state as string | undefined) === 'origin';
+
   const depthMap = new Map<string, number>();
-  const inEdges = new Map<string, string[]>(); // 节点 → 入边 source 列表
-  const outEdges = new Map<string, string[]>(); // 节点 → 出边 target 列表
+  const inEdges = new Map<string, string[]>();
+  const outEdges = new Map<string, string[]>();
   for (const n of visibleNodes) {
     inEdges.set(n.id, []);
     outEdges.set(n.id, []);
@@ -97,18 +120,18 @@ function buildElements(snap: BlackboardSnapshot): ElementDefinition[] {
     inEdges.get(e.target)?.push(e.source);
     outEdges.get(e.source)?.push(e.target);
   }
-  // 1. origin 设 depth 0，作为 BFS 起点
+  // 1. 根节点：origin fact + goal 均 depth=0（goal 是独立起点，spawns 向下游派生意图）
   const roots: string[] = [];
   for (const n of visibleNodes) {
-    if (n.kind === 'origin') {
+    if (isOrigin(n) || n.kind === 'goal') {
       depthMap.set(n.id, 0);
       roots.push(n.id);
     }
   }
-  // 无 origin 时，无入边且非 goal 的节点作根
+  // 无 origin/goal 时，无入边节点作根
   if (roots.length === 0) {
     for (const n of visibleNodes) {
-      if (n.kind !== 'goal' && (inEdges.get(n.id) || []).length === 0) {
+      if ((inEdges.get(n.id) || []).length === 0) {
         depthMap.set(n.id, 0);
         roots.push(n.id);
       }
@@ -128,135 +151,99 @@ function buildElements(snap: BlackboardSnapshot): ElementDefinition[] {
       }
     }
   }
-  // 3. 孤立 fact（无入边且非 origin 且 BFS 未到达）按 created_at 分层
-  //    避免多个无入边 fact 全部 fallback 到 depth=1 同级
+  // 3. 孤立节点（无入边且 BFS 未到达）按 created_at 分层，避免同级堆叠
   const orphans = visibleNodes
-    .filter(n =>
-      n.kind !== 'origin' && n.kind !== 'goal' &&
-      !depthMap.has(n.id) &&
-      (inEdges.get(n.id) || []).length === 0
-    )
+    .filter(n => !depthMap.has(n.id) && (inEdges.get(n.id) || []).length === 0)
     .sort((a, b) => (a.created_at || '').localeCompare(b.created_at || ''));
   let orphanDepth = 1;
   for (const o of orphans) {
     depthMap.set(o.id, orphanDepth);
     orphanDepth++;
   }
-  // 4. 仍有节点无 depth（有入边但 BFS 未到达，如有环）→ 给个兜底 depth
-  let maxFactDepth = 0;
-  for (const n of visibleNodes) {
-    if (n.kind === 'fact' && depthMap.has(n.id)) {
-      const d = depthMap.get(n.id)!;
-      if (d > maxFactDepth) maxFactDepth = d;
-    }
+  // 4. 仍有节点无 depth（有入边但 BFS 未到达，如有环）→ 兜底 depth
+  let maxDepth = 0;
+  for (const d of depthMap.values()) {
+    if (d > maxDepth) maxDepth = d;
   }
   for (const n of visibleNodes) {
-    if (!depthMap.has(n.id) && n.kind !== 'goal') {
-      depthMap.set(n.id, maxFactDepth + 1);
-    }
-  }
-  // 5. goal depth = max(fact depth) + 1（强制在最底层，确保 goal 在所有结论之下）
-  for (const n of visibleNodes) {
-    if (n.kind === 'goal') {
-      depthMap.set(n.id, maxFactDepth + 1);
-    }
-  }
-
-  // depth → 颜色渐变（深 → 浅，Cairn 蓝紫渐变风格）
-  const DEPTH_FILLS = [
-    '#4c1d95', // L0 深紫（origin）
-    '#1e3a8a', // L1 深蓝
-    '#1e40af', // L2 中深蓝
-    '#1d4ed8', // L3 中蓝
-    '#2563eb', // L4 浅蓝
-    '#3b82f6', // L5 更浅
-    '#60a5fa', // L6+
-  ];
-  function depthFill(d: number): string {
-    if (d < 0) return KIND_VIS.fact.fill;
-    return DEPTH_FILLS[Math.min(d, DEPTH_FILLS.length - 1)];
-  }
-  function depthTextColor(d: number): string {
-    // 深底浅字，浅底深字
-    return d <= 4 ? '#e5e7eb' : '#0f172a';
+    if (!depthMap.has(n.id)) depthMap.set(n.id, maxDepth + 1);
   }
 
   // 节点
   for (const n of visibleNodes) {
-    const vis = KIND_VIS[n.kind] || KIND_VIS.fact;
+    const depth = depthMap.get(n.id) ?? 0;
+    const origin = isOrigin(n);
+    const vis = origin ? ORIGIN_VIS : (KIND_VIS[n.kind] || KIND_VIS.fact);
     const role = n.properties?.role as string | undefined;
     const roleVis = role ? FACT_ROLE_VIS[role] : undefined;
     const polarity = n.properties?.polarity as string | undefined;
-    let stroke = roleVis?.stroke || vis.stroke;
-    if (role === 'evidence' && polarity === 'refutes') stroke = '#f87171';
-    else if (role === 'evidence' && polarity === 'supports') stroke = '#4ade80';
-    const icon = roleVis?.icon || vis.icon;
-    const dimmed = n.status === 'superseded' || n.status === 'refuted' || n.status === 'failed';
+    const dimmed = n.status === 'superseded' || n.status === 'refuted' || n.status === 'failed'
+      || n.status === 'dismissed' || n.status === 'abandoned';
 
-    // depth：从 BFS depthMap 读取（origin=0, goal=maxFactDepth+1, 其余按 BFS）
-    const depth = depthMap.get(n.id) ?? 0;
-
-    // ── 背景着色策略 ──
-    // origin/goal：保留 KIND_VIS 原色（首尾节点视觉权重）
-    // fact：按 severity 着色（高分红/中分蓝/低分青/排除灰），覆盖 depth 渐变
-    // intent：按 phase 着色（recon 青/vuln 橙/exploit 红/post 紫）
-    // 其他：按 depth 渐变（保留原 Cairn 蓝紫风格）
-    let bg: string;
-    let textColor: string;
+    // ── 着色策略（按节点类型分色，血缘链可读性优先）──
+    let bg = vis.fill;
+    let stroke = vis.stroke;
+    const textColor = vis.color;
+    let icon = roleVis?.icon || vis.icon;
     let phaseTag = '';
     let scoreTag = '';
+    let sevTag = '';
 
-    if (n.kind === 'origin' || n.kind === 'goal') {
-      bg = vis.fill;
-      textColor = vis.color;
+    if (origin) {
+      icon = ORIGIN_VIS.icon;
     } else if (n.kind === 'fact') {
+      // fact：severity 覆盖基色（高分红/中分琥珀/低分青/排除灰）
       const severity = (n.properties?.severity as string) || '';
       const score = n.properties?.score as number | undefined;
       const sevVis = severity ? SEVERITY_VIS[severity] : undefined;
-      bg = sevVis?.fill || depthFill(depth);
-      textColor = sevVis ? '#e5e7eb' : depthTextColor(depth);
+      if (sevVis) { bg = sevVis.fill; stroke = sevVis.stroke; }
+      if (role === 'evidence' && polarity === 'refutes') stroke = '#f87171';
+      else if (role === 'evidence' && polarity === 'supports') stroke = '#4ade80';
       if (score !== undefined) scoreTag = `[${score}] `;
+    } else if (n.kind === 'finding') {
+      // finding：severity 五级红色系分级
+      const severity = ((n.properties?.severity as string) || 'medium').toLowerCase();
+      const fVis = FINDING_SEVERITY_VIS[severity] || FINDING_SEVERITY_VIS.medium;
+      bg = fVis.fill;
+      stroke = fVis.stroke;
+      sevTag = `${fVis.label} `;
     } else if (n.kind === 'intent') {
+      // intent：蓝色基色 + phase 描边/图标
       const phase = (n.properties?.phase as string) || '';
       const phVis = phase ? PHASE_VIS[phase] : undefined;
-      bg = phVis?.fill || depthFill(depth);
-      textColor = phVis ? '#e5e7eb' : depthTextColor(depth);
-      if (phase && PHASE_VIS[phase]) phaseTag = `${PHASE_VIS[phase].icon} `;
-    } else {
-      bg = depthFill(depth);
-      textColor = depthTextColor(depth);
+      if (phVis) { stroke = phVis.stroke; phaseTag = `${phVis.icon} `; }
     }
 
     const labelPrefix = phaseTag || (icon ? `${icon} ` : '');
-    const depthTag = depth >= 0 ? `L${depth} · ` : '';
+    const depthTag = `L${depth} · `;
 
     elements.push({
       group: 'nodes',
       data: {
         id: n.id,
-        label: labelPrefix + scoreTag + depthTag + truncateLabel(n.label, 22),
+        label: labelPrefix + sevTag + scoreTag + depthTag + truncateLabel(n.label, 22),
         fullLabel: n.label,
-        kind: n.kind,
+        kind: origin ? 'origin' : n.kind,
         role: role || '',
         status: n.status || '',
         color: textColor,
         background: bg,
         borderColor: stroke,
         dimmed: dimmed ? 0.35 : 1,
-        active: n.status === 'active',
+        active: n.status === 'active' || n.status === 'claimed' || n.status === 'exploring',
         depth,
       },
     });
   }
 
-  // 边
+  // 边（血缘关系配色 + 线型）
   for (const e of snap.edges) {
     const src = e.source;
     const tgt = e.target;
     if (!src || !tgt || src === tgt) continue;
     if (!visibleNodes.find(n => n.id === src) || !visibleNodes.find(n => n.id === tgt)) continue;
 
-    const color = EDGE_COLORS[e.relation] || '#64748b';
+    const ev = EDGE_VIS[e.relation];
 
     elements.push({
       group: 'edges',
@@ -265,9 +252,11 @@ function buildElements(snap: BlackboardSnapshot): ElementDefinition[] {
         source: src,
         target: tgt,
         relation: e.relation,
-        color,
-        lineStyle: 'solid',
-        opacity: 0.7,
+        color: ev?.color || '#64748b',
+        lineStyle: ev?.dashed ? 'dashed' : 'solid',
+        // proves（finding→goal 关键证明链）加粗高亮
+        width: e.relation === 'proves' ? 3.5 : 2.0,
+        opacity: e.relation === 'proves' ? 0.95 : 0.7,
       },
     });
   }
@@ -275,26 +264,24 @@ function buildElements(snap: BlackboardSnapshot): ElementDefinition[] {
   return elements;
 }
 
-// ELK 布局配置：垂直分层树（Cairn 风格，从上到下生长）
+// ELK 布局配置：水平分层血缘链（ARTEX 风格，从左到右生长）
 function elkLayout(): any {
   return {
     name: 'elk',
     elk: {
       algorithm: 'layered',
-      'elk.direction': 'DOWN',
-      // 层间距加大：让树状层级感清晰可见
-      'elk.layered.spacing.nodeNodeBetweenLayers': 110,
-      'elk.spacing.nodeNode': 55,
-      'elk.layered.spacing.edgeNodeBetweenLayers': 40,
+      'elk.direction': 'RIGHT',
+      // 层间距加大：让血缘层级清晰可见
+      'elk.layered.spacing.nodeNodeBetweenLayers': 90,
+      'elk.spacing.nodeNode': 40,
+      'elk.layered.spacing.edgeNodeBetweenLayers': 35,
       // 网络单纯形法放置节点，减少边交叉
       'elk.layered.nodePlacement.strategy': 'NETWORK_SIMPLEX',
       'elk.layered.nodePlacement.freeNodeModel.strategy': 'NETWORK_SIMPLEX',
       // 交叉最小化：层扫 + 中点偏移
       'elk.layered.crossingMinimization.strategy': 'LAYER_SWEEP',
       'elk.layered.crossingMinimization.semiInteractive': 'true',
-      // 同层节点按 BFS 深度排序，让派生链（A→B→C）尽量在同侧
       'elk.layered.layering.layerConstraint': 'NONE',
-      // 节点间不要重叠，离散分层
       'elk.layered.nodePlacement.freeNodeModel.overhang': '0',
       'elk.hierarchyHandling': 'INCLUDE_CHILDREN',
       'elk.padding': '[top=30,left=30,bottom=30,right=30]',
@@ -302,7 +289,7 @@ function elkLayout(): any {
       'elk.layered.edgeRouting.shape': 'ORTHOGONAL',
       'elk.layered.edgeRouting.style': 'ORTHOGONAL',
       'elk.layered.edgeRouting.selfSpacing': '6',
-      'elk.layered.edgeSpacing': '40',
+      'elk.layered.edgeSpacing': '35',
     },
     fit: false,
     padding: 30,
@@ -310,7 +297,7 @@ function elkLayout(): any {
   };
 }
 
-// Cytoscape 样式：垂直分层树（Cairn 风格）
+// Cytoscape 样式：水平分层血缘链（ARTEX 风格）
 function graphStyles(): StylesheetJson {
   return [
     {
@@ -334,7 +321,7 @@ function graphStyles(): StylesheetJson {
         'overlay-opacity': 0,
       },
     },
-    // origin/goal：首尾节点尺寸加大，视觉权重更高
+    // origin/goal：血缘链起点，尺寸加大，视觉权重更高
     {
       selector: 'node[kind = "origin"], node[kind = "goal"]',
       style: {
@@ -345,10 +332,13 @@ function graphStyles(): StylesheetJson {
         'font-weight': 700,
       },
     },
-    // 同层节点（depth 相同）：浅色边框做"层带"视觉提示
+    // finding：确认漏洞，加粗红色边框突出
     {
-      selector: 'node[depth <= 1]',
-      style: { 'border-width': 3 },
+      selector: 'node[kind = "finding"]',
+      style: {
+        'border-width': 3,
+        'font-weight': 700,
+      },
     },
     {
       selector: 'node[?active]',
@@ -370,11 +360,11 @@ function graphStyles(): StylesheetJson {
       selector: '.is-dimmed-node',
       style: { opacity: 0.3 },
     },
-    // 边：bezier 曲线（避免 taxi 乱穿）+ 加粗箭头 + 圆角端点
+    // 边：bezier 曲线 + 血缘关系配色/线型
     {
       selector: 'edge',
       style: {
-        width: 2.0,
+        width: 'data(width)' as any,
         'line-color': 'data(color)',
         'target-arrow-color': 'data(color)',
         'source-arrow-color': 'data(color)',
@@ -391,15 +381,9 @@ function graphStyles(): StylesheetJson {
         'overlay-opacity': 0,
       },
     },
-    // precondition 边虚线：区分"前置条件"和"派生"两种语义
-    {
-      selector: 'edge[relation = "precondition"]',
-      style: { 'line-style': 'dashed' as any },
-    },
     {
       selector: 'edge.is-active-edge',
       style: {
-        width: 3.0,
         label: 'data(relation)',
         'font-size': 9,
         'font-weight': 600,
@@ -651,9 +635,9 @@ export function AttackMap({ sessionId, open, onClose }: Props): JSX.Element | nu
         {/* 顶部 */}
         <div className="flex items-center justify-between px-4 py-3 border-b border-gray-700/50 bg-gray-800/30">
           <div>
-            <h3 className="text-sm font-bold text-gray-100">证据攻击地图</h3>
+            <h3 className="text-sm font-bold text-gray-100">探索链路图</h3>
             <p className="text-[10px] text-gray-500 mt-0.5">
-              垂直分层树 · origin(顶)→goal(底) · 每层向下派生 ·{' '}
+              水平血缘链 · goal/origin(左)→探索链(右) · finding 回证 goal ·{' '}
               {snapshot ? `v${snapshot.version}` : '加载中'}
             </p>
           </div>
@@ -729,11 +713,12 @@ export function AttackMap({ sessionId, open, onClose }: Props): JSX.Element | nu
         {/* 统计条 */}
         {stats && (
           <div className="flex flex-wrap gap-1.5 px-4 py-2 border-b border-gray-700/40 text-[10px] font-medium">
-            <span className="px-2 py-0.5 rounded-full bg-blue-600/15 text-blue-200 border border-blue-600/20">✓{stats.facts}</span>
-            <span className="px-2 py-0.5 rounded-full bg-cyan-600/15 text-cyan-300 border border-cyan-600/20">◇{stats.intents_pending}</span>
+            <span className="px-2 py-0.5 rounded-full bg-amber-600/15 text-amber-200 border border-amber-600/20">🧪{stats.facts}</span>
+            <span className="px-2 py-0.5 rounded-full bg-rose-600/15 text-rose-300 border border-rose-600/20">🐛{stats.findings ?? 0}</span>
+            <span className="px-2 py-0.5 rounded-full bg-blue-600/15 text-blue-300 border border-blue-600/20">🧭{stats.intents_pending}</span>
             <span className="px-2 py-0.5 rounded-full bg-green-600/15 text-green-300 border border-green-600/20">✅{stats.intents_done}</span>
             <span className="px-2 py-0.5 rounded-full bg-red-600/15 text-red-300 border border-red-600/20">❌{stats.intents_failed ?? 0}</span>
-            <span className="px-2 py-0.5 rounded-full bg-amber-600/15 text-amber-300 border border-amber-600/20">!{stats.hints}</span>
+            <span className="px-2 py-0.5 rounded-full bg-violet-600/15 text-violet-300 border border-violet-600/20">💡{stats.hints}</span>
           </div>
         )}
 
@@ -771,14 +756,31 @@ export function AttackMap({ sessionId, open, onClose }: Props): JSX.Element | nu
           </div>
         )}
 
-        {/* 图例：节点类型 + phase + severity + 深度色带 */}
+        {/* 图例：节点类型 + finding 严重度 + intent 阶段 + 血缘边 */}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-1.5 border-b border-gray-700/40 text-[9px] text-gray-500">
+          <span className="flex items-center gap-1" title="起点">
+            <span style={{ color: ORIGIN_VIS.stroke, fontWeight: 700 }}>{ORIGIN_VIS.icon}</span>
+            {ORIGIN_VIS.label}
+          </span>
           {Object.entries(KIND_VIS).map(([k, v]) => (
             <span key={k} className="flex items-center gap-1">
               <span style={{ color: v.stroke, fontWeight: 700 }}>{v.icon}</span>
               {v.label}
             </span>
           ))}
+          <span className="text-gray-700 mx-1">|</span>
+          <span className="flex items-center gap-1 font-medium text-gray-400">
+            漏洞
+            {Object.entries(FINDING_SEVERITY_VIS).map(([k, v]) => (
+              <span key={k} className="flex items-center gap-0.5" title={k}>
+                <span style={{
+                  display: 'inline-block', width: 9, height: 9,
+                  background: v.fill, border: `1px solid ${v.stroke}`, borderRadius: 2,
+                }} />
+                {v.label}
+              </span>
+            ))}
+          </span>
           <span className="text-gray-700 mx-1">|</span>
           <span className="flex items-center gap-1 font-medium text-gray-400">
             阶段
@@ -790,31 +792,21 @@ export function AttackMap({ sessionId, open, onClose }: Props): JSX.Element | nu
             ))}
           </span>
           <span className="text-gray-700 mx-1">|</span>
-          <span className="flex items-center gap-1 font-medium text-gray-400">
-            威胁
-            {Object.entries(SEVERITY_VIS).map(([k, v]) => (
-              <span key={k} className="flex items-center gap-0.5" title={k}>
-                <span style={{
-                  display: 'inline-block', width: 9, height: 9,
-                  background: v.fill, border: `1px solid ${v.stroke}`, borderRadius: 2,
-                }} />
-                {v.label}
-              </span>
-            ))}
-          </span>
-          <span className="text-gray-700 mx-1">|</span>
-          <span className="flex items-center gap-1">
-            <span style={{ borderTop: '2px solid #60a5fa', width: 14, display: 'inline-block' }} /> 派生
-          </span>
-          <span className="flex items-center gap-1">
-            <span style={{ borderTop: '2px dashed #5eead4', width: 14, display: 'inline-block' }} /> 前置
-          </span>
+          {Object.entries(EDGE_VIS).map(([k, v]) => (
+            <span key={k} className="flex items-center gap-1" title={k}>
+              <span style={{
+                borderTop: `2px ${v.dashed ? 'dashed' : 'solid'} ${v.color}`,
+                width: 14, display: 'inline-block',
+              }} />
+              {v.label}
+            </span>
+          ))}
         </div>
 
         {/* 图 */}
         <div className="flex-1 overflow-hidden bg-gray-950/60 relative">
           {loading ? (
-            <div className="text-center text-gray-600 py-8 text-xs">加载攻击地图中...</div>
+            <div className="text-center text-gray-600 py-8 text-xs">加载探索链路图中...</div>
           ) : error ? (
             <div className="text-center py-8">
               <p className="text-xs text-gray-500 mb-2">该会话无黑板</p>
@@ -921,7 +913,14 @@ function HandoffCard({ node, selected, onClick }: {
 }
 
 function NodeDetail({ node, onClose }: { node: BBNode; onClose: () => void }): JSX.Element {
-  const vis = KIND_VIS[node.kind] || KIND_VIS.fact;
+  const isOrigin = node.kind === 'fact' && (node.properties?.state as string | undefined) === 'origin';
+  const vis = isOrigin ? ORIGIN_VIS : (KIND_VIS[node.kind] || KIND_VIS.fact);
+  const isFinding = node.kind === 'finding';
+  const findingSev = isFinding
+    ? FINDING_SEVERITY_VIS[((node.properties?.severity as string) || 'medium').toLowerCase()]
+    : undefined;
+  const vulnClass = node.properties?.vuln_class as string | undefined;
+  const evidence = node.properties?.evidence as string | undefined;
   const card = node.kind === 'fact' && node.properties?.role === 'handoff' ? (node.properties?.card || {}) as Record<string, any> : null;
   return (
     <div className="border-t border-gray-700/50 bg-gray-900/95 max-h-[42%] overflow-y-auto px-4 py-3 backdrop-blur-sm">
@@ -930,6 +929,19 @@ function NodeDetail({ node, onClose }: { node: BBNode; onClose: () => void }): J
           <span className="text-xs font-semibold" style={{ color: vis.stroke }}>
             {vis.icon} {vis.label}
           </span>
+          {findingSev && (
+            <span
+              className="text-[9px] px-1.5 py-0.5 rounded font-bold"
+              style={{ background: findingSev.fill, color: '#fff', border: `1px solid ${findingSev.stroke}` }}
+            >
+              {findingSev.label}
+            </span>
+          )}
+          {vulnClass && (
+            <span className="text-[9px] px-1.5 py-0.5 rounded bg-rose-900/40 text-rose-300 border border-rose-700/40">
+              {vulnClass}
+            </span>
+          )}
           {node.status && (
             <span className="text-[9px] px-1.5 py-0.5 rounded bg-gray-800 text-gray-400">
               {node.status}
@@ -943,6 +955,14 @@ function NodeDetail({ node, onClose }: { node: BBNode; onClose: () => void }): J
         <pre className="text-[10px] text-gray-400 whitespace-pre-wrap break-all font-sans">
           {node.detail}
         </pre>
+      )}
+      {evidence && (
+        <div className="mt-1.5">
+          <div className="text-[10px] text-rose-300/90 font-semibold mb-0.5">证据：</div>
+          <pre className="text-[9px] text-gray-400 whitespace-pre-wrap break-all font-mono bg-gray-950/60 border border-rose-900/30 rounded p-1.5 max-h-32 overflow-y-auto">
+            {evidence}
+          </pre>
+        </div>
       )}
       {card && (
         <div className="mt-1.5 text-[10px] text-gray-400">

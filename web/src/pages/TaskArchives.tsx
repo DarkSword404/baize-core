@@ -198,10 +198,10 @@ export function TaskArchives(): JSX.Element {
               {selected.goal && <InfoRow label="任务目标" value={selected.goal} />}
             </div>
             <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">
-              对话历史 ({selected.history.length} 条)
+              对话历史 ({(selected.history || []).length} 条)
             </h3>
             <div className="space-y-2">
-              {selected.history.map((h: any, i: number) => (
+              {(selected.history || []).map((h: any, i: number) => (
                 <div key={i} className="bg-gray-800/40 rounded-lg p-3 text-xs">
                   <div className="flex items-center gap-2 mb-1">
                     <span className={`px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase ${

@@ -1,6 +1,16 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo, memo } from 'react';
 import type { ChatMessage as ChatMessageType, IntermediateData } from '../types';
 import type { JSX } from 'react';
+
+/**
+ * 单条思考详情参与 HTML 渲染的字符上限。
+ * 根因：CTF/渗透长任务（十余分钟）中 reasoning 经 SSE 持续 append，
+ * 单块 detail 实测可达 400KB+；展开状态下每次增量都触发全量正则扫描
+ * 与 DOM 全量替换，O(n²) 复杂度最终撑崩页面。
+ * 只渲染尾部窗口（最新推理最有价值），头部完整内容已由后端持久化，
+ * 用户可在任务结束后的历史记录中回看。
+ */
+const MAX_DETAIL_RENDER_CHARS = 12000;
 
 function formatTime(ts: string): string {
   try {
@@ -50,8 +60,8 @@ function sanitizeHtml(html: string): string {
     .replace(/(href|src)\s*=\s*("|')\s*(javascript|vbscript):[^"']*\2/gi, '$1="#"');
 }
 
-export function ChatMessage({ msg }: { msg: ChatMessageType }): JSX.Element {
-  const hasIntermediates = msg.intermediates && msg.intermediates.length > 0;
+export const ChatMessage = memo(function ChatMessage({ msg }: { msg: ChatMessageType }): JSX.Element {
+  const hasIntermediates = Array.isArray(msg.intermediates) && msg.intermediates.length > 0;
   const isUser = msg.role === 'user';
 
   // ── 思考过程：多个中间产物折叠块（在消息体上方） ──
@@ -70,6 +80,12 @@ export function ChatMessage({ msg }: { msg: ChatMessageType }): JSX.Element {
 
   // ── 正常对话消息 ──
   const config = roleConfig[msg.role] || roleConfig.system;
+  // 正文 Markdown 转换缓存：流式 delta 仅改变当前消息，
+  // 其余消息因 React.memo 跳过重渲染（见导出处）
+  const contentHtml = useMemo(
+    () => (msg.content ? renderMarkdown(msg.content) : ''),
+    [msg.content],
+  );
 
   return (
     <div className={`animate-fade-in mb-6 ${isUser ? 'flex justify-end' : ''}`}>
@@ -93,7 +109,7 @@ export function ChatMessage({ msg }: { msg: ChatMessageType }): JSX.Element {
         }`}
       >
         {msg.content ? (
-          <div className="prose-chat break-words space-y-0.5" dangerouslySetInnerHTML={{ __html: renderMarkdown(msg.content) }} />
+          <div className="prose-chat break-words space-y-0.5" dangerouslySetInnerHTML={{ __html: contentHtml }} />
         ) : msg.isStreaming ? (
           <span className="text-gray-500 italic">思考中...</span>
         ) : (
@@ -101,7 +117,7 @@ export function ChatMessage({ msg }: { msg: ChatMessageType }): JSX.Element {
         )}
 
         {/* 多模态附件展示 */}
-        {msg.attachments && msg.attachments.length > 0 && (
+        {Array.isArray(msg.attachments) && msg.attachments.length > 0 && (
           <div className={`mt-2 flex flex-wrap gap-1.5 ${isUser ? 'justify-end' : ''}`}>
             {msg.attachments.map((fn, i) => (
               <span
@@ -131,7 +147,7 @@ export function ChatMessage({ msg }: { msg: ChatMessageType }): JSX.Element {
       )}
     </div>
   );
-}
+});
 
 /** 根据文件名返回附件类型图标 */
 function attachmentIcon(filename: string): string {
@@ -153,6 +169,19 @@ function ThinkingBlock({ item, timestamp, isLast }: { item: IntermediateData; ti
   const containerBorder = isError ? 'border-red-500/30' : ico.border;
   const containerBg = isError ? 'bg-red-600/5' : ico.bg;
   const iconColor = isError ? 'text-red-400' : '';
+
+  // 长内容防护：超长 detail 只渲染尾部窗口（最新推理最有价值）。
+  // useMemo 让未变化的思考块在消息列表重渲染时不重跑昂贵的正则转换；
+  // 折叠时不计算 HTML（detail 再大也零开销）。
+  const fullDetail = typeof item.detail === 'string' ? item.detail : String(item.detail ?? '');
+  const detailOversize = fullDetail.length > MAX_DETAIL_RENDER_CHARS;
+  const renderedHtml = useMemo(() => {
+    if (!expanded) return '';
+    const windowText = detailOversize
+      ? fullDetail.slice(-MAX_DETAIL_RENDER_CHARS)
+      : fullDetail;
+    return renderThinkingDetail(windowText);
+  }, [expanded, fullDetail, detailOversize]);
 
   // Collapse when streaming ends (isLast transitions from true to false)
   const wasLast = useRef(isLast);
@@ -197,8 +226,13 @@ function ThinkingBlock({ item, timestamp, isLast }: { item: IntermediateData; ti
       </button>
       {expanded && (
         <div className={`mt-1 mx-1 px-3 py-2 rounded-lg border ${ico.border} bg-gray-800/40 max-h-60 overflow-y-auto`}>
+          {detailOversize && (
+            <div className="text-[10px] text-amber-400/80 mb-1 pb-1 border-b border-gray-700/50">
+              思考过程较长（共 {fullDetail.length.toLocaleString()} 字符），仅渲染最近 {MAX_DETAIL_RENDER_CHARS.toLocaleString()} 字符；完整记录已随任务存档。
+            </div>
+          )}
           <div className="text-xs whitespace-pre-wrap break-words font-mono"
-               dangerouslySetInnerHTML={{ __html: renderThinkingDetail(item.detail) }} />
+               dangerouslySetInnerHTML={{ __html: renderedHtml }} />
         </div>
       )}
     </div>

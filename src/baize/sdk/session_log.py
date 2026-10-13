@@ -25,11 +25,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterator, Optional
+
+logger = logging.getLogger("baize.session_log")
 
 _SESSION_EVENT_KINDS = {
     "session/start",
@@ -187,6 +190,7 @@ class SessionLog:
         """
         messages: list[dict[str, Any]] = []
         tool_map: dict[str, str] = {}  # tool_call_id -> tool name（用于 tool/result 对齐）
+        pending_ids: list[str] = []    # 已发出、尚未被 tool/result 配对的 tool_call id
 
         for ev in self._events:
             p = ev.payload
@@ -201,14 +205,33 @@ class SessionLog:
                     for tc in tool_calls:
                         if isinstance(tc, dict) and tc.get("id"):
                             tool_map[tc["id"]] = tc.get("function", {}).get("name", "?")
+                            pending_ids.append(tc["id"])
                 else:
                     messages.append({"role": "assistant", "content": content})
             elif ev.kind == "tool/result":
                 tc_id = p.get("tool_call_id") or p.get("call_id")
+                if tc_id:
+                    # 显式 id：从待配对队列移除，避免后续 result 复用同一个 id
+                    if tc_id in pending_ids:
+                        pending_ids.remove(tc_id)
+                else:
+                    # 兜底：历史日志与部分调用点未记录 call_id。此前直接填 "?"，
+                    # 重建出的 tool 消息 tool_call_id 与 assistant 的 id 不匹配，
+                    # 回放/续跑时 OpenAI 兼容端点直接 400。这里按先进先出取用
+                    # 尚未配对的 tool_call id。
+                    tc_id = pending_ids.pop(0) if pending_ids else ""
+                if not tc_id:
+                    # 实在无法配对：丢弃这条工具结果，也好过产生一条会让
+                    # 整个请求 400 的非法 tool 消息
+                    logger.warning(
+                        "tool/result 缺少可配对的 call_id（name=%s），重建时跳过该条",
+                        p.get("name", "?"),
+                    )
+                    continue
                 messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": tc_id or "?",
+                        "tool_call_id": tc_id,
                         "content": p.get("output", ""),
                     }
                 )

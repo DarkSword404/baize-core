@@ -168,7 +168,9 @@ class CustomToolStore:
     """
 
     def __init__(self, base_dir: Optional[str] = None) -> None:
-        self.dir = base_dir or os.path.join(os.path.expanduser("~"), ".baize", "custom", "tools")
+        from baize.config import DEFAULT_BAIZE_DIR
+
+        self.dir = base_dir or str(DEFAULT_BAIZE_DIR / "custom" / "tools")
         os.makedirs(self.dir, exist_ok=True)
 
     # ---- 路径 ----

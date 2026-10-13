@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Baize (白泽) — 启动脚本 v4.0.0
+# Baize (白泽) — 启动脚本 v5.0.0
 #
 # 启动后端 (FastAPI/uvicorn, 端口 8001) 和前端 (Vite, 端口 5173)。
 #
@@ -189,7 +189,7 @@ fi
 
 echo ""
 echo -e "${C_CYAN}============================================${C_RESET}"
-echo -e "${C_CYAN}  白泽 (Baize) v4.0.0 已启动${C_RESET}"
+echo -e "${C_CYAN}  白泽 (Baize) v5.0.0 已启动${C_RESET}"
 echo -e "${C_CYAN}============================================${C_RESET}"
 echo -e "  后端: http://localhost:$BACKEND_PORT"
 echo -e "  前端: http://localhost:$FRONTEND_PORT"

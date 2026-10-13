@@ -2007,6 +2007,11 @@ def create_baize_api_app(
     )
     def list_archives() -> dict:
         items = app.state.archive_manager.list_archives()
+        # 归档文件是磁盘持久化格式（字段名 messages），归一化为前端
+        # SessionSummary 期望的 API 格式（history_length），避免 undefined
+        for it in items:
+            if isinstance(it, dict) and "history_length" not in it:
+                it["history_length"] = len(it.get("messages") or [])
         return {"archives": items}
 
     @app.get(
@@ -2018,6 +2023,12 @@ def create_baize_api_app(
         data = app.state.archive_manager.get_archive(session_id)
         if data is None:
             raise HTTPException(status_code=404, detail="归档不存在")
+        # 归档文件是磁盘持久化格式（字段名 messages），归一化为前端
+        # SessionDetail 期望的 API 格式（history + history_length），
+        # 否则详情面板读 selected.history.length 会得到 undefined
+        msgs = data.get("history") or data.get("messages") or []
+        data["history"] = msgs
+        data["history_length"] = len(msgs)
         return {"session": data}
 
     @app.post(

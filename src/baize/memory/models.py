@@ -30,6 +30,8 @@ REL_CONTRADICTS = "CONTRADICTS"  # 经验反驳另一条
 REL_DERIVED_FROM = "DERIVED_FROM"
 REL_SUPERSEDES = "SUPERSEDES"
 REL_MENTIONS = "MENTIONS"        # (episode/experience) → entity
+REL_IS_A = "IS_A"                # 本体层级：子节点 IS_A 父节点
+REL_APPLIES_TO = "APPLIES_TO"    # 本体知识：漏洞/组件 APPLIES_TO 场景
 REL_REFUTES = "REFUTES"          # 事实对经验反证
 REL_EVIDENCE_OF = "EVIDENCE_OF"  # evidence episode → experience
 
@@ -156,6 +158,9 @@ class ExperienceRecord:
     created_at: str = ""
     updated_at: str = ""
     source: str = ""                # 何种入口创建：agent | api | consolidate
+    # 语义检索用的向量缓存：{"v": [float...], "fp": 文本指纹}。fp 用来判断向量
+    # 是否过期——内容改过却没重算的向量必须弃用，否则召回会拿错东西。
+    embedding: Optional[dict] = None
 
     def to_dict(self) -> dict:
         return {
@@ -178,6 +183,7 @@ class ExperienceRecord:
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "source": self.source,
+            "embedding": dict(self.embedding) if self.embedding else None,
         }
 
     @classmethod
@@ -202,6 +208,8 @@ class ExperienceRecord:
             created_at=d.get("created_at", ""),
             updated_at=d.get("updated_at", ""),
             source=d.get("source", ""),
+            embedding=(dict(d["embedding"])
+                       if isinstance(d.get("embedding"), dict) else None),
         )
 
 

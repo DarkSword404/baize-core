@@ -79,32 +79,50 @@ class SkillStore:
         self._lock = threading.Lock()
         self._cache: dict[str, Skill] = {}
         self._loaded = False
+        # 加载失败标记：置位后禁止 _save()，避免用空缓存覆盖磁盘上的历史技能
+        self._load_failed = False
 
     def _path(self) -> Path:
         return self._base_dir / "skills.json"
 
     def _load(self) -> None:
-        if self._loaded:
+        if self._loaded or self._load_failed:
             return
         path = self._path()
         if path.exists():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(data, list):
-                    for item in data:
-                        if isinstance(item, dict):
-                            skill = Skill.from_dict(item)
-                            self._cache[skill.id] = skill
-                elif isinstance(data, dict):
-                    for item in data.values():
-                        if isinstance(item, dict):
-                            skill = Skill.from_dict(item)
-                            self._cache[skill.id] = skill
-            except (json.JSONDecodeError, OSError):
-                pass
+                items = data if isinstance(data, list) else (
+                    list(data.values()) if isinstance(data, dict) else []
+                )
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        skill = Skill.from_dict(item)
+                    except Exception as exc:  # noqa: BLE001
+                        # 单条坏数据（字段不兼容）不应毁掉整个技能库
+                        logger.warning("跳过无法解析的技能条目: %s", exc)
+                        continue
+                    self._cache[skill.id] = skill
+                self._loaded = True
+                return
+            except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
+                # 文件损坏/被截断：绝不能把空 cache 当成"已加载"，否则下一次
+                # _save() 会用空数组原子覆盖磁盘 —— 历史技能全部丢失且不可恢复
+                self._load_failed = True
+                logger.warning(
+                    "技能文件解析失败，已禁止写入以保护历史数据: %s (%s)",
+                    path, exc,
+                )
+                return
         self._loaded = True
 
     def _save(self) -> None:
+        # 加载失败时拒绝写入：避免用空/不完整的缓存覆盖磁盘上的历史技能
+        if self._load_failed:
+            logger.warning("技能文件加载失败，跳过写入以保护已有数据: %s", self._path())
+            return
         path = self._path()
         data = [s.to_dict() for s in self._cache.values()]
         tmp = path.with_suffix(".json.tmp")

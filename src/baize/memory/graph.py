@@ -5,6 +5,16 @@
 - 关系边带 valid_from/invalid_at 时间有效窗，旧边作废不删除；
 - 邻域扩展用于检索时的 Semantic Memory 召回。
 LLM 负责从文本提炼结构化关系（见 learn.py），本层负责存储与查询。
+
+图上的知识有两类来源：
+- 本体（taxonomy）：预置的安全知识树，节点是漏洞类型 / 场景 / 技术栈组件，
+  边是 IS_A（层级）与 APPLIES_TO（什么场景用什么打法），由 materialize_taxonomy
+  一次性写入——即使某类漏洞从未遇到过，节点也在图上，查询才有的放矢；
+- 实例：每次任务从 Episode / 经验文本里确定性抽出的实体，以及内容物 → 实体的
+  MENTIONS 边。
+
+只存类型级知识，不存目标资产（IP / 域名 / 产品版本）——理由见
+extract_entities_from_text 与 taxonomy 的模块说明。
 """
 from __future__ import annotations
 
@@ -12,47 +22,55 @@ import logging
 import re
 from typing import Iterable, Optional
 
-from .models import (REL_MENTIONS, REL_SUPPORTS, new_entity, new_relation)
+from . import taxonomy
+from .models import REL_MENTIONS, REL_SUPPORTS, new_entity, new_relation
 from .store import MemoryStore
 from .utils import new_id, now_iso
 
 logger = logging.getLogger("baize.memory.graph")
 
-# 确定性安全目标实体模式：CVE / IP / 域名 / IP:端口 / 弱口令特征等
+# 只保留 CVE：公开的漏洞编号是可复用知识（「遇到 CVE-2021-44228 走 Log4j 打法」），
+# 不属于目标资产。IP / 域名 / 产品版本一律不抽，理由见 extract_entities_from_text。
 _CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.IGNORECASE)
-_IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
-_IPPORT_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}\b")
-_DOMAIN_RE = re.compile(r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+"
-                        r"(?:com|cn|net|org|io|dev|edu|gov|top|xyz|info|cc)\b", re.IGNORECASE)
-# 常用中间件/框架指纹（产品实体），可扩展
-_PRODUCTS = (
-    "nginx", "apache", "tomcat", "iis", "weblogic", "jboss", "shiro", "struts2",
-    "thinkphp", "wordpress", "joomla", "drupal", "phpmyadmin", "mysql", "redis",
-    "postgresql", "mssql", "mongodb", "elasticsearch", "kibana", "grafana", "jenkins",
-    "gitlab", "docker", "kubernetes", "metasploit", "sqlmap", "nmap", "nessus",
-    "fortinet", "f5", "citrix", "fastjson", "log4j", "spring", "laravel", "weixin",
-    "wechat", "alibaba", "windows", "linux", "ubuntu", "centos", "debian", "kali",
-)
 
 _ENTITY_KIND_BY_PREFIX = {
-    "ip": "ip",
-    "domain": "domain",
     "cve": "cve",
-    "product": "product",
-    "port": "port",
-    "account": "account",
+    "vuln": "vuln",
+    "scenario": "scenario",
+    "component": "component",
+    "category": "category",
 }
+
+# 已停抽的资产类实体。保留这份清单只为一个目的：清理历史数据——此前落库的
+# 资产实体要靠它识别（见 purge_asset_entities）。
+_ASSET_KINDS = ("ip", "domain", "product", "port", "account")
+
+
+def _mentions(low: str, alias: str) -> bool:
+    """别名命中判定：纯 ASCII 用词边界，中文用子串（中文无词边界）。
+
+    判定规则实现在本体层（taxonomy.mentions），此处仅转发，避免两处各写一份
+    而逐渐分叉。
+    """
+    return taxonomy.mentions(low, alias)
 
 
 def extract_entities_from_text(text: str) -> dict[str, dict]:
     """从一段文本确定性抽取实体，返回 {key: {key, kind, label, aliases}}。
 
-    仅做可验证的模式识别，避免幻觉；语义关系由 LLM 层负责。
+    只抽**类型级知识**：漏洞类型、场景、技术栈组件，以及 CVE 编号。
+
+    不再抽 IP / 域名 / 产品版本——那是目标资产实例，有两个问题：换一次任务就
+    全部失效（记住「目标 A 的 8080 跑着 Shiro」对打下一个目标毫无帮助）；把客户
+    域名、IP 长期留在记忆库里本身就是敏感信息，违背数据最小化。类型级知识
+    （「遇到 Shiro 试反序列化」「登录框先试弱口令」）才跨任务复用，这才是知识
+    图谱该存的东西。
+
+    仅做可验证的模式识别与本体别名匹配，避免幻觉；语义关系由 LLM 层负责。
     """
     if not text:
         return {}
     out: dict[str, dict] = {}
-    src = text
 
     def add(kind: str, value: str, label: str = "", alias: str = "") -> None:
         v = value.strip().lower()
@@ -60,35 +78,64 @@ def extract_entities_from_text(text: str) -> dict[str, dict]:
             return
         key = f"{kind}:{v}"
         if key not in out:
-            out[key] = new_entity(key, kind, label or v, aliases=[alias] if alias and alias.lower() != v else [])
+            out[key] = new_entity(key, kind, label or v,
+                                  aliases=[alias] if alias and alias.lower() != v else [])
         elif alias and alias.lower() != v and alias not in out[key]["aliases"]:
             out[key]["aliases"].append(alias)
 
-    # IP:端口 先于纯 IP，避免被消费
-    for m in _IPPORT_RE.findall(src):
-        ip, _, port = m.partition(":")
-        add("ip", ip)
-        key = f"ip:{ip.lower()}"
-        if key in out and port not in out[key]["aliases"]:
-            out[key]["aliases"].append(f"port {port}")
-    for m in _IPV4_RE.findall(src):
-        add("ip", m)
-    for m in _DOMAIN_RE.findall(src):
-        add("domain", m)
-    for m in _CVE_RE.findall(src):
+    for m in _CVE_RE.findall(text):
         add("cve", m.upper())
-    low = src.lower()
-    for p in _PRODUCTS:
-        for m in re.finditer(rf"\b{re.escape(p)}\b", low):
-            add("product", p, label=p)
-            # 尽量带版本：如 nginx/1.18.0、nginx 1.18.0
-            m = re.search(rf"\b{re.escape(p)}\b\s*(?:/|v?)\s*([0-9][0-9A-Za-z.\-]*)", low)
-            if m:
-                ver = m.group(1)
-                if ver and not re.fullmatch(r"\d", ver):
-                    add("product", f"{p} {ver}", label=f"{p} {ver}", alias=p)
-            break
+    # 本体节点：把文本里实际的写法也记为别名，于是「反代入口」与「反向代理」
+    # 两种说法会累积到同一个节点上，下次换种叫法查询也能命中——这正是「同类
+    # 漏洞换个说法」时字面匹配失效的解法。
+    for key, hit in taxonomy.match_pairs(text):
+        n = taxonomy.node(key)
+        add(n["kind"], key, label=n["label"], alias=hit)
     return out
+
+
+def materialize_taxonomy(store: MemoryStore, force: bool = False) -> int:
+    """把安全知识本体的节点与语义边写入图谱，返回写入的实体数。
+
+    本体是**预置**的：即使某类漏洞一次都没遇到过，节点也在图上，查询才能命中
+    它并沿 IS_A / APPLIES_TO 找到近邻。这与「只记录出现过的实体」相反——后者在
+    冷启动时图是空的，检索只能退化成纯字面匹配，而字面匹配恰恰在「同类漏洞换个
+    说法」时失效，那正是最需要记忆的场景。
+
+    force=False 时若根节点已在则跳过：本体是静态的，没必要每次启动都重写磁盘。
+    """
+    if not force and store.get_entity(taxonomy.entity_key(taxonomy.ROOT)):
+        return 0
+    n = 0
+    for nd in taxonomy.all_nodes():
+        store.upsert_entity(new_entity(
+            key=taxonomy.entity_key(nd["key"]), kind=nd["kind"],
+            label=nd["label"], aliases=list(nd["aliases"]),
+            props={"taxonomy": True, "parent": nd["parent"]}))
+        n += 1
+    for rel_type, src, tgt in taxonomy.semantic_edges():
+        store.add_relation(new_relation(
+            rid=new_id("rt"), rel_type=rel_type, source=src, target=tgt,
+            provenance={"episode_id": "", "at": now_iso()},
+            props={"taxonomy": True}))
+    logger.info("安全知识本体落库：%d 个节点", n)
+    return n
+
+
+def purge_asset_entities(store: MemoryStore) -> dict:
+    """清理历史落库的资产实体（ip/domain/product/port/account）及其边。
+
+    抽取侧已经停抽，但**已落库的数据不会自己消失**，所以要显式清一次。连边一起
+    删是必须的（理由见 store.delete_entities）。
+
+    只删图谱里的实体，不动经验/事实正文——正文是证据原文，改写证据会破坏可
+    回溯性；是否展示、是否脱敏应由上层决定。
+    """
+    keys = [e["key"] for e in store.list_entities()
+            if e.get("kind") in _ASSET_KINDS]
+    removed = store.delete_entities(keys)
+    logger.info("清理资产实体 %d 个（及其关联边）", removed)
+    return {"removed_entities": removed, "kinds": list(_ASSET_KINDS)}
 
 
 class KnowledgeGraph:
@@ -96,6 +143,17 @@ class KnowledgeGraph:
 
     def __init__(self, store: MemoryStore):
         self.store = store
+
+    def ensure_taxonomy(self, force: bool = False) -> int:
+        """确保安全知识本体已落库（幂等），返回写入的实体数。
+
+        检索前调用一次即可：根节点在就跳过，不必每次写盘。
+        """
+        if force:
+            return materialize_taxonomy(self.store, force=True)
+        if self.store.get_entity(taxonomy.entity_key(taxonomy.ROOT)):
+            return 0
+        return materialize_taxonomy(self.store)
 
     # ---- 落库 -------------------------------------------------------------
     def record_entities(self, episode_id: str, texts: Iterable[str]) -> list[str]:

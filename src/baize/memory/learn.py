@@ -15,6 +15,7 @@ import logging
 import re
 from typing import Optional
 
+from .embed import attach_embedding
 from .episode import EpisodeBuilder
 from .graph import KnowledgeGraph
 from .models import EpisodeRecord, attach_evidence
@@ -64,8 +65,11 @@ class LearnSignals:
         tool_text = _clean(" ".join(
             f"{s.get('tool_name','')} {s.get('arguments','')} {s.get('output','')}"
             for s in steps if s.get("type") == "tool_call"))
-        result = _clean((episode.get("result_text") or "") + " " +
-                        (episode.get("summary") or ""))
+        # 只看真正的结论文本。Episode 的 summary 是自动摘要，其中拼接了 task
+        # （见 EpisodeBuilder._auto_summary），若一并计入，任务描述里出现
+        # 「漏洞/注入」等词就会被误判为「本次有结论」——失败回合被当成成功，
+        # 人工介入后没拿下的教训也就无法归为 lesson。
+        result = _clean(episode.get("result_text") or "")
         error = _clean(episode.get("error_text") or "")
         self.concluded = _has_any(result, CONCLUSION_KEYWORDS)
         self.failed_once = _has_any(tool_text + " " + error, FAILURE_KEYWORDS)
@@ -73,6 +77,15 @@ class LearnSignals:
         self.tool_calls = sum(1 for s in steps if s.get("type") == "tool_call")
         self.has_output = bool((episode.get("result_text") or "").strip())
         self.has_error = bool((episode.get("error_text") or "").strip())
+        # ── 人工介入信号 ──
+        # user_hint 是用户在本轮给出的方向性建议（尚未执行验证），与 tool_call
+        # （已执行、有输出）性质不同。人工介入意味着「AI 自己没搞定、人出手了」，
+        # 这类回合的信息密度最高，应当显著升权，否则介入对下次任务没有意义。
+        hint_text = _clean(" ".join(
+            s.get("text", "") for s in steps if s.get("type") == "user_hint"))
+        self.human_assisted = bool(hint_text.strip())
+        self.guided = _has_any(hint_text, GUIDANCE_KEYWORDS)
+        self.assisted_success = bool(self.human_assisted and self.concluded)
 
     def meaningful(self) -> bool:
         """没有任何产出/过程也没有错误 → 不值得沉淀（空转/闲聊）。"""
@@ -88,10 +101,18 @@ class LearnSignals:
         score = 0.30
         if self.concluded:
             score += 0.30
-        if self.error_then_success:
+        # 人工介入后走通 > 自行绕路走通 > 单纯失败：人的注意力是最稀缺的资源，
+        # 人愿意插手纠正的地方，就是下次最该想起来的地方。
+        if self.assisted_success:
+            score += 0.25
+        elif self.error_then_success:
             score += 0.20
         elif self.failed_once:
             score += 0.10
+        if self.human_assisted:
+            score += 0.10
+        if self.guided:
+            score += 0.05
         if self.tool_calls:
             score += 0.10
         if self.tool_calls >= 5:
@@ -102,10 +123,14 @@ class LearnSignals:
         r = []
         if self.concluded:
             r.append("任务有明确结论")
-        if self.error_then_success:
+        if self.assisted_success:
+            r.append("人工介入后走通（用户纠正/指导 + 最终有结论）")
+        elif self.error_then_success:
             r.append("绕路后走通（错误→成功）")
         elif self.failed_once:
             r.append("本次出现失败，失败原因有记录价值")
+        if self.human_assisted and not self.assisted_success:
+            r.append("本次有人工介入（用户给出方向性建议）")
         if self.tool_calls:
             r.append(f"有 {self.tool_calls} 次工具调用轨迹")
         return r
@@ -145,7 +170,11 @@ def _material(episode: dict) -> str:
                          f"参数 {excerpt(s.get('arguments',''),200)} "
                          f"=> 输出 {excerpt(s.get('output',''),260)}")
         elif s.get("text"):
-            lines.append(f"- [{s.get('type')}] {excerpt(s.get('text',''),240)}")
+            if s.get("type") == "user_hint":
+                # 人工建议单独标注为「未验证」，避免提炼时被当成已验证事实
+                lines.append(f"- [人工建议·未验证] {excerpt(s.get('text',''),300)}")
+            else:
+                lines.append(f"- [{s.get('type')}] {excerpt(s.get('text',''),240)}")
     if episode.get("result_text"):
         lines.append(f"结论：{episode.get('result_text','')[:1200]}")
     if episode.get("error_text"):
@@ -201,9 +230,17 @@ class MemoryLearner:
         candidate["confidence"] = confidence
         candidate["status"] = ("active" if confidence >= AUTO_ACTIVE_CONFIDENCE
                                else "draft")
+        # 人工介入但最终没拿下：这类「试过 X 不奏效」的避坑结论价值很高，
+        # 却因为没有明确结论而置信度偏低，会落进 draft 被召回层永久过滤掉
+        # ——人出手了反而记不住。强制归为 lesson，由召回层开一条低置信度通道
+        # 让它以「教训·未验证」的形式出现，不再白白丢掉这次介入。
+        if signals.human_assisted and not signals.concluded:
+            candidate["kind"] = "lesson"
 
         # 4) 落库：经验本体 + 证据链 + 与 Episode/实体的图谱关系
         exp = self._to_record(ep, candidate, confidence)
+        # 补语义向量供检索的向量通道使用；算不出来也照常落库（检索退回纯 BM25）
+        await attach_embedding(exp)
         self.store.save_experience(exp)
 
         self.graph.record_relation(
@@ -248,6 +285,11 @@ class MemoryLearner:
             "以及『适用条件（目标指纹/版本特征）』；\n"
             "3) tags：3-6 个检索标签（技术关键词）；\n"
             "4) kind：method(可复用方法)/lesson(教训避坑)/intel(情报事实) 三选一。\n"
+            "5) 输入中的『人工建议·未验证』是用户给出的方向性提示，未经执行验证，"
+            "可能不准确。结论必须以『工具 ...』之后的实测输出为准：\n"
+            "   - 人工建议被实测证实 → 正常写入可复用步骤；\n"
+            "   - 人工建议被实测证伪 → 显式写明『该方法无效』及实测现象，不要沿用建议；\n"
+            "   - 无论如何都不要把人工建议当作已验证事实来陈述。\n"
             "只输出 JSON："
             "{\"title\":\"...\",\"content\":\"...\",\"tags\":[...],\"kind\":\"method\"}"
         )
@@ -284,6 +326,11 @@ class MemoryLearner:
         error = (episode.get("error_text") or "").strip()
 
         parts = []
+        # 无 LLM 时也要留下人工介入的痕迹（标注未验证，不混入实测结论）
+        hints = [s.get("text", "") for s in episode.get("steps", [])
+                 if s.get("type") == "user_hint" and s.get("text")]
+        if hints:
+            parts.append("人工提示（未验证）：" + excerpt("；".join(hints), 300))
         if error:
             parts.append(f"踩坑：{excerpt(error, 400)}")
         lines = []
@@ -306,9 +353,26 @@ class MemoryLearner:
 
     def _to_record(self, episode: dict, candidate: dict,
                    confidence: float) -> dict:
+        exp_id = new_id("exp")
         entity_keys = list(episode.get("entity_keys", []))
+        # 经验自身的文本也要抽一遍实体：episode 的文本是工具输出（域名、IP、
+        # 版本号），而经验的标题/正文是总结性表述——「反序列化」「越权」这类
+        # 漏洞类型多半只出现在这里。只继承 episode 实体的话，漏洞类型实体永远
+        # 是零，图距离通道也就无从谈起。
+        own_text = " ".join([
+            candidate.get("title", "") or "",
+            candidate.get("content", "") or "",
+            " ".join(candidate.get("tags") or []),
+        ]).strip()
+        if own_text:
+            for key in self.graph.record_entities(exp_id, [own_text]):
+                if key not in entity_keys:
+                    entity_keys.append(key)
+        # 人工介入标记：落库后可用于检索升权与审计，区分「实测验证过」与「人工建议过」
+        human_assisted = any(s.get("type") == "user_hint"
+                             for s in episode.get("steps", []))
         record = {
-            "id": new_id("exp"),
+            "id": exp_id,
             "title": candidate.get("title", ""),
             "content": candidate.get("content", ""),
             "tags": candidate.get("tags", []) or [],
@@ -334,5 +398,6 @@ class MemoryLearner:
             "created_at": now_iso(),
             "updated_at": now_iso(),
             "source": "agent",
+            "human_assisted": human_assisted,
         }
         return record

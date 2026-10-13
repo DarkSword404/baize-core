@@ -175,12 +175,16 @@ class OpenAICompatibleModel(BaseChatModel):
         *,
         tools: Optional[list[dict]] = None,
         temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
     ) -> AsyncIterator[CompletionResult]:
         msgs = self._messages(history)
         logger.info(
             "模型请求: model=%s, base_url=%s, msg_count=%d",
             self.model, self.base_url, len(msgs),
         )
+        extra: dict = {}
+        if max_tokens is not None:
+            extra["max_tokens"] = max_tokens
         try:
             stream = await self._client.chat.completions.create(
                 model=self.model,
@@ -188,6 +192,7 @@ class OpenAICompatibleModel(BaseChatModel):
                 tools=tools,
                 temperature=temperature,
                 stream=True,
+                **extra,
             )
         except Exception as e:
             logger.error("模型 API 请求失败: %s", e)

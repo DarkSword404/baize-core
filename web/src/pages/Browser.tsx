@@ -75,6 +75,9 @@ export function BrowserPanel({ open, onClose }: BrowserPanelProps): JSX.Element 
     setLoading(true);
     let closed = false;
     let reconnectTimer: number | null = null;
+    // 指数退避：连续重连失败时延后重试，避免高频重连压死后端
+    let reconnectDelay = 1500;
+    const RECONNECT_MAX_DELAY = 30000;
 
     const renderFrame = async (b64: string, w: number, h: number) => {
       const canvas = canvasRef.current;
@@ -99,7 +102,10 @@ export function BrowserPanel({ open, onClose }: BrowserPanelProps): JSX.Element 
     const connect = () => {
       const ws = new WebSocket(sharedBrowserStreamUrl());
       wsRef.current = ws;
-      ws.onopen = () => setWsConnected(true);
+      ws.onopen = () => {
+        setWsConnected(true);
+        reconnectDelay = 1500;  // 连接成功后重置退避
+      };
       ws.onmessage = (ev) => {
         let m: { t?: string; d?: string; w?: number; h?: number; url?: string; running?: boolean; msg?: string } & Partial<Status>;
         try {
@@ -120,7 +126,11 @@ export function BrowserPanel({ open, onClose }: BrowserPanelProps): JSX.Element 
       };
       ws.onclose = () => {
         setWsConnected(false);
-        if (!closed && open) reconnectTimer = window.setTimeout(connect, 1500);
+        if (!closed && open) {
+          reconnectTimer = window.setTimeout(connect, reconnectDelay);
+          // 指数退避：下次失败延后一倍，上限 30 秒
+          reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_DELAY);
+        }
       };
       ws.onerror = () => setWsConnected(false);
     };

@@ -69,11 +69,18 @@ def json_load(path: Path, default: Any = None) -> Any:
 
 
 def data_root() -> Path:
-    """记忆库根目录（真相源）。可用 BAIZE_MEMORY_DIR 覆盖。"""
+    """记忆库根目录（真相源）。可用 BAIZE_MEMORY_DIR 覆盖。
+
+    未覆盖时跟随 ``BAIZE_DATA_DIR``（即 ``DEFAULT_BAIZE_DIR``），而不是硬编码
+    ``~/.baize`` —— 否则设置 BAIZE_DATA_DIR 后记忆库仍写在 HOME 下，数据
+    一分为二（备份/迁移必漏），且只读 HOME 的环境直接 PermissionError。
+    """
+    from baize.config import DEFAULT_BAIZE_DIR
+
     override = os.environ.get("BAIZE_MEMORY_DIR")
     if override:
         return Path(override).expanduser()
-    return Path.home() / ".baize" / "memory"
+    return DEFAULT_BAIZE_DIR / "memory"
 
 
 def excerpt(text: str, limit: int = 240) -> str:

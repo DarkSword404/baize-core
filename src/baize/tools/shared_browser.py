@@ -38,10 +38,11 @@ from typing import Any, Awaitable, Callable, Optional
 
 from baize.tools.extended import _check_url_allowed
 from baize.tools.registry import register_tool
+from baize.config import DEFAULT_BAIZE_DIR
 
 logger = logging.getLogger("baize.tools.shared_browser")
 
-DEFAULT_PROFILE = Path.home() / ".baize" / "shared-browser-profile"
+DEFAULT_PROFILE = DEFAULT_BAIZE_DIR / "shared-browser-profile"
 
 # 固定视口尺寸：前端截图交互层按此比例将屏幕坐标映射为页面坐标。
 # 截图默认截取视口区域，与 viewport 严格一致，保证点击坐标精确。
@@ -86,6 +87,8 @@ class SharedBrowserManager:
         self._stream_mode: Optional[str] = None
         self._stream_task: Any = None
         self._viewport_actual: Optional[dict[str, int]] = None
+        # 背压：上一帧仍在处理时丢弃新帧，防止 asyncio task 堆积
+        self._frame_busy: bool = False
 
     # ---- 单例 -----------------------------------------------------------
     @classmethod
@@ -146,7 +149,9 @@ class SharedBrowserManager:
         async with self._lock:
             page = await self._ensure_started()
             await page.goto(url, timeout=30000, wait_until="domcontentloaded")
-            return f"已打开: {page.url}（标题: {await page.title()}）"
+            title = await page.title()
+            logger.info("共享浏览器已导航: url=%s 标题=%s", page.url, title)
+            return f"已打开: {page.url}（标题: {title}）"
 
     async def snapshot(self) -> Optional[bytes]:
         """截取共享浏览器当前页面（PNG bytes），未启动时返回 None。"""
@@ -390,6 +395,8 @@ class SharedBrowserManager:
                 await send_frame(data, w, h)
             except Exception:  # noqa: BLE001
                 pass
+            finally:
+                self._frame_busy = False
             try:
                 await cdp.send(
                     "Page.screencastFrameAck",
@@ -399,6 +406,10 @@ class SharedBrowserManager:
                 pass
 
         def _handler(params: dict) -> None:
+            # 背压：上一帧仍在处理时丢弃当前帧，避免 asyncio task 无限堆积
+            if self._frame_busy:
+                return
+            self._frame_busy = True
             asyncio.create_task(_on_frame(params))
 
         self._stream_handler = _handler
@@ -440,13 +451,20 @@ class SharedBrowserManager:
     async def stop_stream(self) -> None:
         """停止帧流。"""
         cdp = self._stream_cdp
+        handler = self._stream_handler
         mode = self._stream_mode
         task = self._stream_task
         self._stream_cdp = None
         self._stream_handler = None
         self._stream_mode = None
         self._stream_task = None
-        if mode == "cdp" and cdp is not None:
+        self._frame_busy = False
+        # 先移除事件 handler，防止 stopScreencast 后仍有残留帧触发 create_task
+        if mode == "cdp" and cdp is not None and handler is not None:
+            try:
+                cdp.remove_listener("Page.screencastFrame", handler)
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 await cdp.send("Page.stopScreencast")
             except Exception:  # noqa: BLE001

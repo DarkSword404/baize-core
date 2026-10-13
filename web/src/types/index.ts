@@ -96,7 +96,7 @@ export const TASK_TYPE_OPTIONS: { value: TaskType; label: string; desc: string }
 
 // ---- 黑板（证据攻击图：target/hypothesis/evidence/action/handoff）----
 export type BlackboardNodeKind =
-  | 'origin' | 'goal' | 'fact' | 'intent' | 'hint';
+  | 'goal' | 'fact' | 'intent' | 'finding' | 'hint' | 'digest';
 
 export interface BlackboardNode {
   id: string;
@@ -132,6 +132,7 @@ export interface BlackboardSnapshot {
     intents_done: number;
     intents_failed?: number;
     hints: number;
+    findings?: number;
   };
 }
 

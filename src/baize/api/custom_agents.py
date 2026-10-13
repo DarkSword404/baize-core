@@ -136,7 +136,14 @@ class CustomPipelineStore:
     )
 
     def list(self) -> list[dict[str, Any]]:
-        return sorted(self._pipelines.values(), key=lambda p: p["created_at"])
+        # 必须持锁：sorted() 会迭代 dict_values，并发 create/delete 会触发
+        # "dictionary changed size during iteration"（列表接口间歇 500）。
+        # 另外用 .get() 取 created_at —— 历史数据缺该字段时不应直接 KeyError。
+        with self._lock:
+            return sorted(
+                self._pipelines.values(),
+                key=lambda p: p.get("created_at") or "",
+            )
 
     def create(self, data: dict[str, Any]) -> dict[str, Any]:
         now = _now()

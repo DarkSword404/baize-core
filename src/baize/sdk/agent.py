@@ -112,14 +112,22 @@ def _llm_cache_get(key: str) -> Optional["CompletionResult"]:
 
 
 def _llm_cache_put(key: str, result: "CompletionResult") -> None:
-    """写入缓存（仅缓存无 tool_calls 的纯文本响应）。"""
+    """写入缓存（仅缓存无 tool_calls 的非空纯文本响应）。"""
     if result.tool_calls:
         return  # 含 tool_calls 的响应不缓存：避免一次性 id 复用破坏配对
+    # 空内容不缓存：上游偶发返回 200 + 空 content（思考预算吃光 / 内容过滤）。
+    # 若把它当作成功结果缓存，TTL 内同 prompt 会一直命中空结果，连重试机会
+    # 都没有 —— 表现为"编排持续空转"，且故障被缓存放大。
+    if not (result.content or "").strip():
+        logger.debug("空内容响应不入缓存（key=%s...）", key[:12])
+        return
     _LLM_RESPONSE_CACHE[key] = (time.time(), result)
-    # 简单防泄漏：缓存超过 256 项时清理最旧的一半
+    # 防泄漏：超过 256 项时清理最旧的一半。
+    # 原实现只删"已过期"项 —— 60 秒内新增超过 256 条时一条也删不掉，
+    # 字典无界增长（每个 value 都是完整的 CompletionResult）。
     if len(_LLM_RESPONSE_CACHE) > 256:
-        cutoff = time.time() - _LLM_RESPONSE_CACHE_TTL
-        for k in [k for k, (ts, _) in list(_LLM_RESPONSE_CACHE.items()) if ts < cutoff]:
+        oldest = sorted(_LLM_RESPONSE_CACHE.items(), key=lambda kv: kv[1][0])
+        for k, _ in oldest[: len(oldest) // 2]:
             _LLM_RESPONSE_CACHE.pop(k, None)
 
 # 工具执行超时：单次工具调用（含同步 handler 的线程池执行）超过该秒数
@@ -611,6 +619,13 @@ class Agent:
     空转；与"按实际工具调用数计数"的 max_tool_calls 预算共同防止
     agent 在 read→load→probe 循环里耗尽上百次调用而无产出。
     """
+    ctx_budget_override: Optional[int] = None
+    """per-agent 上下文 token 预算覆盖（由 Reason LLM 在 AgentSpec.ctx_budget 指定）。
+
+    None = 用全局 model.json 配置；非 None 则优先用此值（8192~131072）。
+    这是"把抉择交付给 AI"的落地：AI 决定每个 agent 的上下文预算，
+    简单任务用小预算省 token，复杂分析用大预算防裁剪。
+    """
 
     def mount_dynamic_tool(self, tool: "AgentTool") -> bool:
         """挂载一个运行时加载的工具。已存在（核心层/已加载）则返回 False。"""
@@ -979,11 +994,21 @@ class Agent:
         """读取模型配置，返回 (max_ctx_tokens, max_message_chars, enable_summary)。
 
         预算推导规则（优先级从高到低）：
+        0. ``ctx_budget_override`` per-agent 覆盖（Reason LLM 指定）。
         1. ``max_context_tokens`` 显式配置（0 表示不限制）。
         2. ``context_window`` 配置：预算 = 窗口 × 90%（预留输出空间）。
         3. 内置默认 256000。
         """
         from baize.sdk.client import get_active_model_config
+
+        # 优先级 0：Reason LLM 为本 agent 指定的 per-agent 预算
+        if self.ctx_budget_override is not None:
+            ctx = int(self.ctx_budget_override)
+            cfg = get_active_model_config()
+            msg = (cfg.max_message_chars if cfg and cfg.max_message_chars
+                   else DEFAULT_MAX_MESSAGE_CHARS)
+            enable_sum = bool(cfg.enable_context_summary) if cfg else True
+            return ctx, msg, enable_sum
 
         cfg = get_active_model_config()
         if cfg is None:
@@ -1468,7 +1493,7 @@ class Agent:
                                     self._log_event(
                                         "tool/call", name="auto_install",
                                         arguments=f'{{"binary": "{missing_bin}"}}',
-                                        call_id=f"install_{tc_id}",
+                                        call_id=f"install_{tc.get('id', '')}",
                                     )
                                     install_ok, install_msg = await _import_try_auto_install()(
                                         missing_bin,
@@ -1478,6 +1503,7 @@ class Agent:
                                     self._log_event(
                                         "tool/result", name="auto_install",
                                         output=install_msg, denied=not install_ok,
+                                        call_id=f"install_{tc.get('id', '')}",
                                     )
                                     if install_ok:
                                         # 安装成功：重试原工具调用一次
@@ -1495,7 +1521,9 @@ class Agent:
                                     self._log_event("tool/error", name=name, error=str(exc))
                                     logger.warning("工具 %s 执行失败: %s: %s", name, type(exc).__name__, exc)
                             duration = asyncio.get_running_loop().time() - started_at
-                            self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
+                            # call_id 必须带上：否则会话日志里的 tool 消息
+                            # tool_call_id 会退化成 "?"，回放时端点报 400
+                            self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4), call_id=tc.get("id", ""))
                         await self._emit("on_tool_result", self, name, output)
                     # ── TokenJuice 语义压缩（hooks 拿到原始输出，LLM 拿到压缩版）──
                     if self.tool_output_compressor and self.tool_output_compressor.should_compress(name, output):
@@ -1559,40 +1587,13 @@ class Agent:
                 logger.warning("配额耗尽后的强制报告请求失败，返回空")
         return "", total
 
-    async def _try_auto_refine(self, client, user_message: str, final_text: str) -> None:
-        """记忆自动学习：每回合结束，把本轮轨迹固化为 Episode 并提炼经验。
+    # 记忆自动学习已由「每回合」改为「会话结束」：见模块级 learn_session()。
+    # 原先每回合都固化一个 Episode，而采集源是整个 session_log——第 N 个
+    # Episode 是第 N-1 个的超集，长会话会产出大量互相包含、内容高度重叠的
+    # Episode 与经验。改为会话结束时一次性学习：一个会话只沉淀一份轨迹。
 
-        依赖全局注册的 memory_service（全新记忆子系统 baize.memory）：
-        - 工具调用 / 观察 / 结论按时间序固化为 Episode（原始证据，只增不改）；
-        - 信号判定后提炼为自然语言经验（高置信度自动 active，否则 draft）。
-        """
-        svc = _svc_get("memory_service")
-        if svc is None:
-            return
-        session_id = (self.session_log.session_id if self.session_log
-                      else self.session_id or "")
-        events = self._normalize_log_events(self._collect_tool_events())
-        task = (user_message or "").strip()[:400]
-        try:
-            await svc.learn_events(
-                events=events,
-                task=task,
-                agent_key=self.name,
-                session_id=session_id,
-                result_text=final_text or "",
-                error_text="",
-                status="failed" if not (final_text or "").strip() else "success",
-                user_message=user_message,
-                client=client,
-            )
-            logger.info(
-                "记忆已学习: session=%s task=%s events=%d",
-                session_id or "-", task[:60] or "(空)", len(events),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("记忆学习异常: %s", exc)
-
-    def _normalize_log_events(self, events: list[dict]) -> list[dict]:
+    @staticmethod
+    def normalize_log_events(events: list[dict]) -> list[dict]:
         """把 SessionLog 的 tool/call + tool/result 事件配对成 Episode 工具调用。"""
         merged: dict[str, dict] = {}
         order: list[str] = []
@@ -1631,15 +1632,37 @@ class Agent:
                 merged[key]["status"] = ("error" if ev.get("error")
                                          else ("denied" if ev.get("denied")
                                                else "ok"))
+            elif kind == "user/message":
+                # 人工介入：以 user_hint 类型进入 Episode，与 tool_call（已执行、
+                # 有输出）区分开。提炼时据此判断哪些是实测事实、哪些只是方向。
+                text = str(ev.get("content") or "").strip()
+                if not text:
+                    continue
+                key = f"hint:{len(order)}"
+                merged[key] = {
+                    "type": "user_hint",
+                    "role": "user",
+                    "text": text[:2000],
+                    "ts": ev.get("ts", ev.get("timestamp", "")),
+                }
+                order.append(key)
         return [merged[k] for k in order]
 
-    def _collect_tool_events(self) -> list[dict]:
-        """从会话日志中收集本轮工具调用事件。"""
+    @staticmethod
+    def collect_session_events(session_log) -> list[dict]:
+        """从会话日志中收集工具事件 + 人工介入消息 + 最终回复。
+
+        除工具调用外还要收集 ``user/message``：用户的人工指导/纠正正是
+        「上次漏检、人工补做」的关键线索。此前只收工具事件，记忆里只有
+        「AI 做了什么」而没有「用户是怎么纠正它的」——人工介入无法对下次
+        同类任务产生任何作用，介入等于白做。
+        """
         events: list[dict] = []
-        if self.session_log is None:
+        if session_log is None:
             return events
-        for ev in self.session_log:
-            if ev.kind in ("tool/call", "tool/result"):
+        for ev in session_log:
+            if ev.kind in ("tool/call", "tool/result", "user/message",
+                           "agent/response"):
                 events.append({"kind": ev.kind, **ev.payload})
         return events
 
@@ -1724,8 +1747,7 @@ class Agent:
             content, usage = await self._run_tool_loop(client, history, tool_schemas)
             await self._emit("on_done", self, content)
 
-            # ── 经验自动提炼 (P1) ──
-            await self._try_auto_refine(client, user_message, content)
+            # 记忆学习已改为会话结束触发（见模块级 learn_session），非每回合
 
             self._log_event("session/end", reason="done") if not suppress_session_end else None
             self._save_memory(history, content)
@@ -2004,6 +2026,7 @@ class Agent:
                                     self._log_event(
                                         "tool/result", name="auto_install",
                                         output=install_msg, denied=not install_ok,
+                                        call_id=f"install_{tc_id}",
                                     )
                                     yield AgentEvent(
                                         type="tool_result",
@@ -2031,7 +2054,7 @@ class Agent:
                         # 进度看门狗：每个工具调用（含被拦截/未注册）都计一步；
                         # write_fact 成功写入时由工具内部 mark_fact() 清零计数。
                         if self.progress_guard is not None:
-                            self.progress_guard.record_tool_call(name)
+                            self.progress_guard.record_tool_call(name, arguments)
                         await self._emit("on_tool_result", self, name, output)
                         yield AgentEvent(type="tool_result", tool_name=name, tool_result=output, tool_call_id=tc_id)
                         history.append(
@@ -2098,8 +2121,10 @@ class Agent:
                                 ),
                             )
                         )
-                    # ── 零增量硬停（ProgressGuard）──────────────────────────
-                    # 第一次触发：给模型一次强制结论机会；仍继续调工具则硬停。
+                    # ── 零增量软提醒 + 二次硬停（ProgressGuard）──────────────
+                    # 第一次触发：软提醒，由 AI 自己决定是否换思路或总结。
+                    #   重置 _streak 和 abort，给 AI 一次自由决策的机会。
+                    # 第二次触发（仍空转）：硬停（安全护栏）。
                     _guard = self.progress_guard
                     if _guard is not None and _guard.should_abort:
                         if not guard_forced_conclusion:
@@ -2108,17 +2133,23 @@ class Agent:
                                 ChatMessage(
                                     role="user",
                                     content=(
-                                        f"（停止信号：{_guard.abort_reason}。"
-                                        "请立即停止发起新的探测/攻击步骤，"
-                                        "把已经确认的观察用 write_fact 写入黑板，"
-                                        "并给出阶段性结论。）"
+                                        f"（空转提醒：已连续 {_guard._streak} 次执行相同操作"
+                                        f"未产生新事实（{_guard.abort_reason}）。"
+                                        "你可以选择：①换一种工具或参数重新尝试；"
+                                        "②把已确认的观察用 write_fact 写入黑板并给出阶段性结论；"
+                                        "③如果你认为需要继续相同操作，请在回复中说明原因。"
+                                        "决策权在你，但请避免无意义的重复。）"
                                     ),
                                 )
                             )
+                            # 重置计数，给 AI 一次自由决策的机会
+                            _guard._streak = 0
+                            _guard.abort = False
+                            _guard.abort_reason = ""
                             continue
                         final_text = (
-                            f"（已达工具调用次数上限 {self.max_tool_calls} 轮，本轮未产出最终文本。"
-                            f"空转保护：{_guard.abort_reason}，已强制中止以避免重复探测。"
+                            f"（空转保护二次触发：在软提醒后仍继续相同操作无新事实产出，"
+                            f"已强制中止以避免重复探测。"
                             "已确认发现已写入黑板，后续波次将基于黑板继续。）"
                         )
                         yield AgentEvent(type="text", content=final_text)
@@ -2174,8 +2205,7 @@ class Agent:
 
             yield AgentEvent(type="done", content=final_text)
             await self._emit("on_done", self, final_text)
-            # ── 经验自动提炼 (P1) ──
-            await self._try_auto_refine(client, user_message, final_text)
+            # 记忆学习已改为会话结束触发（见模块级 learn_session），非每回合
             if not suppress_session_end:
                 self._log_event("session/end", reason="done")
             self._save_memory(history, final_text)
@@ -2184,3 +2214,73 @@ class Agent:
             if not suppress_session_end:
                 self._log_event("session/end", reason="error", error=str(exc))
             raise
+
+
+async def learn_session(session_log, *, session_id: str = "",
+                        agent_key: str = "", client=None) -> dict:
+    """会话结束时把整段会话轨迹一次性沉淀为 Episode 并提炼经验。
+
+    与原先「每回合学习」的区别：每回合都会固化一个 Episode，而采集源是
+    整个 session_log，导致第 N 个 Episode 是第 N-1 个的超集——长会话会产出
+    大量互相包含、内容高度重叠的 Episode 与经验。改为会话结束时学习一次，
+    一个会话只沉淀一份完整轨迹。
+
+    由 API 层在会话删除或空闲超时时调用（见 api.app._finalize_session_learning），
+    幂等由调用方保证（同一 session 只学一次）。
+    """
+    svc = _svc_get("memory_service")
+    if svc is None:
+        return {"skipped": "no-memory-service"}
+    raw = Agent.collect_session_events(session_log)
+    if not raw:
+        return {"skipped": "empty-session"}
+    # 会话主题=首个用户提问；结论=最后一条助手回复
+    user_msgs = [str(e.get("content") or "")
+                 for e in raw if e.get("kind") == "user/message"]
+    agent_msgs = [str(e.get("content") or "")
+                  for e in raw if e.get("kind") == "agent/response"]
+    task = (user_msgs[0] if user_msgs else "").strip()[:400]
+    result_text = (agent_msgs[-1] if agent_msgs else "").strip()
+    # 会话首条 user/message 是任务描述本身，不是「人工纠正」。若把它也算作
+    # user_hint，则任何会话都会被判定 human_assisted——该信号将恒为真、
+    # 完全失去区分度。故首条只作 task，后续发言才算人工介入。
+    dropped_first_user = False
+    trimmed: list[dict] = []
+    for e in raw:
+        if e.get("kind") == "user/message" and not dropped_first_user:
+            dropped_first_user = True
+            continue
+        trimmed.append(e)
+    events = Agent.normalize_log_events(trimmed)
+    if client is None:
+        try:
+            from baize.sdk.client import LLMClient
+
+            client = LLMClient()
+        except Exception:  # noqa: BLE001
+            client = None  # 无可用模型时退化为规则提炼，仍会留下 Episode
+    try:
+        out = await svc.learn_events(
+            events=events,
+            task=task,
+            agent_key=agent_key,
+            session_id=session_id or getattr(session_log, "session_id", ""),
+            result_text=result_text,
+            error_text="",
+            status="failed" if not result_text else "success",
+            client=client,
+        )
+        logger.info("会话记忆已学习: session=%s task=%s steps=%d",
+                    session_id or "-", task[:60] or "(空)", len(events))
+        # 经验自动演化：学习后顺带检查是否有同类经验可以合并概括。此前
+        # consolidate 只挂在手动端点，同类经验只增不演化、无限堆积。
+        try:
+            merged = await svc.auto_consolidate()
+            if merged:
+                logger.info("自动合并已触发: %d 组", len(merged))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("经验自动合并异常: %s", exc)
+        return out
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("会话记忆学习异常: %s", exc)
+        return {"skipped": "error", "error": str(exc)}

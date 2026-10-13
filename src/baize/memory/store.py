@@ -227,6 +227,47 @@ class MemoryStore:
         recs.sort(key=lambda r: r.get("last_seen") or "", reverse=True)
         return recs
 
+    def delete_entities(self, keys: Iterable[str]) -> int:
+        """删除实体及其相关边（资产清理用）。
+
+        连边一起删是必须的：只删实体会留下指向空节点的悬空边，BFS 遍历时把它
+        们当成普通邻居，图距离反而被污染——清理比不清理更糟。
+        """
+        self._reload_graph()
+        keyset = set(keys)
+        removed = 0
+        for k in keyset:
+            if self._entities.pop(k, None) is not None:
+                removed += 1
+        for rid, r in list(self._relations.items()):
+            if r.get("source") in keyset or r.get("target") in keyset:
+                self._relations.pop(rid, None)
+        if removed:
+            self._persist_graph()
+        return removed
+
+    def delete_relations_of(self, sources: Iterable[str],
+                            rel_types: Optional[Iterable[str]] = None) -> int:
+        """删除指定源节点发出的边（重挂实体前清理旧边）。
+
+        可按关系类型过滤：重挂只影响 MENTIONS，不该连带删掉 SUPPORTS /
+        SUPERSEDES 这些承载演化历史、删了就找不回来的边。
+        """
+        self._reload_graph()
+        src_set = set(sources)
+        types = set(rel_types) if rel_types else None
+        removed = 0
+        for rid, r in list(self._relations.items()):
+            if r.get("source") not in src_set:
+                continue
+            if types is not None and r.get("type") not in types:
+                continue
+            self._relations.pop(rid, None)
+            removed += 1
+        if removed:
+            self._persist_graph()
+        return removed
+
     # ---- 统计 --------------------------------------------------------------
     def stats(self) -> dict:
         episodes = self._list_records("episodes")

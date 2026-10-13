@@ -55,7 +55,11 @@ class ReceiverStore:
         return cls._instance
 
     def __init__(self):
-        self._base = Path(os.path.expanduser("~/.baize"))
+        from baize.config import DEFAULT_BAIZE_DIR
+
+        # 跟随 BAIZE_DATA_DIR：与 sessions / model.json 等落在同一处，
+        # 避免设置 BAIZE_DATA_DIR 后接收器配置仍写 HOME（数据分裂）
+        self._base = DEFAULT_BAIZE_DIR
         self._base.mkdir(parents=True, exist_ok=True)
         self._path = self._base / "receivers.json"
         self._data: dict[str, ReceiverConfig] = {}
