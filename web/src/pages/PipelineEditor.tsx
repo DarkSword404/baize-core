@@ -1250,6 +1250,7 @@ interface CanvasNode {
   max_concurrency?: number;
   target?: string;
   error_target?: string;
+  on_error?: string;
   ignore_error?: boolean;
   // 结束对话节点：true=保留归档，false/缺省=运行完成后回收
   save_dialog?: boolean;
@@ -1714,7 +1715,9 @@ function CreatePipelineModal({ initial, onClose, onCreated, onUpdated, showFeedb
           if (nn.parallel_branches) nn.parallel_branches = nn.parallel_branches.filter(Boolean);
           if (nn.confirm_branches) {
             const cb: Record<string, string> = {};
-            Object.entries(nn.confirm_branches).forEach(([k, v]) => { if (v) cb[k] = v; });
+            Object.entries(nn.confirm_branches as Record<string, unknown>).forEach(([k, v]) => {
+              if (typeof v === 'string' && v) cb[k] = v;
+            });
             nn.confirm_branches = Object.keys(cb).length ? cb : undefined;
           }
           if (nn.target === '') delete nn.target;
@@ -2225,7 +2228,7 @@ function NodeConfigForm({ node, onChange, allNodes }: {
   );
 }
 
-function BranchesEditor({ node, onChange, allNodes }: {
+function BranchesEditor({ node, onChange, allNodes: _allNodes }: {
   node: CanvasNode;
   onChange: (u: Partial<CanvasNode>) => void;
   allNodes?: CanvasNode[];

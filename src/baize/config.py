@@ -72,9 +72,10 @@ class SingleModelConfig:
     压缩为语义摘要（比机械截断更保信息，但会多消耗一次模型调用）。
 
     ``embedding_model``: 长期记忆语义检索用的向量模型，与聊天模型 ``model``
-    是两回事（聊天模型做不了 embedding）。留空则回退到
-    ``baize.memory.embed.DEFAULT_EMBEDDING_MODEL``；环境变量
-    BAIZE_EMBEDDING_MODEL 优先级高于此配置，便于运维临时覆盖。
+    是两回事（聊天模型做不了 embedding）。留空时默认不启用语义通道，
+    检索走 BM25；显式设置后才会请求 ``/v1/embeddings``。环境变量
+    BAIZE_EMBEDDING_MODEL 优先级高于此配置，便于运维临时覆盖；
+    BAIZE_EMBEDDING_ENABLED=0/1 可强制关闭/开启。
     """
 
     base_url: str = ""
@@ -140,6 +141,13 @@ class ServerConfig:
     port: int = field(default_factory=lambda: int(os.getenv("BAIZE_PORT", "8001")))
     require_auth: bool = field(
         default_factory=lambda: os.getenv("BAIZE_API_REQUIRE_AUTH", "1").lower()
+        in ("1", "true", "yes")
+    )
+    # 流水线编排（orchestration）功能开关。
+    # 当前产品阶段聚焦 CTF / 渗透对话，默认关闭；代码与历史数据完整保留，
+    # 设置 BAIZE_ENABLE_PIPELINES=1 即可恢复，无需改代码或迁移数据库。
+    enable_pipelines: bool = field(
+        default_factory=lambda: os.getenv("BAIZE_ENABLE_PIPELINES", "0").lower()
         in ("1", "true", "yes")
     )
     # 前端 Vite 开发地址（用于凭证登录 URL 提示）

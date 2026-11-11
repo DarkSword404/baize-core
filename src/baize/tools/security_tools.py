@@ -15,12 +15,37 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
+import tempfile
 from typing import Optional
 
 from baize.executors import ExecutorConfig, build_executor
 from baize.tools.registry import register_tool
 
 logger = logging.getLogger("baize.tools.security")
+
+
+class ToolBinaryMissing(RuntimeError):
+    """工具依赖的系统二进制未安装。
+
+    抛出后由 agent 主循环的自动安装自洽修复（``auto_install``）识别并
+    尝试安装 + 重试一次，避免返回裸 ``exit=127`` 报错让模型反复无效重试。
+    """
+
+    def __init__(self, binary: str) -> None:
+        self.binary = binary
+        super().__init__(f"command not found: {binary}")
+
+
+def _is_binary_available(binary: str) -> bool:
+    """预检命令是否存在于 PATH。
+
+    只对纯命令名预检；含路径或 shell 元字符的输入不做预检（交由执行器
+    按原样处理），避免误伤。
+    """
+    if not binary or "/" in binary or any(c in binary for c in " \t|&;<>$`"):
+        return True
+    return shutil.which(binary) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +86,12 @@ async def _run_tool(
     timeout: int = 120,
     config: Optional[ExecutorConfig] = None,
 ) -> str:
-    """构造命令并通过执行器运行（含危险参数校验）。"""
+    """构造命令并通过执行器运行（含危险参数校验 + 二进制缺失预检）。"""
+    # 二进制缺失预检：直接抛出可识别的缺失异常，交由 agent 主循环的
+    # auto_install 自洽修复（安装 + 重试一次）处理，避免返回裸 exit=127
+    # 报错导致模型反复无效重试、白烧预算。
+    if not _is_binary_available(binary):
+        raise ToolBinaryMissing(binary)
     command = " ".join([binary] + args)
     blocked = _check_command(tool_name, command)
     if blocked:
@@ -139,15 +169,130 @@ async def nuclei_scan(
 
 @register_tool(
     description=(
-        "使用 nikto 执行 Web 服务器漏洞扫描（发现过期组件、错误配置、敏感文件）。"
-        "参数: url 目标 URL(如 https://example.com); 输出包含发现的风险项列表。"
+        "对目标 Web 服务器执行轻量级安全配置扫描（纯 Python 实现，速度远快于外部 nikto，"
+        "覆盖敏感文件暴露、安全响应头缺失、危险 HTTP 方法、服务版本信息泄露、"
+        "Cookie 安全标志、目录列表等）。参数: url 目标 URL(如 https://example.com);"
+        "输出以 + 开头的问题清单。"
     ),
     category="security",
-    tags=["web", "vuln", "nikto"],
+    tags=["web", "vuln", "nikto", "misconfig"],
 )
 async def nikto_scan(url: str, timeout: int = 180) -> str:
-    """nikto Web 服务器扫描。"""
-    return await _run_tool("nikto", "nikto", ["-h", url], timeout=timeout)
+    """轻量 Web 服务器安全配置扫描（纯 Python，替代慢速外部 nikto）。"""
+    import asyncio as _asyncio
+    import re as _re
+
+    import httpx as _httpx
+
+    target = str(url).strip()
+    if not target:
+        return "未提供目标 URL"
+    if not target.startswith(("http://", "https://")):
+        target = "http://" + target
+    target = target.rstrip("/")
+
+    findings: list[str] = []
+    client_timeout = min(int(timeout) if timeout else 20, 20)
+    async with _httpx.AsyncClient(
+        timeout=client_timeout, follow_redirects=False, verify=False  # noqa: S501
+    ) as client:
+        try:
+            base = await client.get(target + "/")
+        except Exception as exc:  # noqa: BLE001
+            return f"[nikto 请求失败] {type(exc).__name__}: {str(exc)[:120]}"
+
+        server = base.headers.get("server", "")
+        if server:
+            findings.append(f"+ Server: {server}")
+            if _re.search(r"[0-9]+\.[0-9]+", server):
+                findings.append("+ 服务器精确版本号暴露，建议隐藏（ServerTokens/ServerSignature）")
+        powered = base.headers.get("x-powered-by", "")
+        if powered:
+            findings.append(f"+ X-Powered-By: {powered}（技术栈信息泄露）")
+
+        # 1) 安全响应头缺失
+        sec_headers = {
+            "x-content-type-options": "X-Content-Type-Options",
+            "x-frame-options": "X-Frame-Options",
+            "content-security-policy": "Content-Security-Policy",
+            "referrer-policy": "Referrer-Policy",
+            "permissions-policy": "Permissions-Policy",
+        }
+        if target.startswith("https://"):
+            sec_headers["strict-transport-security"] = "Strict-Transport-Security"
+        for key, label in sec_headers.items():
+            if key not in base.headers:
+                findings.append(f"+ 缺少安全响应头: {label}")
+
+        # 2) Cookie 安全标志
+        for sc in base.headers.get_list("set-cookie"):
+            ck_name = sc.split("=", 1)[0].strip() or "(cookie)"
+            low = sc.lower()
+            missing = [f for f in ("httponly", "secure", "samesite") if f not in low]
+            if missing:
+                findings.append(f"+ Cookie {ck_name} 缺少安全标志: {', '.join(missing)}")
+
+        # 3) 危险 HTTP 方法
+        try:
+            opt = await client.request("OPTIONS", target + "/")
+            allow = opt.headers.get("allow", "")
+            if allow:
+                findings.append(f"+ 可用的 HTTP 方法(Allow): {allow}")
+                for risky in ("PUT", "DELETE", "TRACE"):
+                    if risky in allow.upper():
+                        findings.append(f"+ 启用潜在危险方法: {risky}")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # 4) 目录列表
+        if _re.search(r"<title>\s*Index of|Index of /", base.text or "", _re.I):
+            findings.append("+ 目录列表(Directory Listing)开启")
+
+        # 5) 敏感文件/路径探测（并发）
+        paths = [
+            "/.git/config", "/.env", "/web.config", "/config.php.bak",
+            "/phpinfo.php", "/info.php", "/test.php",
+            "/server-status", "/server-info",
+            "/robots.txt", "/crossdomain.xml", "/sitemap.xml",
+            "/backup.zip", "/backup.tar.gz", "/db.sql", "/dump.sql",
+            "/admin/", "/administrator/", "/phpmyadmin/",
+            "/readme.html", "/README.md", "/package.json", "/.DS_Store",
+        ]
+
+        async def _probe(path: str):
+            try:
+                pr = await client.get(target + path)
+            except Exception:  # noqa: BLE001
+                return None
+            code = pr.status_code
+            if code not in (200, 204, 301, 302, 401, 403):
+                return None
+            snippet = ""
+            if code in (200, 204):
+                snippet = _re.sub(r"\s+", " ", (pr.text or "")[:80]).strip()
+            return (path, code, snippet)
+
+        for item in await _asyncio.gather(*[_probe(p) for p in paths]):
+            if not item:
+                continue
+            path, code, snippet = item
+            sensitive = any(k in path for k in (
+                ".git", ".env", "web.config", "backup", "dump", ".sql",
+                "config.", ".DS_Store", "phpinfo",
+            ))
+            if code in (200, 204) and sensitive:
+                findings.append(f"+ 敏感文件可访问(可能信息泄露): {path} ({code}) {snippet}")
+            elif code in (200, 204):
+                findings.append(f"+ 发现可访问路径: {path} ({code}) {snippet}")
+            else:
+                findings.append(f"+ 路径存在(需鉴权/重定向): {path} ({code})")
+
+    if not findings:
+        return f"[nikto] {target} 未发现明显安全配置问题（轻量扫描）"
+    return (
+        f"[nikto] {target} 轻量安全配置扫描（共 {len(findings)} 项）:\n"
+        + "\n".join(findings)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +328,55 @@ async def sqlmap_check(
 # 目录爆破 / 枚举
 # ---------------------------------------------------------------------------
 
+_COMMON_WORDLIST_PATHS = (
+    "/usr/share/wordlists/dirb/common.txt",
+    "/usr/share/dirb/wordlists/common.txt",
+    "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt",
+    "/usr/share/seclists/Discovery/Web-Content/common.txt",
+    "/usr/share/seclists/Discovery/Web-Content/raft-small-words.txt",
+    "/usr/share/wordlists/seclists/Discovery/Web-Content/common.txt",
+)
+
+# 外部字典缺失时的最小内置字典。它不是完整爆破集，只保证枚举不会因
+# “文件不存在”直接失败；agent 仍应继续用 http_request 验证命中结果。
+_BUILTIN_WORDLIST = (
+    "admin", "administrator", "login", "signin", "logout", "register",
+    "api", "api/v1", "portal", "home", "dashboard", "console", "manage",
+    "user", "users", "account", "profile", "settings", "config", "backup",
+    "static", "assets", "uploads", "download", "downloads", "files",
+    "robots.txt", "sitemap.xml", ".well-known", ".well-known/security.txt",
+    "health", "healthz", "status", "metrics", "debug", "test", "dev",
+    "graphql", "swagger", "swagger.json", "openapi.json", "api-docs",
+    "actuator", "actuator/health", "server-status", "phpinfo.php",
+    "wp-admin", "wp-login.php", "xmlrpc.php", "git", ".git/config",
+    ".env", "web.config", "crossdomain.xml", "favicon.ico",
+)
+
+
+def _resolve_wordlist(path: str) -> tuple[str, str]:
+    """返回可用字典路径及提示。
+
+    优先使用调用方指定且真实存在的路径；否则在常见字典位置中查找；
+    都没有时生成一个最小内置字典，避免 gobuster 因 “wordlist does not exist”
+    直接中止整个枚举方向。
+    """
+    requested = os.path.expanduser(str(path or "").strip())
+    if requested and os.path.isfile(requested):
+        return requested, ""
+
+    for candidate in _COMMON_WORDLIST_PATHS:
+        if os.path.isfile(candidate):
+            return candidate, f"[gobuster] 指定字典不存在，已改用 {candidate}"
+
+    fd, fallback = tempfile.mkstemp(prefix="baize-gobuster-", suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(_BUILTIN_WORDLIST) + "\n")
+    return fallback, (
+        "[gobuster] 指定字典和常见字典均不存在，已使用内置最小字典；"
+        "结果只覆盖常见路径，请结合 http_request 继续验证"
+    )
+
+
 @register_tool(
     description=(
         "使用 gobuster 执行目录/子域名枚举（基于字典）。"
@@ -199,12 +393,14 @@ async def gobuster_enum(
     timeout: int = 300,
 ) -> str:
     """gobuster 目录 / 子域名枚举。"""
+    resolved_wordlist, note = _resolve_wordlist(wordlist)
     args = []
     if mode == "dns":
-        args = ["dns", "-d", url, "-w", wordlist]
+        args = ["dns", "-d", url, "-w", resolved_wordlist]
     else:
-        args = ["dir", "-u", url, "-w", wordlist]
-    return await _run_tool("gobuster", "gobuster", args, timeout=timeout)
+        args = ["dir", "-u", url, "-w", resolved_wordlist]
+    result = await _run_tool("gobuster", "gobuster", args, timeout=timeout)
+    return f"{note}\n{result}" if note else result
 
 
 # ---------------------------------------------------------------------------

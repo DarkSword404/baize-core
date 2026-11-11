@@ -190,6 +190,24 @@ class AuthManager:
                 return False
             return True
 
+    def username_for_token(self, token: str) -> str | None:
+        """将 API Token 解析为用户名（仅用于审计，不暴露给业务）。"""
+        if not token:
+            return None
+        with self._lock:
+            sess = self._sessions.get(token)
+            if sess is None:
+                return None
+            try:
+                expires = datetime.fromisoformat(sess.expires_at)
+            except (ValueError, TypeError):
+                expires = None
+            if expires is not None and expires <= datetime.now(timezone.utc):
+                self._sessions.pop(token, None)
+                return None
+            user = self._users.get(sess.user_id)
+            return user.username if user is not None else None
+
     def validate_password(self, username: str, password: str) -> bool:
         for u in self._users.values():
             if u.username == username:

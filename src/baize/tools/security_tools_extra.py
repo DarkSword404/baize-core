@@ -15,7 +15,10 @@
 
 from __future__ import annotations
 
+import html
+import re
 from typing import Optional
+from urllib.parse import urljoin
 
 from baize.tools.registry import register_tool
 from baize.tools.security_tools import _run_tool
@@ -220,17 +223,124 @@ async def ssl_cert_info(host: str, port: int = 443, timeout: int = 60) -> str:
     return await _run_tool("openssl", "openssl", args, timeout=timeout)
 
 
+# Web 指纹签名库：(插件名, 匹配源, 正则, 版本捕获组索引或 None)
+# 匹配源: "server"=Server 头, "x-powered-by"=X-Powered-By 头, "html"=响应正文
+_WEB_FINGERPRINTS: list[tuple[str, str, str, int | None]] = [
+    ("IIS", "server", r"microsoft-iis(?:/([0-9.]+))?", 1),
+    ("Nginx", "server", r"nginx(?:/([0-9.]+))?", 1),
+    ("Apache", "server", r"apache(?:/([0-9.]+))?", 1),
+    ("Tomcat", "server", r"(?:coyote|tomcat)(?:/([0-9.]+))?", 1),
+    ("Jetty", "server", r"jetty(?:\(([0-9.]+))?", 1),
+    ("OpenResty", "server", r"openresty(?:/([0-9.]+))?", 1),
+    ("LiteSpeed", "server", r"litespeed", None),
+    ("ASP.NET", "x-powered-by", r"asp\.net", None),
+    ("PHP", "x-powered-by", r"php(?:/([0-9.]+))?", 1),
+    ("Express", "x-powered-by", r"express", None),
+    ("WordPress", "html",
+     r'name=["\']generator["\'][^>]+content=["\']WordPress ?([0-9.]+)', 1),
+    ("WordPress", "html", r"/wp-(?:content|includes|login)", None),
+    ("Joomla", "html",
+     r'name=["\']generator["\'][^>]+content=["\']Joomla!? ?-? ?([0-9.]+)', 1),
+    ("Joomla", "html", r"/components/com_|/media/jui/", None),
+    ("Drupal", "html",
+     r'name=["\']Generator["\'][^>]+content=["\']Drupal ?([0-9.]+)', 1),
+    ("Drupal", "html", r"Drupal\.settings|/sites/default/files", None),
+    ("jQuery", "html", r"jquery[-.]?([0-9]+\.[0-9]+\.[0-9]+)?(?:\.min)?\.js", 1),
+    ("Bootstrap", "html",
+     r"bootstrap[-.]?([0-9]+\.[0-9]+\.[0-9]+)?(?:\.min)?\.(?:css|js)", 1),
+    ("Vue.js", "html", r"vue[-.]?([0-9]+\.[0-9]+\.[0-9]+)?(?:\.min)?\.js", 1),
+    ("React", "html", r"react[-.]?([0-9]+\.[0-9]+\.[0-9]+)?(?:\.min)?\.js", 1),
+    ("Angular", "html", r"angular[-.]?([0-9]+\.[0-9]+\.[0-9]+)?(?:\.min)?\.js", 1),
+    ("phpMyAdmin", "html", r"phpmyadmin", None),
+    ("Google Analytics", "html",
+     r"(?:google-analytics\.com|googletagmanager\.com)", None),
+    ("Cloudflare", "header", r"cloudflare", None),
+]
+
+
 @register_tool(
     description=(
-        "使用 whatweb 对目标 Web 应用进行指纹识别（CMS、框架、服务器、JS 库、版本）。"
+        "对目标 Web 应用进行指纹识别（CMS、框架、服务器、JS 库及版本）。"
+        "纯 Python 实现，不依赖外部 whatweb，速度快且结果确定。"
         "参数: url 目标 URL(如 https://example.com); 输出识别的技术栈与版本。"
     ),
     category="security",
     tags=["recon", "fingerprint", "whatweb", "web"],
 )
 async def whatweb_fingerprint(url: str, timeout: int = 120) -> str:
-    """whatweb Web 应用指纹识别。"""
-    return await _run_tool("whatweb", "whatweb", ["-v", url], timeout=timeout)
+    """Web 指纹识别（纯 Python，替代外部 whatweb）。"""
+    import re as _re
+
+    import httpx as _httpx
+
+    target = str(url).strip()
+    if not target:
+        return "未提供目标 URL"
+    if not target.startswith(("http://", "https://")):
+        target = "https://" + target
+
+    async def _fetch(u: str):
+        async with _httpx.AsyncClient(
+            timeout=min(int(timeout) if timeout else 20, 20),
+            follow_redirects=True,
+            verify=False,  # noqa: S501
+        ) as client:
+            return await client.get(u)
+
+    try:
+        resp = await _fetch(target)
+    except Exception as exc:  # noqa: BLE001
+        # https 失败回退 http
+        if target.startswith("https://"):
+            fallback = "http://" + target[len("https://"):]
+            try:
+                resp = await _fetch(fallback)
+                target = fallback
+            except Exception as exc2:  # noqa: BLE001
+                return f"[whatweb 请求失败] {type(exc2).__name__}: {str(exc2)[:120]}"
+        else:
+            return f"[whatweb 请求失败] {type(exc).__name__}: {str(exc)[:120]}"
+
+    body = resp.text[:50000]
+    server = resp.headers.get("server", "")
+    powered = resp.headers.get("x-powered-by", "")
+    header_blob = "\n".join(f"{k}: {v}" for k, v in resp.headers.items())
+
+    def _haystack(src: str) -> str:
+        if src == "html":
+            return body
+        if src == "server":
+            return server
+        if src == "x-powered-by":
+            return powered
+        return header_blob
+
+    plugins: list[str] = []
+    for name, src, pattern, vgrp in _WEB_FINGERPRINTS:
+        m = _re.search(pattern, _haystack(src), _re.I)
+        if not m:
+            continue
+        ver = ""
+        if vgrp is not None:
+            try:
+                ver = m.group(vgrp) or ""
+            except (IndexError, _re.error):
+                ver = ""
+        label = f"{name}[{ver}]" if ver else name
+        if label not in plugins:
+            plugins.append(label)
+
+    m_title = _re.search(r"<title[^>]*>(.*?)</title>", body, _re.I | _re.S)
+    title = _re.sub(r"\s+", " ", m_title.group(1)).strip()[:80] if m_title else ""
+
+    parts = [f"{target} [{resp.status_code}]"]
+    if title:
+        parts.append(f"Title[{title}]")
+    if plugins:
+        parts.append(", ".join(plugins))
+    elif not title:
+        parts.append("未识别到已知指纹")
+    return " | ".join(parts)
 
 
 @register_tool(
@@ -513,6 +623,92 @@ async def hashid_identify(hash_value: str, timeout: int = 30) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Web 证据提取（纯 Python，无外部命令）
+# ---------------------------------------------------------------------------
+
+@register_tool(
+    description=(
+        "从 HTML/JavaScript 文本中提取 Web 攻击面证据：script src、link href、"
+        "form action/method/input、同源/绝对 URL、/api/ 路径、常见端点。"
+        "参数: content HTML/JS 原文; base_url 可选，用于把相对路径转成绝对 URL。"
+        "只做解析，不发请求，不判断漏洞。适合在 http_request 拿到页面后调用。"
+    ),
+    category="security",
+    tags=["web", "recon", "html", "javascript", "artifacts"],
+)
+def extract_web_artifacts(content: str, base_url: str = "") -> str:
+    """从 HTML/JS 文本提取表单、脚本、链接和 API 路径。"""
+    text = str(content or "")
+    if not text.strip():
+        return "(空内容，未提取到任何 Web 证据)"
+
+    def _attr_value(tag: str, name: str) -> list[str]:
+        values: list[str] = []
+        for m in re.finditer(
+            rf"\b{name}\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s>]+))",
+            tag,
+            flags=re.IGNORECASE,
+        ):
+            value = next((v for v in m.groups() if v is not None), "")
+            value = html.unescape(value).strip()
+            if value:
+                values.append(value)
+        return values
+
+    def _absolute(value: str) -> str:
+        if not value:
+            return value
+        if base_url and value.startswith("/"):
+            return urljoin(base_url, value)
+        return value
+
+    scripts: list[str] = []
+    links: list[str] = []
+    forms: list[str] = []
+    for tag in re.findall(r"<script\b[^>]*>", text, flags=re.IGNORECASE):
+        scripts.extend(_attr_value(tag, "src"))
+    for tag in re.findall(r"<link\b[^>]*>", text, flags=re.IGNORECASE):
+        links.extend(_attr_value(tag, "href"))
+    for form_match in re.finditer(
+        r"<form\b([^>]*)>(.*?)</form>", text, flags=re.IGNORECASE | re.DOTALL
+    ):
+        attrs, body = form_match.group(1), form_match.group(2)
+        action = (_attr_value(attrs, "action") or [""])[0]
+        method = ((_attr_value(attrs, "method") or ["GET"])[0] or "GET").upper()
+        fields: list[str] = []
+        for inp in re.findall(r"<input\b[^>]*>", body, flags=re.IGNORECASE):
+            name = (_attr_value(inp, "name") or [""])[0]
+            typ = (_attr_value(inp, "type") or ["text"])[0]
+            if name:
+                fields.append(f"{name}:{typ}")
+        forms.append(f"{method} {_absolute(action) or '(no action)'} fields=[{', '.join(fields)}]")
+
+    api_paths = sorted({
+        html.unescape(p)
+        for p in re.findall(r"""(?<![\w])/(?:api|rest|graphql|v\d+)[A-Za-z0-9_?&=./:{}\-]*""", text)
+    })
+    urls = sorted({
+        html.unescape(u)
+        for u in re.findall(r"https?://[^\s\"'<>]+", text)
+    })
+
+    parts: list[str] = []
+    if scripts:
+        parts.append("## Scripts\n" + "\n".join(f"- {_absolute(s)}" for s in dict.fromkeys(scripts)))
+    if links:
+        parts.append("## Links\n" + "\n".join(f"- {_absolute(s)}" for s in dict.fromkeys(links)))
+    if forms:
+        parts.append("## Forms\n" + "\n".join(f"- {f}" for f in dict.fromkeys(forms)))
+    if api_paths:
+        parts.append("## API paths\n" + "\n".join(f"- {p}" for p in api_paths))
+    if urls:
+        parts.append("## Absolute URLs\n" + "\n".join(f"- {u}" for u in urls[:30]))
+    if not parts:
+        return "(未提取到 script/form/link/API 路径；可能需要先拿到完整 HTML 或 JS 内容)"
+    return "\n\n".join(parts)[:6000]
+
+
+# ---------------------------------------------------------------------------
 # 确保模块导入即注册
 # ---------------------------------------------------------------------------
 
@@ -537,4 +733,5 @@ __all__ = [
     "binwalk_analyze",
     "john_crack",
     "hashid_identify",
+    "extract_web_artifacts",
 ]

@@ -72,10 +72,26 @@ export const toolNameCN: Record<string, string> = {
   'shodan_host_info': 'Shodan 主机详情',
   'fetch_url': 'URL 内容获取',
   'http_request': 'HTTP 请求',
+  'http_probe': 'Web 存活探测',
+  'whatweb_fingerprint': 'Web 指纹识别',
   'web_request_framework': 'HTTP 请求安全分析',
 
   // ---- 渗透 / 扫描 ----
   'port_scan': '端口扫描',
+  'nmap_scan': 'Nmap 扫描',
+  'dns_lookup': 'DNS 查询',
+  'ssl_cert_info': 'TLS 证书信息',
+  'gobuster_enum': '目录枚举',
+  'nikto_scan': 'Nikto 配置扫描',
+  'waf_detect': 'WAF 检测',
+
+  // ---- 黑板 / 编排 ----
+  'read_blackboard': '读取证据黑板',
+  'write_fact': '写入证据事实',
+  'confirm_finding': '确认漏洞',
+  'load_tool': '加载工具',
+  'search_worker_traces': '检索历史轨迹',
+  'record_coverage': '记录覆盖度',
 
   // ---- 共享协作浏览器 ----
   'shared_browser_open': '打开浏览器',

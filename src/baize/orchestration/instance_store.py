@@ -196,12 +196,9 @@ class PipelineInstanceStore:
                 return None
             snapshot = copy.deepcopy(template or {})
             snapshot.setdefault("id", inst.template_id)
-            # 名称、描述、类型跟随模板版本同步
+            # 只同步图定义与类型；实例名/描述属于用户资产，必须保留
+            #（此前会把用户重命名的实例改回模板名）。
             inst.template_snapshot = snapshot
-            if template.get("name"):
-                inst.name = template["name"]
-            if template.get("description") is not None:
-                inst.description = template.get("description", "")
             if template.get("type"):
                 inst.type = str(template["type"])
             inst.updated_at = time.time()

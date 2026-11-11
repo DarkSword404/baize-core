@@ -279,7 +279,9 @@ class MemoryStore:
             "experiences": len(experiences),
             "experiences_active": sum(1 for r in experiences if r.get("status") == "active"),
             "experiences_draft": sum(1 for r in experiences if r.get("status") == "draft"),
+            "experiences_superseded": sum(1 for r in experiences if r.get("status") == "superseded"),
             "facts": len(facts),
+            "facts_active": sum(1 for r in facts if r.get("status") == "active"),
             "entities": len(self._entities),
             "relations": len(self._relations),
         }

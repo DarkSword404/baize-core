@@ -904,7 +904,17 @@ class ExecutorConfig:
         支持 ``BAIZE_EXEC_SANDBOX`` 设置默认隔离等级。
         """
         backend = os.environ.get(f"{prefix}BACKEND", "local")
-        sandbox = os.environ.get(f"{prefix}SANDBOX", SandboxMode.DANGER_FULL_ACCESS.value)
+        _sandbox_env = os.environ.get(f"{prefix}SANDBOX")
+        sandbox = _sandbox_env or SandboxMode.DANGER_FULL_ACCESS.value
+        if not _sandbox_env and backend == "local":
+            # 不改变默认行为（本地执行是渗透场景的刚需），但必须让运维显式知情：
+            # 该组合等价于"宿主机任意命令执行"，且无内核级隔离。
+            logger.warning(
+                "执行沙箱未显式配置，本地后端将使用 danger_full_access"
+                "（宿主机任意命令执行，无隔离）。生产环境请设置 "
+                "BAIZE_EXEC_SANDBOX=workspace_write/read_only 并安装 bwrap，"
+                "或改用 BAIZE_EXEC_BACKEND=docker。"
+            )
         # 校验 sandbox 值，非法则回退并告警
         try:
             SandboxMode(sandbox)

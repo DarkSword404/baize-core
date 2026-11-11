@@ -6,8 +6,10 @@ import type { PromptRequest, ReasoningStep, AttachmentInfo } from '../api/client
 import { ChatMessage } from '../components/ChatMessage';
 import { CreateSessionModal } from '../components/CreateSessionModal';
 import { AttackMap } from '../components/AttackMap';
+import { SituationPanel } from '../components/SituationPanel';
 import type { ChatMessage as ChatMessageType, IntermediateData } from '../types';
 import { agentNameCN, toolNameCN } from '../i18n/translations';
+import { buildToolActivities } from '../lib/toolActivity';
 import type { JSX } from 'react';
 
 function genId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
@@ -74,6 +76,9 @@ function buildChatMessage(h: any, fallbackTimestamp: string): ChatMessageType | 
         itemType: 'function_call',
         label: `${toolName}`,
         detail: args || '(无参数)',
+        toolName: rawTool,
+        callId: h.call_id || h.id || '',
+        agent: h.agent || h.agent_label || '',
       }],
     };
   }
@@ -88,8 +93,12 @@ function buildChatMessage(h: any, fallbackTimestamp: string): ChatMessageType | 
       timestamp: ts,
       intermediates: [{
         itemType: 'function_call_output',
-        label: raw ? raw.slice(0, 80) + (raw.length > 80 ? '...' : '') : '(无输出)',
+        label: h.name ? `${toolNameCN[h.name] || h.name} 输出` : '工具输出',
         detail: raw || '(无输出)',
+        toolName: h.name || '',
+        callId: h.call_id || h.id || '',
+        duration: typeof h.duration === 'number' ? h.duration : undefined,
+        agent: h.agent || h.agent_label || '',
       }],
     };
   }
@@ -166,6 +175,40 @@ function buildChatMessage(h: any, fallbackTimestamp: string): ChatMessageType | 
   return null;
 }
 
+/**
+ * 历史消息重建：把连续的 function_call / function_call_output 合并到同一条
+ * “工具”消息里，避免刷新后每次工具调用都变成一个独立空气泡；同时保留
+ * reasoning 作为独立中间产物，最终 assistant 正文保持原样。
+ */
+function buildChatMessages(history: any[], fallbackTimestamp: string): ChatMessageType[] {
+  const result: ChatMessageType[] = [];
+  let toolGroup: ChatMessageType | null = null;
+
+  for (const h of history) {
+    const itemType = h?.type || '';
+    if (itemType === 'function_call' || itemType === 'function_call_output') {
+      const built = buildChatMessage(h, fallbackTimestamp);
+      if (!built) continue;
+      if (!toolGroup) {
+        toolGroup = {
+          id: genId(),
+          role: 'tool',
+          content: '',
+          timestamp: built.timestamp,
+          intermediates: [],
+        };
+        result.push(toolGroup);
+      }
+      toolGroup.intermediates = [...(toolGroup.intermediates || []), ...(built.intermediates || [])];
+      continue;
+    }
+    toolGroup = null;
+    const built = buildChatMessage(h, fallbackTimestamp);
+    if (built) result.push(built);
+  }
+  return result;
+}
+
 export function Chat(): JSX.Element {
   const {
     sessions, setSessions, activeSessionId, setActiveSessionId,
@@ -202,6 +245,8 @@ export function Chat(): JSX.Element {
 
   // Reasoning timeline panel
   const [reasoningPanelOpen, setReasoningPanelOpen] = useState(false);
+  // Situation plugin panel (dynamic task state, read-only projection)
+  const [situationPanelOpen, setSituationPanelOpen] = useState(false);
   // Shared browser side panel (bound to current session)
   const [browserPanelOpen, setBrowserPanelOpen] = useState(false);
   const [attackMapOpen, setAttackMapOpen] = useState(false);
@@ -214,6 +259,14 @@ export function Chat(): JSX.Element {
   const allSteps = messages.flatMap((m, mi) =>
     (m.intermediates || []).map((s, si) => ({ ...s, _msgIdx: mi, _stepIdx: si, _ts: m.timestamp }))
   );
+  const toolCallCount = allSteps.filter(s => s.itemType === 'function_call').length;
+  // 正在执行的工具：给输入框上方提供一眼可见的实时状态
+  const liveActivities = (() => {
+    const streamingMsg = [...messages].reverse().find(m => m.isStreaming);
+    if (!streamingMsg) return [];
+    return buildToolActivities(streamingMsg.intermediates, true);
+  })();
+  const runningActivity = [...liveActivities].reverse().find(a => a.status === 'running');
 
   // Load sessions on mount; auto-restore last active session
   useEffect(() => {
@@ -245,10 +298,7 @@ export function Chat(): JSX.Element {
     getSession(activeSessionId, ac.signal)
       .then(detail => {
         if (ac.signal.aborted) return;
-        const msgs: ChatMessageType[] = detail.history
-          .map((h: any) => buildChatMessage(h, detail.created_at))
-          .filter(Boolean) as ChatMessageType[];
-        setMessages(msgs);
+        setMessages(buildChatMessages(detail.history || [], detail.created_at));
       })
       .catch((err: any) => {
         if (ac.signal.aborted || err?.name === 'AbortError') return;
@@ -511,6 +561,9 @@ export function Chat(): JSX.Element {
             itemType: 'function_call',
             label,
             detail: argsStr,
+            toolName: rawTool,
+            callId: step.call_id || '',
+            agent: step.agent || step.agent_label || '',
           };
         } else if (step.type === 'tool_output') {
           const outStr = typeof step.output === 'string'
@@ -518,8 +571,12 @@ export function Chat(): JSX.Element {
             : JSON.stringify(step.output || '', null, 2);
           intermediate = {
             itemType: 'function_call_output',
-            label: '工具输出',
+            label: step.tool ? `${toolNameCN[step.tool] || step.tool} 输出` : '工具输出',
             detail: outStr,
+            toolName: step.tool || '',
+            callId: step.call_id || '',
+            agent: step.agent || step.agent_label || '',
+            duration: typeof step.duration === 'number' ? step.duration : undefined,
           };
         } else if (step.type === 'handoff' || step.type === 'agent_switched') {
           const cnFrom = step.from_agent ? (agentNameCN[step.from_agent] || step.from_agent) : '?';
@@ -927,9 +984,22 @@ export function Chat(): JSX.Element {
                     ? 'bg-purple-600/10 border-purple-600/20 text-purple-400'
                     : 'bg-gray-800/50 border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
                 }`}
-                title="推理过程时间线"
+                title="执行与推理时间线"
               >
-                {allSteps.length > 0 ? `推理 (${allSteps.length})` : '推理'}
+                {allSteps.length > 0 ? `轨迹 (${allSteps.length})` : '轨迹'}
+              </button>
+              <button
+                onClick={() => setSituationPanelOpen(!situationPanelOpen)}
+                aria-label={`态势面板${situationPanelOpen ? '（已展开）' : '（已收起）'}`}
+                aria-expanded={situationPanelOpen}
+                className={`px-3 py-1.5 text-xs rounded-lg border transition-colors ${
+                  situationPanelOpen
+                    ? 'bg-cyan-600/10 border-cyan-600/20 text-cyan-400'
+                    : 'bg-gray-800/50 border-gray-700 text-gray-500 hover:text-gray-300 hover:border-gray-600'
+                }`}
+                title="动态任务态势（插件投影）"
+              >
+                态势
               </button>
               <button
                 onClick={() => setBrowserPanelOpen(!browserPanelOpen)}
@@ -1026,11 +1096,24 @@ export function Chat(): JSX.Element {
         {activeSessionId && (
           <div className="px-5 py-4 border-t border-gray-800 bg-gray-900/30">
             {isStreaming && (
-              <div className="max-w-3xl mx-auto mb-2 flex items-center gap-2">
+              <div className="max-w-3xl mx-auto mb-2 flex items-center gap-2 flex-wrap">
                 <div className="flex items-center gap-1.5 bg-amber-600/10 border border-amber-600/20 rounded-lg px-2.5 py-1">
                   <div className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
                   <span className="text-[11px] text-amber-400/80">AI 正在执行，输入指令可中途介入调整</span>
                 </div>
+                {runningActivity && (
+                  <div
+                    className="flex items-center gap-1.5 bg-blue-600/10 border border-blue-600/20 rounded-lg px-2.5 py-1 max-w-full"
+                    title={runningActivity.argsDetail || runningActivity.summary}
+                  >
+                    <span className="text-[11px] text-blue-300 flex-shrink-0">正在使用</span>
+                    <span className="text-[11px] font-mono text-blue-300 flex-shrink-0">{runningActivity.label}</span>
+                    <span className="text-[11px] text-gray-500 truncate">{runningActivity.summary}</span>
+                  </div>
+                )}
+                {toolCallCount > 0 && (
+                  <span className="text-[10px] text-gray-600">已执行 {toolCallCount} 次工具</span>
+                )}
               </div>
             )}
             {/* 待发送附件列表 */}
@@ -1141,7 +1224,7 @@ export function Chat(): JSX.Element {
           <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
             <div className="flex items-center gap-2">
               <div className="w-2 h-2 rounded-full bg-purple-400" />
-              <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">推理时间线</h2>
+              <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider">执行与推理</h2>
               {allSteps.length > 0 && (
                 <span className="text-[10px] bg-gray-800 px-1.5 py-0.5 rounded text-gray-500">{allSteps.length}步</span>
               )}
@@ -1249,6 +1332,15 @@ export function Chat(): JSX.Element {
             )}
           </div>
         </div>
+      )}
+
+      {/* ═══ 态势插件面板（动态任务状态投影）═══ */}
+      {activeSessionId && (
+        <SituationPanel
+          sessionId={activeSessionId}
+          open={situationPanelOpen}
+          onClose={() => setSituationPanelOpen(false)}
+        />
       )}
 
       {/* ═══ 共享浏览器侧窗口（与当前会话绑定）═══ */}

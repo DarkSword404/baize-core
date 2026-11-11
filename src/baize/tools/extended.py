@@ -215,7 +215,36 @@ def _http_request(
                 break
             else:
                 return "(重定向次数过多，已中止)"
-        return f"HTTP {resp.status_code}\n{resp.text[:5000]}"
+        content_type = str(resp.headers.get("content-type") or "")
+        body_text = resp.text or ""
+        # HTML 页面只截前 5000 字符时，script/form 往往正好落在截断之后，
+        # agent 会因此猜错 JS 路径。这里保留更多正文，并额外附加一份从完整
+        # 响应中提取的 script/form/link/API 摘要；纯解析，不改变响应事实。
+        head = f"HTTP {resp.status_code}\n"
+        key_headers = []
+        for name in ("server", "content-type", "location"):
+            value = resp.headers.get(name)
+            if value:
+                key_headers.append(f"{name}: {value}")
+        if key_headers:
+            head += "\n".join(key_headers) + "\n"
+        body = body_text[:8000]
+        content_type_l = content_type.lower()
+        if (
+            "html" in content_type_l
+            or "javascript" in content_type_l
+            or body_text.lstrip().startswith("<")
+            or "/api/" in body_text
+            or "fetch(" in body_text
+        ):
+            try:
+                from baize.tools.security_tools_extra import extract_web_artifacts
+                artifacts = extract_web_artifacts(body_text[:200_000], current)
+                if artifacts and not artifacts.startswith("(未提取"):
+                    body += "\n\n[自动提取的 Web 证据]\n" + artifacts[:4000]
+            except Exception:  # noqa: BLE001
+                pass
+        return head + body
     except Exception as e:  # noqa: BLE001
         return f"(请求失败: {e})"
 
@@ -256,7 +285,7 @@ def _shodan_search(query: str) -> str:
 
 
 def _port_scan(target: str, ports: str = "common") -> str:
-    """TCP 端口扫描。"""
+    """TCP 端口扫描（纯 Python 并发实现，支持单端口/逗号列表/端口范围）。"""
     import socket
     from concurrent.futures import ThreadPoolExecutor
 
@@ -265,10 +294,31 @@ def _port_scan(target: str, ports: str = "common") -> str:
     if ports == "common":
         port_list = common
     else:
-        try:
-            port_list = [int(p.strip()) for p in ports.split(",") if p.strip()]
-        except ValueError:
-            return "(无效端口列表)"
+        # 支持 "80,443"、"1-1000"、"1-100,8080" 等混合写法
+        port_list = []
+        for token in str(ports).split(","):
+            token = token.strip()
+            if not token:
+                continue
+            if "-" in token:
+                try:
+                    lo, hi = token.split("-", 1)
+                    lo, hi = int(lo), int(hi)
+                except ValueError:
+                    return "(无效端口范围)"
+                if lo > hi:
+                    lo, hi = hi, lo
+                port_list.extend(range(lo, hi + 1))
+            else:
+                try:
+                    port_list.append(int(token))
+                except ValueError:
+                    return "(无效端口列表)"
+        port_list = sorted({p for p in port_list if 1 <= p <= 65535})
+        if not port_list:
+            return "(未提供有效端口)"
+        if len(port_list) > 20000:
+            port_list = port_list[:20000]
 
     def _scan(p: int) -> int | None:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -280,8 +330,10 @@ def _port_scan(target: str, ports: str = "common") -> str:
         finally:
             s.close()
 
+    # 端口较多时提高并发，保证大范围扫描的速度
+    workers = 256 if len(port_list) > 500 else 50
     open_ports = []
-    with ThreadPoolExecutor(max_workers=50) as ex:
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         for r in ex.map(_scan, port_list):
             if r:
                 open_ports.append(r)
@@ -428,13 +480,16 @@ def extended_tools() -> list[AgentTool]:
         ),
         make_tool(
             "port_scan",
-            "对目标执行 TCP 端口扫描。",
+            "对目标执行 TCP 端口扫描（纯 Python 并发实现，无需外部 nmap，支持端口范围，速度快）。",
             _port_scan,
             {
                 "type": "object",
                 "properties": {
                     "target": {"type": "string", "description": "目标 IP/域名"},
-                    "ports": {"type": "string", "description": "端口列表"},
+                    "ports": {
+                        "type": "string",
+                        "description": "端口，支持 'common'、'80,443'、'1-1000'、'1-100,8080' 等写法",
+                    },
                 },
                 "required": ["target"],
             },

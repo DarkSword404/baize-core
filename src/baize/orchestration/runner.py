@@ -224,7 +224,8 @@ class PipelineRunner:
         asyncio.create_task(
             self._execute_resume(pipeline_def, run_id, choice)
         )
-        return record
+        # 返回最新状态（record 是更新前的快照，直接返回会误导前端仍为 paused）
+        return self._store.get(run_id) or record
 
     def _validate_prior_outputs(
         self,
@@ -239,6 +240,11 @@ class PipelineRunner:
         missing: list[str] = []
         for node in pipeline.nodes:
             rec = record.nodes.get(node.id) or {}
+            # 兼容旧数据：早期事件把节点函数的完整返回值（含 nodes 字典）
+            # 当成节点记录写入，形成 nodes.<id>.nodes.<id> 的嵌套结构。
+            nested = rec.get("nodes") if isinstance(rec, dict) else None
+            if isinstance(nested, dict) and isinstance(nested.get(node.id), dict):
+                rec = nested[node.id]
             if rec.get("status") != "completed":
                 continue  # 只校验已完成的节点
             if not (rec.get("output") or rec.get("data")):
@@ -465,6 +471,12 @@ class PipelineRunner:
         if node_id and event_type in ("node_started", "node_completed", "node_failed"):
             node_record = data.get("data", {})
             if isinstance(node_record, dict):
+                # node_completed 的 output 是节点函数的完整返回值（包含整个
+                # state["nodes"]）。这里取出本节点的真实记录，避免把整份状态
+                # 写进 nodes.<id>，也避免恢复校验读到错误层级。
+                nested = node_record.get("nodes")
+                if isinstance(nested, dict) and isinstance(nested.get(node_id), dict):
+                    node_record = nested[node_id]
                 self._store.add_node_record(run_id, node_id, {
                     **node_record,
                     "status": event_type.replace("node_", ""),

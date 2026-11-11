@@ -236,6 +236,9 @@ class CustomToolStore:
         error = _validate_code(code)
         if error:
             raise ValueError(error)
+        # 先验证 handler 可加载，再落盘：避免写入"语法正确但没有 handler"的
+        # 脏记录（此前顺序相反，非法工具会以 enabled=true 持久化）。
+        load_handler(code)
 
         now = datetime.now(timezone.utc).isoformat()
         record = {
@@ -252,8 +255,15 @@ class CustomToolStore:
             "is_custom": True,
         }
         record = self._write(record)
-        # 注册到全局注册表
-        self._register(record)
+        # 注册到全局注册表；注册失败则回滚文件，避免留下不可用但 enabled 的记录
+        try:
+            self._register(record)
+        except Exception as exc:
+            try:
+                os.remove(self._path(record["id"]))
+            except OSError:
+                pass
+            raise ValueError(f"工具注册失败: {exc}") from exc
         return record
 
     def update(self, tool_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -261,6 +271,7 @@ class CustomToolStore:
         record = self.get(tool_id)
         if record is None:
             raise KeyError(f"自定义工具 {tool_id} 不存在")
+        old_record = json.loads(json.dumps(record))
 
         old_name = record["name"]
         if "name" in data:
@@ -280,6 +291,7 @@ class CustomToolStore:
             error = _validate_code(data["code"])
             if error:
                 raise ValueError(error)
+            load_handler(data["code"])  # 更新前同样先验证 handler
             record["code"] = data["code"]
             record["parameters"] = data.get("parameters")  # 更新后重新推导
         if "parameters" in data:
@@ -292,10 +304,21 @@ class CustomToolStore:
         # 改名时先注销旧名，避免 registry 里残留过期注册项
         if name != old_name:
             self._unregister(old_name)
-        if record["enabled"]:
-            self._register(record)
-        else:
+        try:
+            if record["enabled"]:
+                self._register(record)
+            else:
+                self._unregister(record["name"])
+        except Exception as exc:
+            # 注册失败 → 回滚磁盘与注册表，保持更新前状态
+            self._write(old_record)
             self._unregister(record["name"])
+            if old_record.get("enabled", True):
+                try:
+                    self._register(old_record)
+                except Exception:  # noqa: BLE001
+                    logger.exception("回滚旧版自定义工具失败: %s", old_record.get("name"))
+            raise ValueError(f"工具注册失败: {exc}") from exc
         return record
 
     def delete(self, tool_id: str) -> None:
@@ -435,9 +458,13 @@ async def test_custom_tool(
     if error:
         return {"ok": False, "error": error}
 
+    import shlex
+
     script = _build_test_script(code, json.dumps(args or {}), timeout)
     executor = LocalExecutor()
-    result = await executor.run(f"python3 -c {json.dumps(script)}", timeout=timeout)
+    # 必须用 shell 安全引用（而非 json.dumps）：JSON 字符串里的 "\n" 在 shell
+    # 中会保持字面量，导致脚本永远 SyntaxError。shlex.quote 会保留真实换行。
+    result = await executor.run(f"python3 -c {shlex.quote(script)}", timeout=timeout)
     out = result.stdout or ""
     err = result.stderr or ""
 

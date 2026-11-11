@@ -22,6 +22,7 @@ export function Settings(): JSX.Element {
   // Single model config
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
+  const [apiKeyMasked, setApiKeyMasked] = useState('');
   const [modelName, setModelName] = useState('');
   const [contextMaxTurns, setContextMaxTurns] = useState<number>(0);
   const [contextWindow, setContextWindow] = useState<string>('');
@@ -38,7 +39,9 @@ export function Settings(): JSX.Element {
       .then(cfg => {
         if (cfg.configured) {
           setBaseUrl(cfg.base_url);
-          setApiKey(cfg.api_key);
+          // 后端只回传掩码；输入框保持空，留空提交即"沿用原密钥"。
+          setApiKey('');
+          setApiKeyMasked(cfg.api_key);
           setModelName(cfg.model);
           setContextMaxTurns(cfg.context_max_turns ?? 0);
           setContextWindow(cfg.context_window != null ? String(cfg.context_window) : '');
@@ -90,6 +93,7 @@ export function Settings(): JSX.Element {
       setConfigured(false);
       setBaseUrl('');
       setApiKey('');
+      setApiKeyMasked('');
       setModelName('');
       setContextMaxTurns(0);
       setContextWindow('');
@@ -199,7 +203,9 @@ export function Settings(): JSX.Element {
                 type="password"
                 value={apiKey}
                 onChange={e => setApiKey(e.target.value)}
-                placeholder="sk-..."
+                placeholder={apiKeyMasked
+                  ? `已保存 ${apiKeyMasked}（留空保持不变）`
+                  : 'sk-...'}
                 className={`${inputCls} font-mono`}
               />
             </div>

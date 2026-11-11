@@ -48,6 +48,12 @@ import type {
   ArchiveDetailResponse,
   RestoreArchiveRequest,
   RestoreArchiveResponse,
+  AuditListResponse,
+  AuditVerifyResponse,
+  AuditStats,
+  SituationResponse,
+  ASMPResponse,
+  PluginsResponse,
 } from '../types';
 
 export type SessionInfo = SessionSummary;
@@ -120,6 +126,59 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 // ===== Health =====
 export async function healthCheck(): Promise<HealthResponse> {
   return request('/health');
+}
+
+// ===== Audit =====
+export type AuditQuery = Record<string, string | number | undefined>;
+
+function auditQuery(params: AuditQuery): string {
+  const q = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== null && value !== '') q.set(key, String(value));
+  }
+  const s = q.toString();
+  return s ? `?${s}` : '';
+}
+
+/** 查询统一审计日志 */
+export async function listAudit(params: AuditQuery = {}): Promise<AuditListResponse> {
+  return request(`/audit${auditQuery(params)}`);
+}
+
+/** 校验审计哈希链完整性 */
+export async function verifyAudit(limit = 0): Promise<AuditVerifyResponse> {
+  return request(`/audit/verify${auditQuery({ limit: limit || undefined })}`);
+}
+
+/** 审计统计（总数 / 按动作 / 按状态） */
+export async function getAuditStats(): Promise<AuditStats> {
+  return request('/audit/stats');
+}
+
+/** 导出审计日志并触发浏览器下载 */
+export async function exportAudit(format: 'jsonl' | 'csv', params: AuditQuery = {}): Promise<void> {
+  const token = getToken();
+  const res = await fetch(`${apiBase}/audit/export${auditQuery({ ...params, format })}`, {
+    headers: token ? { 'X-Baize-API-Key': token } : {},
+  });
+  if (!res.ok) {
+    const body = await res.text();
+    let detail = res.statusText;
+    try { detail = JSON.parse(body).detail || detail; } catch { /* ignore */ }
+    throw new Error(`[${res.status}] ${detail}`);
+  }
+  const blob = await res.blob();
+  const disposition = res.headers.get('Content-Disposition') || '';
+  const match = disposition.match(/filename="([^"]+)"/);
+  const filename = match ? match[1] : `baize-audit.${format}`;
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 // ===== Pipelines =====
@@ -335,6 +394,19 @@ export async function createSession(data: CreateSessionRequest): Promise<Session
 // ===== Blackboard（协作模式攻击图）=====
 export async function getBlackboard(sessionId: string): Promise<BlackboardSnapshot> {
   return request(`/sessions/${sessionId}/blackboard`);
+}
+
+// ===== Situation Plugin =====
+export async function getSituation(sessionId: string): Promise<SituationResponse> {
+  return request(`/sessions/${sessionId}/situation`);
+}
+
+export async function getASMP(sessionId: string): Promise<ASMPResponse> {
+  return request(`/sessions/${sessionId}/asmp`);
+}
+
+export async function listPlugins(): Promise<PluginsResponse> {
+  return request('/plugins');
 }
 
 export async function addBlackboardHint(
@@ -635,10 +707,13 @@ export async function respondToPrompt(
 export interface ReasoningStep {
   type: string;  // "reasoning" | "tool_call" | "tool_output" | "handoff" | "agent_switched" | "message" | "error" | "pipeline_step" | "pipeline_phase_complete" | "stream_reset"
   agent?: string;
+  agent_label?: string;
   tool?: string;
   arguments?: unknown;
   output?: unknown;
   text?: string;
+  call_id?: string;
+  duration?: number;
   from_agent?: string;
   to_agent?: string;
   error?: string;

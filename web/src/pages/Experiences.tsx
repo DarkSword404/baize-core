@@ -336,6 +336,20 @@ export function Experiences(): JSX.Element {
           <p className="text-sm text-gray-500 mt-1">
             Agent 长期记忆：自然语言经验 + 任务轨迹（Episode）+ 语义事实 + 时间知识图谱，全部可证据回溯与人工演进
           </p>
+          {stats && (
+            <div className="flex flex-wrap items-center gap-1.5 mt-2 text-[10px]">
+              <span className="px-2 py-0.5 rounded border border-blue-600/20 bg-blue-600/10 text-blue-400">
+                模式 {stats.mode || 'tool'} · 参考而非强制
+              </span>
+              <span className={`px-2 py-0.5 rounded border ${
+                stats.embedding_enabled
+                  ? 'border-emerald-600/20 bg-emerald-600/10 text-emerald-400'
+                  : 'border-gray-700 bg-gray-800/60 text-gray-500'
+              }`}>
+                语义向量 {stats.embedding_enabled ? '已启用' : '未启用 · BM25/图谱'}
+              </span>
+            </div>
+          )}
         </div>
         <button
           onClick={refresh}

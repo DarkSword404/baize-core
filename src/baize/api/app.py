@@ -25,7 +25,7 @@ from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from baize import __version__
@@ -56,6 +56,7 @@ from baize.agents.guardrails import (
     test_guardrail,
     validate_guardrail_config,
 )
+from baize.audit import AuditLogger, fingerprint_secret, get_audit_logger, sanitize_url
 from baize.config import DEFAULT_BAIZE_DIR, ModelConfigStore, SingleModelConfig, get_server_config
 from baize.db_recorder import DbRecorder
 from baize.multimodal import build_user_message
@@ -67,6 +68,9 @@ from baize.tools.custom_tools import CustomToolStore, test_custom_tool
 from baize.tools.extended import _check_url_allowed
 from baize.tools.shared_browser import get_shared_browser
 from baize.memory import MemoryService
+from baize.memory.mode import memory_auto_inject_enabled
+from baize.plugins import PluginEvent, PluginManager
+from baize.plugins.asmp import ASMPPlugin
 
 
 # ----------------------------------------------------------------------
@@ -76,6 +80,7 @@ class HealthResponse(BaseModel):
     status: str
     version: str
     checks: Optional[dict[str, bool]] = None
+    features: Optional[dict[str, bool]] = None
 
 
 class ModelConfigRequest(BaseModel):
@@ -361,6 +366,25 @@ def _require_api_key(request: Request) -> None:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="无效或缺失 API Token",
         )
+
+
+# 密钥回显掩码：前端展示与配置回读都只给尾部 4 位，避免密钥进入浏览器/日志/截图。
+_MASKED_KEY_PLACEHOLDER = "********"
+
+
+def _mask_api_key(key: str) -> str:
+    """把 API Key 掩码为仅保留末 4 位的形式。"""
+    if not key:
+        return ""
+    if len(key) <= 8:
+        return _MASKED_KEY_PLACEHOLDER
+    return f"****{key[-4:]}"
+
+
+def _is_masked_key(value: str) -> bool:
+    """判断前端回传的是否为掩码占位符（而非用户新输入的密钥）。"""
+    value = (value or "").strip()
+    return value == _MASKED_KEY_PLACEHOLDER or value.startswith("****")
 
 
 # ----------------------------------------------------------------------
@@ -804,6 +828,298 @@ def _sweep_idle_session_learning(app: FastAPI, idle_seconds: int = 1800) -> None
         return
 
 
+# ----------------------------------------------------------------------
+# 审计辅助：请求元数据 / 动作映射 / 会话事件转发
+# ----------------------------------------------------------------------
+_AUDIT_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_AUDIT_VERBS = {"POST": "create", "PUT": "update", "PATCH": "update", "DELETE": "delete"}
+
+
+def _request_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:128]
+    return (request.client.host if request.client else "")[:128]
+
+
+def _request_actor(app: FastAPI, request: Request) -> tuple[str, str]:
+    token = request.headers.get("X-Baize-API-Key") or request.headers.get(
+        "Authorization", ""
+    ).replace("Bearer ", "").strip()
+    if token:
+        try:
+            username = app.state.auth_manager.username_for_token(token)
+        except Exception:  # noqa: BLE001
+            username = None
+        if username:
+            return "user", username
+    return ("anonymous" if getattr(app.state, "require_auth", False) else "local"), ""
+
+
+def _audit_target(method: str, path: str) -> tuple[str, str, str]:
+    """把 REST 路径映射为稳定的审计动作，例如 session.delete。"""
+    rest = [p for p in path.strip("/").split("/") if p]
+    if len(rest) < 3 or rest[0] != "api" or rest[1] != "v1":
+        return f"api.{method.lower()}", "api", ""
+    parts = rest[2:]
+    head = parts[0]
+    verb = _AUDIT_VERBS.get(method, method.lower())
+    rid = parts[1] if len(parts) > 1 else ""
+    sub = parts[2] if len(parts) > 2 else ""
+
+    if head == "sessions":
+        if sub == "files":
+            return f"attachment.{verb}", "attachment", rid
+        if sub in ("archive", "restore", "interrupt", "cancel", "activate"):
+            return f"session.{sub}", "session", rid
+        if sub == "prompts":
+            return "session.prompt.respond", "session", rid
+        if sub == "report":
+            return f"report.{verb}", "session", rid
+        if sub == "messages":
+            return "session.message", "session", rid
+        if sub:
+            return f"session.{sub}", "session", rid
+        return f"session.{verb}", "session", rid
+    if head == "reports":
+        return f"report.{verb}", "report", rid
+    if head == "tools":
+        if len(parts) > 1 and parts[1] == "custom":
+            custom_id = parts[2] if len(parts) > 2 else ""
+            custom_sub = parts[3] if len(parts) > 3 else ""
+            return (
+                f"custom_tool.{custom_sub or verb}",
+                "custom_tool",
+                custom_id,
+            )
+        return f"tool.{verb}", "tool", "/".join(parts[1:])
+    if head == "model-config":
+        return f"model_config.{verb}", "model_config", "default"
+    if head == "guardrails":
+        return f"guardrails.{verb}", "guardrails", "/".join(parts[1:])
+    if head == "sandbox":
+        if sub in ("approve", "deny"):
+            return f"sandbox.{sub}", "sandbox", ""
+        return f"sandbox.{verb}", "sandbox", "/".join(parts[1:])
+    if head == "memory":
+        return f"memory.{verb}", "memory", "/".join(parts[1:])
+    if head == "containers":
+        return f"container.{verb}", "container", "/".join(parts[1:])
+    if head == "archives":
+        return f"archive.{verb}", "archive", "/".join(parts[1:])
+    if head == "receivers":
+        return f"receiver.{verb}", "receiver", "/".join(parts[1:])
+    return f"api.{method.lower()}", head, "/".join(parts[1:])
+
+
+def _should_audit_write(request: Request) -> bool:
+    if request.method not in _AUDIT_WRITE_METHODS:
+        return False
+    path = request.url.path
+    if not path.startswith("/api/v1"):
+        return False
+    if request.method == "POST" and path in (
+        "/api/v1/sessions",
+        "/api/v1/tools/custom",
+        "/api/v1/tools/custom/test",
+    ):
+        # 这些路由由处理器显式记录，才能带上新生成的 session_id / 工具名
+        return False
+    if path.startswith(
+        (
+            "/api/v1/auth/login",
+            "/api/v1/model-config",
+            "/api/v1/hook/",
+            "/api/v1/audit",
+            "/api/v1/sandbox/approve",
+            "/api/v1/sandbox/deny",
+        )
+    ):
+        return False
+    # 对话消息由 SessionLog 旁路记录，避免同一条消息在审计里出现两次
+    if path.endswith("/messages") or path.endswith("/messages/stream"):
+        return False
+    return True
+
+
+def _forward_session_event(
+    audit: Any, session_id: str, kind: str, payload: dict[str, Any]
+) -> None:
+    """把 SessionLog 摘要事件转发到统一审计（完整内容仍在 SessionLog）。"""
+    actor_id = f"session:{session_id}"
+    if kind == "session/start":
+        audit.record(
+            "session.start",
+            actor_type="session",
+            actor_id=actor_id,
+            resource_type="session",
+            resource_id=session_id,
+            session_id=session_id,
+            detail={
+                "origin": payload.get("origin", ""),
+                "goal": payload.get("goal", ""),
+            },
+        )
+    elif kind == "session/end":
+        reason = payload.get("reason", "done")
+        audit.record(
+            "session.end",
+            actor_type="session",
+            actor_id=actor_id,
+            resource_type="session",
+            resource_id=session_id,
+            session_id=session_id,
+            status="error" if reason == "error" else "ok",
+            detail={"reason": reason, "error": payload.get("error", "")},
+        )
+    elif kind == "user/message":
+        audit.record(
+            "session.message.user",
+            actor_type="user",
+            actor_id=actor_id,
+            resource_type="session",
+            resource_id=session_id,
+            session_id=session_id,
+            detail={"content": payload.get("content", "")},
+        )
+    elif kind == "tool/call":
+        audit.record(
+            "tool.call",
+            actor_type="agent",
+            actor_id=actor_id,
+            resource_type="tool",
+            resource_id=str(payload.get("name", "")),
+            session_id=session_id,
+            detail={
+                "name": payload.get("name", ""),
+                "arguments": payload.get("arguments", ""),
+                "call_id": payload.get("call_id", ""),
+            },
+        )
+    elif kind in ("tool/result", "tool/error"):
+        denied = bool(payload.get("denied"))
+        failed = kind == "tool/error" or bool(payload.get("error"))
+        audit.record(
+            "tool.error" if failed else "tool.result",
+            actor_type="agent",
+            actor_id=actor_id,
+            resource_type="tool",
+            resource_id=str(payload.get("name", "")),
+            session_id=session_id,
+            status="error" if failed else ("denied" if denied else "ok"),
+            detail={
+                "name": payload.get("name", ""),
+                "output": payload.get("output", ""),
+                "error": payload.get("error", ""),
+                "denied": denied,
+                "reason": payload.get("reason", ""),
+                "duration": payload.get("duration"),
+                "call_id": payload.get("call_id", ""),
+            },
+        )
+    elif kind in ("turn/start", "turn/end"):
+        audit.record(
+            f"agent.{kind.replace('/', '.')}",
+            actor_type="agent",
+            actor_id=actor_id,
+            session_id=session_id,
+            resource_type="session",
+            resource_id=session_id,
+            detail={"index": payload.get("index")},
+        )
+    elif kind == "agent/retry":
+        audit.record(
+            "agent.retry",
+            actor_type="agent",
+            actor_id=actor_id,
+            session_id=session_id,
+            resource_type="session",
+            resource_id=session_id,
+            status="retry",
+            detail=payload,
+        )
+    elif kind == "system":
+        audit.record(
+            "system.event",
+            actor_type="system",
+            actor_id=actor_id,
+            session_id=session_id,
+            resource_type="session",
+            resource_id=session_id,
+            detail=payload,
+        )
+
+
+def _backfill_tool_trace_from_log(
+    app: FastAPI, session_id: str, history: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """为旧会话补回工具轨迹。
+
+    旧版编排路径只把 reasoning / assistant 写入 session JSON，工具调用只存在
+    append-only 的 ``.audit.jsonl`` 里，导致刷新历史后用户只看到“最终报告”，
+    看不到 AI 跑了哪些工具。这里在读取会话时，如果 history 中没有任何
+    function_call，就从会话日志重建工具轨迹并插入到最后一条 assistant 之前。
+    新会话已经持久化 tool_events，不会重复补。
+    """
+    if any(
+        str(m.get("type") or "") in ("function_call", "function_call_output")
+        for m in history
+    ):
+        return history
+
+    path = os.path.join(app.state.session_log_dir, f"{session_id}.audit.jsonl")
+    if not os.path.isfile(path):
+        return history
+
+    trace: list[dict[str, Any]] = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                kind = event.get("kind", "")
+                payload = event.get("payload") or {}
+                if kind == "tool/call":
+                    call_id = str(payload.get("call_id") or f"hist_{len(trace)}")
+                    trace.append({
+                        "type": "function_call",
+                        "name": payload.get("name", ""),
+                        "arguments": payload.get("arguments", ""),
+                        "call_id": call_id,
+                    })
+                elif kind in ("tool/result", "tool/error"):
+                    call_id = str(payload.get("call_id") or "")
+                    output = payload.get("output") or payload.get("error") or ""
+                    output = str(output)
+                    if len(output) > 8000:
+                        output = output[:8000] + "\n[历史输出已截断，完整内容见会话日志]"
+                    trace.append({
+                        "type": "function_call_output",
+                        "id": call_id,
+                        "call_id": call_id,
+                        "name": payload.get("name", ""),
+                        "output": output,
+                        "duration": payload.get("duration"),
+                    })
+    except OSError:
+        logger.debug("读取会话工具轨迹失败 session=%s", session_id, exc_info=True)
+        return history
+
+    if not trace:
+        return history
+
+    # 插到最后一条正式 assistant 之前：用户先看到提问 → 工具轨迹 → 最终结论。
+    insert_at = len(history)
+    for idx in range(len(history) - 1, -1, -1):
+        msg = history[idx]
+        if msg.get("role") == "assistant" and not msg.get("type"):
+            insert_at = idx
+            break
+    return history[:insert_at] + trace + history[insert_at:]
+
+
 def _get_or_create_session_log(app: FastAPI, session_id: str) -> SessionLog:
     """取（或建）会话级 SessionLog，JSONL 落盘 ~/.baize/sessions/<id>.audit.jsonl。
 
@@ -814,7 +1130,28 @@ def _get_or_create_session_log(app: FastAPI, session_id: str) -> SessionLog:
     log = logs.get(session_id)
     if log is None:
         path = os.path.join(app.state.session_log_dir, f"{session_id}.audit.jsonl")
-        log = SessionLog(session_id=session_id, path=path, origin="api")
+        audit = app.state.audit
+
+        def _sink(kind: str, payload: dict[str, Any]) -> None:
+            _forward_session_event(audit, session_id, kind, payload)
+            manager = getattr(app.state, "plugin_manager", None)
+            if manager is not None:
+                try:
+                    manager.publish(PluginEvent(
+                        session_id=session_id,
+                        kind=kind,
+                        payload=payload,
+                        source="session_log",
+                    ))
+                except Exception:  # noqa: BLE001
+                    logger.debug("插件事件发布失败", exc_info=True)
+
+        log = SessionLog(
+            session_id=session_id,
+            path=path,
+            origin="api",
+            audit_sink=_sink,
+        )
         logs[session_id] = log
     return log
 
@@ -912,7 +1249,103 @@ def create_baize_api_app(
     app.state.custom_tools.register_all()  # 启动时热注册已有自定义工具
     app.state.attachment_store = AttachmentStore()
     app.state.require_auth = cfg.require_auth
+    app.state.enable_pipelines = cfg.enable_pipelines
     app.state.loaded_modules: dict[str, dict] = {}  # 已加载模块注册表
+    try:
+        app.state.audit = get_audit_logger()
+    except Exception:  # noqa: BLE001
+        # 审计初始化失败不能阻断服务启动；退化为禁用态，仅记日志。
+        logger.exception("审计日志初始化失败，已禁用审计")
+        app.state.audit = AuditLogger(enabled=False)
+
+    # ── 默认鉴权兜底 ──
+    # 逐个路由手写 Depends 容易漏（receivers 就曾整组裸奔）。这里对
+    # /api/v1/* 做默认拒绝：只有显式白名单（健康检查 / 登录 / Webhook 入站）
+    # 免 API Token。路由自身的 Depends 仍然生效（双保险）。
+    _PUBLIC_API_PREFIXES = (
+        "/api/v1/health",
+        "/api/v1/auth/login",
+        "/api/v1/hook/",
+    )
+
+    @app.middleware("http")
+    async def _default_auth_guard(request: Request, call_next):
+        if (
+            request.app.state.require_auth
+            and request.method != "OPTIONS"
+            and request.url.path.startswith("/api/v1")
+            and not request.url.path.startswith(_PUBLIC_API_PREFIXES)
+        ):
+            key = request.headers.get("X-Baize-API-Key") or request.headers.get(
+                "Authorization", ""
+            ).replace("Bearer ", "")
+            if not request.app.state.auth_manager.validate_token(key):
+                # 只审计写操作的未授权尝试；登录页等 GET 轮询不落审计，
+                # 避免匿名请求刷爆审计库。
+                if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
+                    try:
+                        app.state.audit.record(
+                            "auth.denied",
+                            actor_type="anonymous",
+                            ip=_request_ip(request),
+                            ua=request.headers.get("user-agent", "")[:512],
+                            resource_type="api",
+                            resource_id=request.url.path,
+                            status="denied",
+                            status_code=401,
+                            detail={
+                                "method": request.method,
+                                "path": request.url.path,
+                                "token_present": bool(key),
+                            },
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning("未授权请求审计失败", exc_info=True)
+                return JSONResponse(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    content={"detail": "无效或缺失 API Token"},
+                )
+        return await call_next(request)
+
+    # ── 管理面写操作审计 ──
+    # 只记录 POST/PUT/PATCH/DELETE，不记录 GET，避免读路径刷爆审计；
+    # 请求体不落盘（其中可能有密钥/大文件），只记录方法、路径、状态与耗时。
+    @app.middleware("http")
+    async def _audit_api_writes(request: Request, call_next):
+        started = time.perf_counter()
+        response = None
+        try:
+            response = await call_next(request)
+            return response
+        finally:
+            if _should_audit_write(request):
+                try:
+                    actor_type, actor_id = _request_actor(app, request)
+                    action, resource_type, resource_id = _audit_target(
+                        request.method, request.url.path
+                    )
+                    code = response.status_code if response is not None else 500
+                    app.state.audit.record(
+                        action,
+                        actor_type=actor_type,
+                        actor_id=actor_id,
+                        ip=_request_ip(request),
+                        ua=request.headers.get("user-agent", "")[:512],
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        session_id=resource_id if resource_type == "session" else "",
+                        status="ok" if code < 400 else "error",
+                        status_code=code,
+                        detail={
+                            "method": request.method,
+                            "path": request.url.path,
+                            "duration_ms": round(
+                                (time.perf_counter() - started) * 1000, 2
+                            ),
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("API 写操作审计失败", exc_info=True)
 
     # ── 任务-容器解耦：容器注册表 + 任务归档管理 ──
     from baize.pentest.container_registry import ContainerRegistry
@@ -950,6 +1383,14 @@ def create_baize_api_app(
     # ── 会话审计日志：SessionLog JSONL 落盘目录 + 进程内缓存 ──
     app.state.session_log_dir = os.path.join(str(DEFAULT_BAIZE_DIR), "sessions")
     app.state.session_logs: dict[str, SessionLog] = {}
+    # ── Harness plugins ──
+    # Situation is the first plugin: dynamic task state + optional tools/API.
+    app.state.plugin_manager = PluginManager(
+        Path(DEFAULT_BAIZE_DIR) / "plugins",
+        services=services,
+    )
+    app.state.plugin_manager.register(ASMPPlugin())
+    services.register("plugin_manager", app.state.plugin_manager)
     # DbRecorder（SQLite 结构化镜像）注册为全局服务，
     # Agent._log_event 会把每条会话事件并行写入 runtime.sqlite
     app.state.db_recorder = DbRecorder()
@@ -971,17 +1412,27 @@ def create_baize_api_app(
 
     # ------------------------------------------------------------------
     # 内置编排模块注册（合并自 baize-orchestration，无 entry point）
+    #
+    # 当前阶段聚焦对话式 CTF / 渗透，流水线默认下架（BAIZE_ENABLE_PIPELINES=0）：
+    # 不注册路由、不加载模板、不启动 receiver / 长驻实例。代码与 runs.db 中
+    # 的历史数据完整保留，改环境变量即可恢复，无需迁移。
     # ------------------------------------------------------------------
-    try:
-        from baize.orchestration import register as _orch_register
-        _orch_register(app)
-        app.state.loaded_modules["orchestration"] = {
-            "installed": True,
-            "version": __version__,
-        }
-        logger.info("已加载内置模块: orchestration")
-    except Exception:  # noqa: BLE001
-        logger.exception("加载内置 orchestration 模块失败")
+    if cfg.enable_pipelines:
+        try:
+            from baize.orchestration import register as _orch_register
+            _orch_register(app)
+            app.state.loaded_modules["orchestration"] = {
+                "installed": True,
+                "version": __version__,
+            }
+            logger.info("已加载内置模块: orchestration")
+        except Exception:  # noqa: BLE001
+            logger.exception("加载内置 orchestration 模块失败")
+    else:
+        logger.info(
+            "流水线编排已关闭（BAIZE_ENABLE_PIPELINES=0），"
+            "仅保留对话式 CTF / 渗透能力"
+        )
 
     # ------------------------------------------------------------------
     # 内置报告管理模块注册（报告模板 + 报告 CRUD + agent 报告工具）
@@ -1000,7 +1451,29 @@ def create_baize_api_app(
     # ------------------------------------------------------------------
     # 接收器管理 API + Webhook 路由
     # ------------------------------------------------------------------
-    app.include_router(receivers_router, prefix="/api/v1")
+    # 接收器 CRUD / 队列读取默认要求鉴权（此前漏挂依赖，开启认证后仍可匿名读写）。
+    # Webhook 入站路由 /api/v1/hook/{path} 由 receivers.webhook 单独校验 webhook key。
+    # 接收器只服务于流水线长驻消费，流水线关闭时一并下架。
+    if cfg.enable_pipelines:
+        app.include_router(
+            receivers_router,
+            prefix="/api/v1",
+            dependencies=[Depends(_require_api_key)],
+        )
+
+    @app.on_event("startup")
+    async def _start_plugins():
+        try:
+            await app.state.plugin_manager.start()
+        except Exception:  # noqa: BLE001
+            logger.warning("插件管理启动失败", exc_info=True)
+
+    @app.on_event("shutdown")
+    async def _stop_plugins():
+        try:
+            await app.state.plugin_manager.stop()
+        except Exception:  # noqa: BLE001
+            logger.debug("插件管理停止失败", exc_info=True)
 
     @app.on_event("startup")
     async def _reconcile_containers():
@@ -1024,18 +1497,19 @@ def create_baize_api_app(
         except Exception:  # noqa: BLE001
             logger.debug("容器注册表对账失败", exc_info=True)
 
-    @app.on_event("startup")
-    async def _start_receiver_manager():
-        """应用启动时初始化 ReceiverManager 并启动所有已启用的接收器。"""
-        mgr = ReceiverManager.get()
-        await mgr.start()
-        logger.info("ReceiverManager 已启动")
+    if cfg.enable_pipelines:
+        @app.on_event("startup")
+        async def _start_receiver_manager():
+            """应用启动时初始化 ReceiverManager 并启动所有已启用的接收器。"""
+            mgr = ReceiverManager.get()
+            await mgr.start()
+            logger.info("ReceiverManager 已启动")
 
-    @app.on_event("shutdown")
-    async def _stop_receiver_manager():
-        """应用关闭时停止所有接收器。"""
-        mgr = ReceiverManager.get()
-        await mgr.stop()
+        @app.on_event("shutdown")
+        async def _stop_receiver_manager():
+            """应用关闭时停止所有接收器。"""
+            mgr = ReceiverManager.get()
+            await mgr.stop()
 
     @app.on_event("shutdown")
     async def _flush_pending_session_learning():
@@ -1070,10 +1544,11 @@ def create_baize_api_app(
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Webhook 捕获所有路由
-    @app.api_route("/api/v1/hook/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
-    async def webhook_catchall(request: Request, path: str):
-        return await handle_webhook(request, path)
+    # Webhook 捕获所有路由（仅流水线模式下开放）
+    if cfg.enable_pipelines:
+        @app.api_route("/api/v1/hook/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+        async def webhook_catchall(request: Request, path: str):
+            return await handle_webhook(request, path)
 
     # ------------------------------------------------------------------
     # 健康检查
@@ -1081,7 +1556,14 @@ def create_baize_api_app(
     @app.get("/api/v1/live", response_model=HealthResponse)
     def live() -> HealthResponse:
         """存活探针：仅检查进程是否响应，不做依赖巡检。"""
-        return HealthResponse(status="ok", version=__version__)
+        return HealthResponse(
+            status="ok",
+            version=__version__,
+            features={
+                "pipelines": bool(getattr(app.state, "enable_pipelines", False)),
+                "audit": bool(getattr(getattr(app.state, "audit", None), "enabled", False)),
+            },
+        )
 
     @app.get("/api/v1/health", response_model=HealthResponse)
     def health() -> HealthResponse:
@@ -1122,6 +1604,10 @@ def create_baize_api_app(
             status="ok" if all_ok else "degraded",
             version=__version__,
             checks=checks,
+            features={
+                "pipelines": bool(getattr(app.state, "enable_pipelines", False)),
+                "audit": bool(getattr(getattr(app.state, "audit", None), "enabled", False)),
+            },
         )
 
     # B-20: Prometheus 指标端点
@@ -1382,7 +1868,7 @@ def create_baize_api_app(
             )
         return ModelConfigResponse(
             base_url=m.base_url,
-            api_key=m.api_key,
+            api_key=_mask_api_key(m.api_key),
             model=m.model,
             context_max_turns=int(m.context_max_turns or 0),
             context_window=m.context_window,
@@ -1397,7 +1883,9 @@ def create_baize_api_app(
         response_model=ModelConfigResponse,
         dependencies=[Depends(_require_api_key)],
     )
-    def update_model_config(payload: ModelConfigRequest) -> ModelConfigResponse:
+    def update_model_config(
+        payload: ModelConfigRequest, request: Request
+    ) -> ModelConfigResponse:
         base_url = payload.base_url.strip().rstrip("/")
         model = payload.model.strip()
         if not base_url or not model:
@@ -1413,10 +1901,18 @@ def create_baize_api_app(
         ):
             if value is not None and value < 0:
                 raise HTTPException(status_code=400, detail=f"{name} 不能为负数")
+        # 密钥保留语义：前端拿到的已是掩码，回传掩码（或留空）表示"沿用原密钥"，
+        # 只有输入全新明文时才覆盖。避免保存配置时把密钥清空/写回掩码串。
+        existing = app.state.model_config.load()
+        submitted_key = payload.api_key.strip()
+        if _is_masked_key(submitted_key) or not submitted_key:
+            api_key = existing.api_key if existing else ""
+        else:
+            api_key = submitted_key
         m = app.state.model_config.save(
             SingleModelConfig(
                 base_url=base_url,
-                api_key=payload.api_key.strip(),
+                api_key=api_key,
                 model=model,
                 context_max_turns=context_max_turns,
                 context_window=payload.context_window,
@@ -1425,9 +1921,37 @@ def create_baize_api_app(
                 enable_context_summary=bool(payload.enable_context_summary),
             )
         )
+        # 配置变更后丢弃 embedding 单例，避免记忆检索继续请求旧端点/旧模型
+        try:
+            from baize.memory.embed import reset_embedder
+            reset_embedder()
+        except Exception:  # noqa: BLE001
+            logger.debug("重置 embedding 实例失败（忽略）", exc_info=True)
+        actor_type, actor_id = _request_actor(app, request)
+        app.state.audit.record(
+            "model_config.update",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            ip=_request_ip(request),
+            ua=request.headers.get("user-agent", "")[:512],
+            resource_type="model_config",
+            resource_id="default",
+            status_code=200,
+            detail={
+                "base_url": sanitize_url(base_url),
+                "model": model,
+                "api_key_fp": fingerprint_secret(api_key),
+                "key_replaced": bool(submitted_key and not _is_masked_key(submitted_key)),
+                "context_max_turns": context_max_turns,
+                "context_window": payload.context_window,
+                "max_context_tokens": payload.max_context_tokens,
+                "max_message_chars": payload.max_message_chars,
+                "enable_context_summary": bool(payload.enable_context_summary),
+            },
+        )
         return ModelConfigResponse(
             base_url=m.base_url,
-            api_key=m.api_key,
+            api_key=_mask_api_key(m.api_key),
             model=m.model,
             context_max_turns=int(m.context_max_turns or 0),
             context_window=m.context_window,
@@ -1441,8 +1965,24 @@ def create_baize_api_app(
         "/api/v1/model-config",
         dependencies=[Depends(_require_api_key)],
     )
-    def clear_model_config() -> dict:
+    def clear_model_config(request: Request) -> dict:
         app.state.model_config.clear()
+        try:
+            from baize.memory.embed import reset_embedder
+            reset_embedder()
+        except Exception:  # noqa: BLE001
+            logger.debug("重置 embedding 实例失败（忽略）", exc_info=True)
+        actor_type, actor_id = _request_actor(app, request)
+        app.state.audit.record(
+            "model_config.clear",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            ip=_request_ip(request),
+            ua=request.headers.get("user-agent", "")[:512],
+            resource_type="model_config",
+            resource_id="default",
+            status_code=200,
+        )
         return {"ok": True, "configured": False}
 
     # ------------------------------------------------------------------
@@ -1461,18 +2001,19 @@ def create_baize_api_app(
         dependencies=[Depends(_require_api_key)],
     )
     def tools_list() -> ToolsResponse:
-        builtin = list_tools()
-        custom = [
-            {
-                "name": r["name"],
-                "description": r.get("description", ""),
-                "category": r.get("category", "custom"),
-                "is_custom": True,
-                "enabled": r.get("enabled", True),
-            }
-            for r in app.state.custom_tools.list()
-        ]
-        return ToolsResponse(tools=builtin + custom)
+        # list_tools() 已包含"已启用并成功注册"的自定义工具；若再把自定义
+        # 记录追加一遍，启用态工具会在列表里出现两次。这里只做标记，不再追加。
+        custom_names = {
+            r["name"] for r in app.state.custom_tools.list()
+            if r.get("enabled", True)
+        }
+        tools = []
+        for item in list_tools():
+            entry = dict(item)
+            if entry.get("name") in custom_names:
+                entry["is_custom"] = True
+            tools.append(entry)
+        return ToolsResponse(tools=tools)
 
     # ------------------------------------------------------------------
     # 自定义工具管理 (Custom Tools)
@@ -1491,11 +2032,43 @@ def create_baize_api_app(
         status_code=201,
         dependencies=[Depends(_require_api_key)],
     )
-    async def custom_tools_create(payload: CustomToolCreateRequest) -> dict:
+    async def custom_tools_create(
+        payload: CustomToolCreateRequest, request: Request
+    ) -> dict:
         try:
             record = app.state.custom_tools.create(payload.model_dump(exclude_none=True))
+            actor_type, actor_id = _request_actor(app, request)
+            app.state.audit.record(
+                "custom_tool.create",
+                actor_type=actor_type,
+                actor_id=actor_id,
+                ip=_request_ip(request),
+                ua=request.headers.get("user-agent", "")[:512],
+                resource_type="custom_tool",
+                resource_id=record.get("name", ""),
+                status_code=201,
+                detail={
+                    "name": record.get("name", ""),
+                    "category": payload.category,
+                    "enabled": payload.enabled,
+                    "code_fp": fingerprint_secret(payload.code),
+                },
+            )
             return {"ok": True, "tool": record}
         except ValueError as exc:
+            actor_type, actor_id = _request_actor(app, request)
+            app.state.audit.record(
+                "custom_tool.create",
+                actor_type=actor_type,
+                actor_id=actor_id,
+                ip=_request_ip(request),
+                ua=request.headers.get("user-agent", "")[:512],
+                resource_type="custom_tool",
+                resource_id=payload.name,
+                status="error",
+                status_code=400,
+                detail={"name": payload.name, "error": str(exc)},
+            )
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.put(
@@ -1543,8 +2116,27 @@ def create_baize_api_app(
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    async def custom_tools_test(payload: CustomToolTestRequest) -> dict:
+    async def custom_tools_test(
+        payload: CustomToolTestRequest, request: Request
+    ) -> dict:
         result = await test_custom_tool(payload.code, payload.args, timeout=payload.timeout or 60)
+        actor_type, actor_id = _request_actor(app, request)
+        app.state.audit.record(
+            "custom_tool.test",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            ip=_request_ip(request),
+            ua=request.headers.get("user-agent", "")[:512],
+            resource_type="custom_tool",
+            resource_id="",
+            status="ok" if result.get("ok") else "error",
+            detail={
+                "ok": bool(result.get("ok")),
+                "args": payload.args or {},
+                "code_fp": fingerprint_secret(payload.code),
+                "error": result.get("error", ""),
+            },
+        )
         return result
 
 
@@ -1557,7 +2149,7 @@ def create_baize_api_app(
         status_code=201,
         dependencies=[Depends(_require_api_key)],
     )
-    def create_session(payload: CreateSessionRequest) -> dict:
+    def create_session(payload: CreateSessionRequest, request: Request) -> dict:
         session = app.state.session_manager.create_session(
             agent=payload.agent,
             model=payload.model,
@@ -1567,6 +2159,27 @@ def create_baize_api_app(
             scope=payload.scope,
             goal=payload.goal,
             task_type=payload.task_type,
+        )
+        actor_type, actor_id = _request_actor(app, request)
+        app.state.audit.record(
+            "session.create",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            ip=_request_ip(request),
+            ua=request.headers.get("user-agent", "")[:512],
+            resource_type="session",
+            resource_id=session.id,
+            session_id=session.id,
+            status_code=201,
+            detail={
+                "goal": payload.goal,
+                "scope": payload.scope,
+                "task_type": payload.task_type,
+                "agent": payload.agent,
+                "pattern": payload.pattern,
+                "stateful": payload.stateful,
+                "browser_collab": payload.browser_collab,
+            },
         )
         return session.to_dict()
 
@@ -1598,7 +2211,124 @@ def create_baize_api_app(
         session = app.state.session_manager.get_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="会话不存在")
-        return {"session": session.to_dict()}
+        data = session.to_dict()
+        # 旧会话兼容：从 append-only 会话日志恢复工具轨迹（新会话已有，不会重复）
+        data["history"] = _backfill_tool_trace_from_log(
+            app, session_id, data.get("history") or []
+        )
+        data["history_length"] = len(data["history"])
+        return {"session": data}
+
+    # ---- 攻击态势模型（ASMP Harness plugin projection） -----------------
+    @app.get(
+        "/api/v1/sessions/{session_id}/asmp",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    @app.get(
+        "/api/v1/sessions/{session_id}/situation",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def get_asmp(session_id: str) -> dict:
+        pm = getattr(app.state, "plugin_manager", None)
+        plugin = pm.get("baize.asmp") if pm is not None else None
+        service = getattr(plugin, "service", None) if plugin is not None else None
+        if service is None:
+            raise HTTPException(status_code=503, detail="ASMP 插件未启用")
+        snap = service.get_model_snapshot(session_id)
+        if not snap.get("nodes") and not snap.get("evidence"):
+            log_path = os.path.join(
+                app.state.session_log_dir, f"{session_id}.audit.jsonl"
+            )
+            if os.path.isfile(log_path) and service.replay_from_log(session_id, log_path):
+                snap = service.get_model_snapshot(session_id)
+        return {
+            "asmp": snap,
+            # 兼容旧前端字段名
+            "situation": snap,
+            "brief": service.brief(session_id),
+        }
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/asmp/tasks",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def propose_asmp_tasks(session_id: str, payload: dict | None = None) -> dict:
+        pm = getattr(app.state, "plugin_manager", None)
+        plugin = pm.get("baize.asmp") if pm is not None else None
+        service = getattr(plugin, "service", None) if plugin is not None else None
+        if service is None:
+            raise HTTPException(status_code=503, detail="ASMP 插件未启用")
+        limit = int((payload or {}).get("limit") or 10)
+        return {"tasks": service.propose_tasks(session_id, limit=limit)}
+
+    @app.get(
+        "/api/v1/sessions/{session_id}/asmp/types",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def asmp_types(session_id: str) -> dict:
+        pm = getattr(app.state, "plugin_manager", None)
+        plugin = pm.get("baize.asmp") if pm is not None else None
+        service = getattr(plugin, "service", None) if plugin is not None else None
+        if service is None:
+            raise HTTPException(status_code=503, detail="ASMP 插件未启用")
+        return {"types": service.get_types(session_id)}
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/asmp/types/validate",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def asmp_validate_type(session_id: str, payload: dict) -> dict:
+        pm = getattr(app.state, "plugin_manager", None)
+        plugin = pm.get("baize.asmp") if pm is not None else None
+        service = getattr(plugin, "service", None) if plugin is not None else None
+        if service is None:
+            raise HTTPException(status_code=503, detail="ASMP 插件未启用")
+        return service.validate_type_definition(session_id, payload)
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/asmp/types/propose",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def asmp_propose_type(session_id: str, payload: dict) -> dict:
+        pm = getattr(app.state, "plugin_manager", None)
+        plugin = pm.get("baize.asmp") if pm is not None else None
+        service = getattr(plugin, "service", None) if plugin is not None else None
+        if service is None:
+            raise HTTPException(status_code=503, detail="ASMP 插件未启用")
+        definition = payload.get("definition") or {}
+        return service.propose_type_definition(
+            session_id, definition, reason=str(payload.get("reason") or "")
+        )
+
+    @app.post(
+        "/api/v1/sessions/{session_id}/asmp/types/{type_id}/register",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def asmp_register_type(session_id: str, type_id: str) -> dict:
+        pm = getattr(app.state, "plugin_manager", None)
+        plugin = pm.get("baize.asmp") if pm is not None else None
+        service = getattr(plugin, "service", None) if plugin is not None else None
+        if service is None:
+            raise HTTPException(status_code=503, detail="ASMP 插件未启用")
+        return service.register_type(session_id, type_id)
+
+    @app.get(
+        "/api/v1/plugins",
+        response_model=dict,
+        dependencies=[Depends(_require_api_key)],
+    )
+    def list_plugins() -> dict:
+        pm = getattr(app.state, "plugin_manager", None)
+        if pm is None:
+            return {"plugins": [], "ui": []}
+        return {"plugins": pm.plugins(), "ui": pm.ui_manifests()}
 
     # ---- 黑板：协作模式攻击图 -----------------------------------------
     # 前端攻击地图视图拉取 Fact-Intent 图快照，以及人类注入 Hint
@@ -1690,7 +2420,7 @@ def create_baize_api_app(
         if not image_exists(mgr.runtime, get_image()):
             raise HTTPException(
                 status_code=503,
-                detail=f"镜像 {get_image()} 不存在，请先构建：podman build -t {get_image()} -f docker/baize-sandbox/Dockerfile .",
+                detail=f"镜像 {get_image()} 不存在，请先构建：{os.path.basename(mgr.runtime or 'docker')} build -t {get_image()} -f docker/baize-sandbox/Dockerfile .",
             )
         registry = app.state.container_registry
 
@@ -1823,7 +2553,7 @@ def create_baize_api_app(
         if not image_exists(mgr.runtime, image):
             raise HTTPException(
                 status_code=503,
-                detail=f"镜像 {image} 不存在，请先构建：podman build -t {image} -f docker/baize-sandbox/Dockerfile .",
+                detail=f"镜像 {image} 不存在，请先构建：{os.path.basename(mgr.runtime or 'docker')} build -t {image} -f docker/baize-sandbox/Dockerfile .",
             )
         registry = app.state.container_registry
         # 预检并发上限（避免无谓创建）
@@ -2174,7 +2904,7 @@ def create_baize_api_app(
             return {"ok": False, "handled": False, "error": "无效的沙箱审批 prompt_id"}
 
         # ── 流水线人工确认：prompt_id 格式 "run:{run_id}"，桥接 runner.resume_after_confirm ──
-        if prompt_id.startswith("run:"):
+        if prompt_id.startswith("run:") and getattr(app.state, "enable_pipelines", False):
             run_id = prompt_id[len("run:"):]
             response = (payload.get("response") or payload.get("content") or "")
             # 用户拒绝（rejected=true）时传入拒绝信号
@@ -2346,7 +3076,9 @@ def create_baize_api_app(
         # 3. 内置智能体已废弃 — 当无任何 agent 注册时，全部回退到对话自动编排
         pipeline_def = None
         use_conversation_orchestrator = False
-        if getattr(session, "pattern", None):
+        # 流水线关闭时忽略 session.pattern（历史会话可能仍带着该字段），
+        # 直接回退到黑板驱动的对话编排，避免调用未注册的 runner。
+        if getattr(session, "pattern", None) and getattr(app.state, "enable_pipelines", False):
             try:
                 from baize.orchestration.api import _find_pipeline
                 pipeline_def = _find_pipeline(session.pattern)
@@ -2469,15 +3201,18 @@ def create_baize_api_app(
         # memory 子系统（baize.memory）：纯本地混合召回，不依赖任何旧经验引擎。
         experience_block = ""
         injected_exp_ids: list[str] = []
-        try:
-            recalled = app.state.memory_service.recall(payload.input)
-            injected_exp_ids = recalled.get("ids", [])
-            if injected_exp_ids:
-                app.state.memory_service.record_hits(injected_exp_ids)
-            if (recalled.get("block") or "").strip():
-                experience_block = recalled["block"]
-        except Exception:  # noqa: BLE001
-            logger.warning("记忆检索注入失败", exc_info=True)
+        # 记忆默认是“可查询的参考”，不是每轮强制注入的上下文。
+        # tool 模式：agent 通过 memory_search 自行查询；brief/auto 才自动召回。
+        if memory_auto_inject_enabled():
+            try:
+                recalled = app.state.memory_service.recall(payload.input)
+                injected_exp_ids = recalled.get("ids", [])
+                if injected_exp_ids:
+                    app.state.memory_service.record_hits(injected_exp_ids)
+                if (recalled.get("block") or "").strip():
+                    experience_block = recalled["block"]
+            except Exception:  # noqa: BLE001
+                logger.warning("记忆检索注入失败", exc_info=True)
 
         # ── 会话级记忆学习：记录活跃时间，顺带把空闲超时的旧会话收尾学习 ──
         app.state.session_last_active[session_id] = time.time()
@@ -2496,6 +3231,8 @@ def create_baize_api_app(
             # 本轮累积缓冲：思考过程、工具调用/结果记录、最终文本
             reasoning_parts: list[str] = []
             tool_events: list[dict] = []
+            # 工具调用开始时间：用于在 UI 上显示每一步耗时
+            tool_started: dict[str, float] = {}
             final_text = ""
             # 是否已把本轮内容持久化（正常完成 / 中断都只保存一次）
             saved = False
@@ -2672,8 +3409,10 @@ def create_baize_api_app(
                 _active_session_tasks[session_id] = current_task  # type: ignore[assignment]
 
                 stream = None
+                orch = None  # 供 finally 释放 claimed intent
                 draft_finalized = False
-                intermediates_saved = False  # 防止 intermediate 消息重复写入
+                reasoning_saved = False       # 思考过程只落一次，避免 phase 重复写入
+                tool_events_saved = 0         # 已落盘的工具事件数量（增量追加）
 
                 def _persist_draft(*, finished: bool, note: str = "") -> None:
                     """把当前正文+思考过程+工具轨迹落盘（中断/异常也不丢内容）。
@@ -2684,28 +3423,30 @@ def create_baize_api_app(
                     - tool_events → intermediate 消息（前端可回溯工具调用）
                     - final_text → assistant 正文
                     - reasoning_trace → 草稿字段（兼容旧前端）
+
+                    工具事件按增量追加：phase 开始时先落上一波已产生的调用，
+                    最终收尾再落最后一波；避免"只落一次"导致后续工具轨迹丢失。
                     """
-                    nonlocal draft_finalized, intermediates_saved
+                    nonlocal draft_finalized, reasoning_saved, tool_events_saved
                     if draft_finalized:
                         return
                     body = final_text
                     if note:
                         body = (body + note) if body else note
                     trace = "\n".join(reasoning_parts)[-8000:]
-                    # 思考过程 + 工具轨迹存为 intermediate 消息（仅写一次，
-                    # 防止 phase 事件多次调用 _persist_draft(finished=False) 时重复）
-                    if not intermediates_saved and (reasoning_parts or tool_events):
-                        if reasoning_parts:
-                            sm.append_message(
-                                session_id, "intermediate", "",
-                                extra={
-                                    "type": "reasoning",
-                                    "summary": [{"text": "".join(reasoning_parts)}],
-                                },
-                            )
-                        for ev in tool_events:
+                    if reasoning_parts and not reasoning_saved:
+                        sm.append_message(
+                            session_id, "intermediate", "",
+                            extra={
+                                "type": "reasoning",
+                                "summary": [{"text": "".join(reasoning_parts)}],
+                            },
+                        )
+                        reasoning_saved = True
+                    if tool_events_saved < len(tool_events):
+                        for ev in tool_events[tool_events_saved:]:
                             sm.append_message(session_id, "intermediate", "", extra=ev)
-                        intermediates_saved = True
+                        tool_events_saved = len(tool_events)
                     # 正文 + trace 草稿（草稿可反复更新，只保留最新版本）
                     if body.strip() or trace.strip():
                         sm.save_assistant_draft(session_id, body, trace, finished=finished)
@@ -2787,6 +3528,48 @@ def create_baize_api_app(
                                 f"event: reasoning_step\n"
                                 f"data: {json.dumps({'type': 'reasoning', 'text': text})}\n\n"
                             )
+                        elif ev_type == "tool_call":
+                            tool_name = str(ev_data.get("tool", "") or "")
+                            call_id = str(ev_data.get("call_id", "") or "")
+                            arguments = ev_data.get("arguments", "")
+                            if call_id:
+                                tool_started[call_id] = time.monotonic()
+                            tool_events.append({
+                                "type": "function_call",
+                                "name": tool_name,
+                                "arguments": arguments,
+                                "call_id": call_id,
+                                "agent": ev_data.get("agent", ""),
+                                "agent_label": ev_data.get("agent_label", ""),
+                            })
+                            yield (
+                                f"event: reasoning_step\n"
+                                f"data: {json.dumps({'type': 'tool_call', 'tool': tool_name, 'arguments': arguments, 'call_id': call_id, 'agent': ev_data.get('agent', ''), 'agent_label': ev_data.get('agent_label', '')})}\n\n"
+                            )
+                        elif ev_type == "tool_result":
+                            tool_name = str(ev_data.get("tool", "") or "")
+                            call_id = str(ev_data.get("call_id", "") or "")
+                            raw_output = str(ev_data.get("output", "") or "")
+                            duration = None
+                            if call_id and call_id in tool_started:
+                                duration = round(time.monotonic() - tool_started.pop(call_id), 4)
+                            _ui_output = raw_output
+                            if len(_ui_output) > 8000:
+                                _ui_output = _ui_output[:8000] + "\n[输出已截断，完整内容见会话日志]"
+                            tool_events.append({
+                                "type": "function_call_output",
+                                "id": call_id,
+                                "call_id": call_id,
+                                "name": tool_name,
+                                "output": raw_output,
+                                "duration": duration,
+                                "agent": ev_data.get("agent", ""),
+                                "agent_label": ev_data.get("agent_label", ""),
+                            })
+                            yield (
+                                f"event: reasoning_step\n"
+                                f"data: {json.dumps({'type': 'tool_output', 'tool': tool_name, 'output': _ui_output, 'call_id': call_id, 'duration': duration, 'agent': ev_data.get('agent', ''), 'agent_label': ev_data.get('agent_label', '')})}\n\n"
+                            )
                         elif ev_type == "phase":
                             phase = ev_data.get("phase", 0)
                             name = ev_data.get("name", "")
@@ -2802,6 +3585,17 @@ def create_baize_api_app(
                             content = ev_data.get("content", "")
                             final_text += content
                             yield f"data: {json.dumps({'type': 'delta', 'content': content})}\n\n"
+                        elif ev_type == "approval":
+                            # 编排期沙箱审批：转发为 user_prompt，前端展示审批弹窗。
+                            # 此前编排路径不转发该事件，用户看不到请求、审批超时后被记为拒绝。
+                            sandbox_sid = ev_data.get("session_id", "")
+                            tool = ev_data.get("tool_name", "")
+                            reason = ev_data.get("reason", "") or "需要审批"
+                            prompt_id = f"sandbox:{sandbox_sid}:{tool}"
+                            yield (
+                                "event: user_prompt\n"
+                                f"data: {json.dumps({'prompt_id': prompt_id, 'prompt_type': 'sandbox_approval', 'title': '工具执行审批', 'message': f'工具 `{tool}` 需要审批: {reason}', 'command': '', 'options': ['approve', 'deny'], 'is_password': False})}\n\n"
+                            )
                         elif ev_type == "error":
                             err = ev_data.get("error", "编排执行失败")
                             yield f"data: {json.dumps({'type': 'error', 'error': err})}\n\n"
@@ -2823,12 +3617,22 @@ def create_baize_api_app(
                     yield "data: [DONE]\n\n"
                     return
                 except asyncio.CancelledError:
-                    # 被同会话新消息取代：保留草稿后重新抛出，禁止再 yield SSE
-                    logger.info("对话编排被取消（session=%s），已保存执行草稿", session_id)
-                    _persist_draft(
-                        finished=True,
-                        note="\n\n_（已被新消息中断；回复「继续」可从黑板状态接着执行。）_",
-                    )
+                    # CancelledError 有两种来源：① 同会话新消息触发的单飞取消
+                    # （_active_session_tasks 已被新任务顶替）；② 客户端断连或
+                    # 内部任务被取消。只有①才能写成"被新消息中断"，否则会误导用户
+                    # 以为是自己发的消息打断了上一轮。
+                    if _active_session_tasks.get(session_id) is not current_task:
+                        logger.info("对话编排被新消息取代（session=%s），已保存执行草稿", session_id)
+                        _note = "\n\n_（已被新消息中断；回复「继续」可从黑板状态接着执行。）_"
+                    else:
+                        # 非单飞取消（客户端断连 / 内部任务被取消）属异常路径，
+                        # 打出栈信息便于定位泄漏点，避免下次再以黑盒方式排查。
+                        logger.info(
+                            "对话编排被取消（session=%s），已保存执行草稿",
+                            session_id, exc_info=True,
+                        )
+                        _note = "\n\n_（任务被中断；回复「继续」可从黑板状态接着执行。）_"
+                    _persist_draft(finished=True, note=_note)
                     raise
                 except Exception as e:  # noqa: BLE001
                     logger.exception("对话自动编排处理失败: %s", e)
@@ -2845,6 +3649,19 @@ def create_baize_api_app(
                     if stream is not None:
                         # 级联关闭编排器生成器，确保内部 agent/LLM/浏览器协程被取消
                         await stream.aclose()
+                    # 客户端断连/取消/超时后，claimed intent 不能永久悬挂。
+                    try:
+                        if orch is not None:
+                            released = orch.release_claimed(
+                                blackboard, reason="客户端断连/取消或会话超时，本轮未完成执行"
+                            )
+                            if released:
+                                logger.info(
+                                    "会话 %s 释放了 %d 个未完成 intent",
+                                    session_id, released,
+                                )
+                    except Exception:  # noqa: BLE001
+                        logger.debug("释放 claimed intent 失败", exc_info=True)
                     if _active_session_tasks.get(session_id) is current_task:
                         _active_session_tasks.pop(session_id, None)
 
@@ -2892,17 +3709,21 @@ def create_baize_api_app(
                         final_text += event.content
                         yield f"data: {json.dumps({'type': 'delta', 'content': event.content})}\n\n"
                     elif event.type == "tool_call":
+                        call_id = event.tool_call_id or ""
+                        if call_id:
+                            tool_started[call_id] = time.monotonic()
                         tool_events.append(
                             {
                                 "type": "function_call",
                                 "name": event.tool_name,
                                 "arguments": event.tool_args,
+                                "call_id": call_id,
                             }
                         )
                         # 前端期望 reasoning_step 命名事件展示工具调用过程
                         yield (
                             f"event: reasoning_step\n"
-                            f"data: {json.dumps({'type': 'tool_call', 'tool': event.tool_name, 'arguments': event.tool_args})}\n\n"
+                            f"data: {json.dumps({'type': 'tool_call', 'tool': event.tool_name, 'arguments': event.tool_args, 'call_id': call_id})}\n\n"
                         )
                     elif event.type == "tool_result":
                         # B-26: 截断提示 - 工具输出超长时给用户可见提示。
@@ -2913,17 +3734,26 @@ def create_baize_api_app(
                         _raw_output = event.tool_result or ""
                         if _mmc and len(_raw_output) > _mmc:
                             _trunc_notice = "\n[输出已截断，完整内容见会话日志]"
+                        _call_id = event.tool_call_id or ""
+                        _duration = None
+                        if _call_id and _call_id in tool_started:
+                            _duration = round(time.monotonic() - tool_started.pop(_call_id), 4)
+                        _ui_output = _raw_output
+                        if len(_ui_output) > 8000:
+                            _ui_output = _ui_output[:8000] + "\n[输出已截断，完整内容见会话日志]"
                         tool_events.append(
                             {
                                 "type": "function_call_output",
-                                "id": event.tool_call_id,
+                                "id": _call_id,
+                                "call_id": _call_id,
                                 "name": event.tool_name,
                                 "output": event.tool_result,
+                                "duration": _duration,
                             }
                         )
                         yield (
                             f"event: reasoning_step\n"
-                            f"data: {json.dumps({'type': 'tool_output', 'tool': event.tool_name, 'output': _raw_output + _trunc_notice})}\n\n"
+                            f"data: {json.dumps({'type': 'tool_output', 'tool': event.tool_name, 'output': _ui_output + _trunc_notice, 'call_id': _call_id, 'duration': _duration})}\n\n"
                         )
                     elif event.type == "sandbox_approval":
                         # 沙箱审批：转发为 user_prompt 事件，前端展示审批弹窗
@@ -3613,10 +4443,22 @@ def create_baize_api_app(
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    def sandbox_approve(payload: SandboxApproveRequest) -> dict:
+    def sandbox_approve(payload: SandboxApproveRequest, request: Request) -> dict:
         """审批通过工具执行。"""
         sandbox: Sandbox = app.state.sandbox
         sandbox.approve(payload.tool_name, payload.session_id)
+        actor_type, actor_id = _request_actor(app, request)
+        app.state.audit.record(
+            "sandbox.approve",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            ip=_request_ip(request),
+            ua=request.headers.get("user-agent", "")[:512],
+            resource_type="tool",
+            resource_id=payload.tool_name,
+            session_id=payload.session_id,
+            status_code=200,
+        )
         return {"status": "ok", "tool": payload.tool_name}
 
     @app.post(
@@ -3624,10 +4466,23 @@ def create_baize_api_app(
         response_model=dict,
         dependencies=[Depends(_require_api_key)],
     )
-    def sandbox_deny(payload: SandboxDenyRequest) -> dict:
+    def sandbox_deny(payload: SandboxDenyRequest, request: Request) -> dict:
         """拒绝工具执行。"""
         sandbox: Sandbox = app.state.sandbox
         sandbox.deny(payload.tool_name, payload.session_id)
+        actor_type, actor_id = _request_actor(app, request)
+        app.state.audit.record(
+            "sandbox.deny",
+            actor_type=actor_type,
+            actor_id=actor_id,
+            ip=_request_ip(request),
+            ua=request.headers.get("user-agent", "")[:512],
+            resource_type="tool",
+            resource_id=payload.tool_name,
+            session_id=payload.session_id,
+            status="denied",
+            status_code=200,
+        )
         return {"status": "ok", "tool": payload.tool_name, "denied": True}
 
     @app.get(
@@ -3647,12 +4502,44 @@ def create_baize_api_app(
         "/api/v1/auth/login",
         response_model=AuthResponse,
     )
-    def login(payload: LoginRequest) -> AuthResponse:
+    def login(payload: LoginRequest, request: Request) -> AuthResponse:
         auth: AuthManager = app.state.auth_manager
         token = auth.issue_token(payload.username, payload.password)
+        ip = _request_ip(request)
+        ua = request.headers.get("user-agent", "")[:512]
         if token is None:
+            app.state.audit.record(
+                "auth.login",
+                actor_type="user",
+                actor_id=payload.username[:256],
+                ip=ip,
+                ua=ua,
+                resource_type="auth",
+                resource_id="login",
+                status="denied",
+                status_code=401,
+                detail={"reason": "invalid_credentials"},
+            )
             raise HTTPException(status_code=401, detail="用户名或密码错误")
+        app.state.audit.record(
+            "auth.login",
+            actor_type="user",
+            actor_id=payload.username[:256],
+            ip=ip,
+            ua=ua,
+            resource_type="auth",
+            resource_id="login",
+            status="ok",
+            status_code=200,
+        )
         return AuthResponse(token=token, ok=True)
+
+    # ------------------------------------------------------------------
+    # 审计日志查询 / 导出 / 校验
+    # ------------------------------------------------------------------
+    from baize.api.audit import register as register_audit_api
+
+    register_audit_api(app, _require_api_key)
 
     return app
 
@@ -3672,10 +4559,11 @@ def _print_credentials(app: FastAPI, cfg) -> None:
     username = auth.default_username
     separator = "=" * 44
     if auth.default_password and auth.default_token:
-        # 凭证默认写入 ~/.baize/credentials.txt（权限 0600），stdout 仅显示路径，
+        # 凭证默认写入 $BAIZE_DATA_DIR/credentials.txt（权限 0600），stdout 仅显示路径，
         # 避免明文密码/Token 进入容器日志被运维平台永久存档。
         # 设 BAIZE_PRINT_TOKENS=1 才在 stdout 回显明文。
-        cred_path = Path.home() / ".baize" / "credentials.txt"
+        # 跟随 BAIZE_DATA_DIR：多实例/测试环境不应互相覆盖全局 HOME 下的凭据文件。
+        cred_path = Path(DEFAULT_BAIZE_DIR) / "credentials.txt"
         try:
             cred_path.parent.mkdir(parents=True, exist_ok=True)
             cred_path.write_text(
@@ -3748,6 +4636,11 @@ def _discover_and_load_modules(app: FastAPI) -> None:
         eps = entry_points().get("baize.modules", [])
 
     for ep in eps:
+        # 流水线下架期间，连外部 baize-orchestration entry point 也一并跳过，
+        # 避免第三方模块绕过功能开关重新注册路由/启动接收器。
+        if ep.name == "orchestration" and not getattr(app.state, "enable_pipelines", False):
+            logger.info("跳过外部编排模块 %s（BAIZE_ENABLE_PIPELINES=0）", ep.name)
+            continue
         try:
             mod = ep.load()
             if callable(mod):

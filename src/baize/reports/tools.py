@@ -113,14 +113,18 @@ def build_report_tools(
         if rec.status != "draft":
             return f"(报告 {report_id} 已完成，无法追加)"
         chunk = section_markdown
-        truncated = False
-        if len(chunk) > _MAX_SECTION_CHARS:
-            chunk = chunk[:_MAX_SECTION_CHARS]
-            truncated = True
+        oversized = len(chunk) > _MAX_SECTION_CHARS
         try:
+            # 不截断：模型写多少就完整落盘多少。此前超长会静默截断，导致
+            # 报告详情丢失（表现为"报告落盘不全"）。超长时只给提示性说明，
+            # 内容不丢——写什么由 AI 决定，工具不代为删减。
             report_store.append_section(report_id, chunk)
-            size = report_store.get(report_id).size if report_store.get(report_id) else 0
-            note = "（注意：本段超长已截断，请将剩余部分再调一次 append）" if truncated else ""
+            rec_after = report_store.get(report_id)
+            size = rec_after.size if rec_after else 0
+            note = (
+                f"（本段 {len(chunk)} 字符较长，已完整写入；建议后续章节拆小）"
+                if oversized else ""
+            )
             return f"✓ 已追加章节（报告当前 {size} 字节）{note}"
         except Exception as e:  # noqa: BLE001
             return f"(追加章节失败: {e})"

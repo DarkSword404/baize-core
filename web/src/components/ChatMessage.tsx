@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useMemo, memo } from 'react';
 import type { ChatMessage as ChatMessageType, IntermediateData } from '../types';
+import { buildToolActivities, type ToolActivity } from '../lib/toolActivity';
 import type { JSX } from 'react';
 
 /**
@@ -64,15 +65,27 @@ export const ChatMessage = memo(function ChatMessage({ msg }: { msg: ChatMessage
   const hasIntermediates = Array.isArray(msg.intermediates) && msg.intermediates.length > 0;
   const isUser = msg.role === 'user';
 
-  // ── 思考过程：多个中间产物折叠块（在消息体上方） ──
-  const thinkingBlocks = hasIntermediates && !isUser ? (
+  // 工具调用/输出配对成“执行轨迹”；reasoning / handoff 仍走折叠思考块。
+  const activities = useMemo(
+    () => buildToolActivities(msg.intermediates, !!msg.isStreaming),
+    [msg.intermediates, msg.isStreaming],
+  );
+  const thinkingItems = useMemo(
+    () => (msg.intermediates || []).filter(
+      item => item.itemType === 'reasoning' || item.itemType === 'handoff',
+    ),
+    [msg.intermediates],
+  );
+
+  // ── 思考过程：只保留推理/交接块（工具过程由 ActivityTimeline 统一展示） ──
+  const thinkingBlocks = thinkingItems.length > 0 && !isUser ? (
     <div className="mb-2 space-y-1.5">
-      {msg.intermediates!.map((item, i) => (
+      {thinkingItems.map((item, i) => (
         <ThinkingBlock
           key={`${msg.id}-int-${i}`}
           item={item}
           timestamp={msg.timestamp}
-          isLast={i === msg.intermediates!.length - 1 && !!msg.isStreaming}
+          isLast={i === thinkingItems.length - 1 && !!msg.isStreaming}
         />
       ))}
     </div>
@@ -98,9 +111,15 @@ export const ChatMessage = memo(function ChatMessage({ msg }: { msg: ChatMessage
         </div>
       )}
 
+      {/* 工具执行轨迹：一行一个动作，参数/输出可展开 */}
+      {!isUser && activities.length > 0 && (
+        <ActivityTimeline activities={activities} isStreaming={!!msg.isStreaming} />
+      )}
+
       {/* Thinking blocks above the main message */}
       {thinkingBlocks}
 
+      {(msg.content || !hasIntermediates) && (
       <div
         className={`max-w-[85%] px-4 py-3 rounded-xl text-sm leading-relaxed ${
           isUser
@@ -136,6 +155,7 @@ export const ChatMessage = memo(function ChatMessage({ msg }: { msg: ChatMessage
           </div>
         )}
       </div>
+      )}
 
       {isUser && (
         <div className="flex items-center gap-2 mt-1.5 mr-1 justify-end">
@@ -157,6 +177,125 @@ function attachmentIcon(filename: string): string {
   if (/\.(zip|tar|gz|tgz|7z|bz2)$/.test(lower)) return '📦';
   if (/\.(pdf|docx?|pptx?|xlsx?)$/.test(lower)) return '📄';
   return '📎';
+}
+
+const activityStatusConfig: Record<ToolActivity['status'], { label: string; icon: string; cls: string; dot: string }> = {
+  running: { label: '运行中', icon: '◌', cls: 'text-blue-400 border-blue-500/20 bg-blue-600/10', dot: 'bg-blue-400 animate-pulse' },
+  ok: { label: '完成', icon: '✓', cls: 'text-emerald-400 border-emerald-500/20 bg-emerald-600/10', dot: 'bg-emerald-400' },
+  error: { label: '失败', icon: '⚠', cls: 'text-red-400 border-red-500/20 bg-red-600/10', dot: 'bg-red-400' },
+  denied: { label: '拒绝', icon: '⛔', cls: 'text-amber-400 border-amber-500/20 bg-amber-600/10', dot: 'bg-amber-400' },
+  pending: { label: '未完成', icon: '–', cls: 'text-gray-500 border-gray-600/20 bg-gray-700/10', dot: 'bg-gray-500' },
+};
+
+/** 工具执行轨迹：把 AI 的每一步动作压缩成“工具 + 关键参数 + 状态”，避免只看到最终报告。 */
+function ActivityTimeline({ activities, isStreaming }: { activities: ToolActivity[]; isStreaming: boolean }): JSX.Element {
+  const [showAll, setShowAll] = useState(false);
+  const visible = showAll ? activities : activities.slice(-6);
+  const hiddenCount = activities.length - visible.length;
+  const errorCount = activities.filter(a => a.status === 'error').length;
+  const running = activities.some(a => a.status === 'running');
+
+  return (
+    <div className="ml-2 mb-2 max-w-[85%] rounded-xl border border-gray-700/50 bg-gray-900/45 overflow-hidden">
+      <div className="px-3 py-2 flex items-center gap-2 border-b border-gray-800/70">
+        <span className="text-[10px] font-semibold uppercase tracking-wider text-gray-400">执行轨迹</span>
+        <span className="text-[10px] text-gray-600">{activities.length} 次工具</span>
+        {errorCount > 0 && (
+          <span className="text-[10px] px-1.5 py-0.5 rounded bg-red-600/10 border border-red-600/20 text-red-400">
+            {errorCount} 失败
+          </span>
+        )}
+        {running && isStreaming && (
+          <span className="text-[10px] text-blue-400 flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-ping" />
+            执行中
+          </span>
+        )}
+        <span className="flex-1" />
+        {hiddenCount > 0 && (
+          <button
+            onClick={() => setShowAll(true)}
+            className="text-[10px] text-blue-400 hover:text-blue-300 transition-colors"
+          >
+            查看全部 +{hiddenCount}
+          </button>
+        )}
+        {showAll && activities.length > 6 && (
+          <button
+            onClick={() => setShowAll(false)}
+            className="text-[10px] text-gray-500 hover:text-gray-300 transition-colors"
+          >
+            收起
+          </button>
+        )}
+      </div>
+      <div className="divide-y divide-gray-800/50">
+        {visible.map((activity) => {
+          const cfg = activityStatusConfig[activity.status];
+          const duration = typeof activity.duration === 'number'
+            ? (activity.duration >= 0.1 ? `${activity.duration.toFixed(1)}s` : `${Math.max(1, Math.round(activity.duration * 1000))}ms`)
+            : '';
+          const outputPreview = activity.output
+            ? activity.output.replace(/\s+/g, ' ').trim().slice(0, 90)
+            : '';
+          return (
+            <details key={activity.key} className="group">
+              <summary className="list-none cursor-pointer px-3 py-1.5 hover:bg-gray-800/40 transition-colors">
+                <div className="flex items-center gap-2 min-w-0">
+                  <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${cfg.dot}`} />
+                  <span className={`text-[11px] font-mono flex-shrink-0 ${cfg.cls.split(' ').filter(c => c.startsWith('text-')).join(' ')}`}>
+                    {activity.label}
+                  </span>
+                  {activity.agent && (
+                    <span className="text-[9px] px-1 py-0.5 rounded bg-gray-800 text-gray-500 flex-shrink-0" title={activity.agent}>
+                      {activity.agent}
+                    </span>
+                  )}
+                  <span className="text-[11px] text-gray-400 truncate font-mono">
+                    {activity.summary}
+                  </span>
+                  <span className="flex-1" />
+                  {duration && <span className="text-[9px] text-gray-600 flex-shrink-0">{duration}</span>}
+                  <span className={`text-[9px] px-1.5 py-0.5 rounded border flex-shrink-0 ${cfg.cls}`}>
+                    {cfg.icon} {cfg.label}
+                  </span>
+                  <span className="text-[9px] text-gray-700 group-open:rotate-90 transition-transform flex-shrink-0">▶</span>
+                </div>
+                {outputPreview && (
+                  <div className="mt-0.5 ml-3.5 text-[10px] text-gray-600 truncate font-mono">
+                    → {outputPreview}{activity.output.length > 90 ? '…' : ''}
+                  </div>
+                )}
+              </summary>
+              <div className="px-3 pb-2 ml-3.5 space-y-1.5">
+                {activity.argsDetail && (
+                  <div>
+                    <div className="text-[9px] text-gray-600 uppercase tracking-wider mb-0.5">参数</div>
+                    <pre className="max-h-40 overflow-auto rounded-md bg-gray-950/70 border border-gray-800 px-2 py-1.5 text-[10px] text-gray-400 whitespace-pre-wrap break-all">
+                      {activity.argsDetail}
+                    </pre>
+                  </div>
+                )}
+                {activity.output && (
+                  <div>
+                    <div className="text-[9px] text-gray-600 uppercase tracking-wider mb-0.5">输出</div>
+                    <pre className="max-h-64 overflow-auto rounded-md bg-gray-950/70 border border-gray-800 px-2 py-1.5 text-[10px] text-gray-400 whitespace-pre-wrap break-all">
+                      {activity.output.length > 12000
+                        ? `${activity.output.slice(0, 12000)}\n\n[输出较长，仅显示前 12000 字符；完整内容见会话日志]`
+                        : activity.output}
+                    </pre>
+                  </div>
+                )}
+                {!activity.output && activity.status === 'pending' && (
+                  <div className="text-[10px] text-gray-600 italic">该步骤未返回输出（可能被中断或未执行完）。</div>
+                )}
+              </div>
+            </details>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 /** 单个思考块：折叠/展开，流式时自动展开 */

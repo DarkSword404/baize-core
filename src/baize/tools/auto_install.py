@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -112,6 +113,15 @@ def _needs_sudo(pm: str) -> bool:
     return pm in ("apt", "dnf", "pacman")
 
 
+# 已确定失败的安装记忆：binary → 失败原因。
+# 同一进程内不再重复尝试（如沙箱镜像里根本没有 apt 包 exploitdb，
+# 每次工具调用都重跑 apt + 沙箱审批纯属白烧预算）。仅在"确定性失败"
+# 时写入：无包管理器 / 无安装命令 / 安装命令返回非 0 / 审批未收到决定（超时）。
+# 不写"用户显式拒绝"——显式拒绝已由沙箱会话级 denials 粘性拦截，
+# 且尊重用户后续改变决定。
+_FAILED_INSTALLS: dict[str, str] = {}
+
+
 # ---------------------------------------------------------------------------
 # 自动安装入口
 # ---------------------------------------------------------------------------
@@ -133,13 +143,33 @@ async def try_auto_install(
     Returns:
         (success, message): 安装成功返回 (True, 输出)；失败返回 (False, 原因)。
     """
+    cached = _FAILED_INSTALLS.get(binary)
+    if cached:
+        # 同一二进制已确定装不上（如沙箱镜像无该 apt 包），不重复跑安装。
+        return False, f"{cached}（本进程内不再重试，可手动安装）"
+
     pm = detect_package_manager()
     if pm is None:
-        return False, "未检测到可用的包管理器（apt/winget/choco/dnf/brew/pacman）"
+        reason = "未检测到可用的包管理器（apt/winget/choco/dnf/brew/pacman）"
+        _FAILED_INSTALLS[binary] = reason
+        return False, reason
 
     cmd = _build_install_command(binary, pm)
     if cmd is None:
-        return False, f"工具 {binary} 在 {pm} 下无对应安装命令，请手动安装"
+        # 首选包管理器没有该工具的映射时，回退到其它可用管理器。
+        # 典型：wafw00f 在 apt 下无对应包、只有 pip，若只看首选 pm 会直接放弃，
+        # 导致 agent 每轮都撞 "command not found" 白烧预算。
+        for alt in ("pip", "apt", "dnf", "pacman", "brew", "choco", "winget"):
+            if alt == pm:
+                continue
+            alt_cmd = _build_install_command(binary, alt)
+            if alt_cmd is not None:
+                pm, cmd = alt, alt_cmd
+                break
+    if cmd is None:
+        reason = f"工具 {binary} 在所有已知包管理器下均无安装命令，请手动安装"
+        _FAILED_INSTALLS[binary] = reason
+        return False, reason
 
     # 走沙箱审批（自动安装属危险区 generic_linux_command）
     if sandbox is not None and session_id:
@@ -149,6 +179,11 @@ async def try_auto_install(
                 approved = await sandbox.request_approval(
                     "generic_linux_command", session_id, timeout=300.0
                 )
+            except asyncio.TimeoutError:
+                # 未收到用户决定（并非用户拒绝）：记为确定性失败，本进程内不再重复等待。
+                reason = f"审批超时：未在限定时间内收到用户决定，未执行安装 {binary}"
+                _FAILED_INSTALLS[binary] = reason
+                return False, reason
             except Exception as exc:  # noqa: BLE001
                 return False, f"沙箱审批异常: {exc}"
             if not approved:
@@ -173,7 +208,9 @@ async def try_auto_install(
         sandbox.record_execution("generic_linux_command", session_id, success=(result.returncode == 0))
 
     if result.returncode != 0:
-        return False, f"安装失败 (exit={result.returncode}): {result.text[:500]}"
+        reason = f"安装失败 (exit={result.returncode}): {result.text[:500]}"
+        _FAILED_INSTALLS[binary] = reason
+        return False, reason
 
     # 验证二进制是否真的可用
     if shutil.which(binary):

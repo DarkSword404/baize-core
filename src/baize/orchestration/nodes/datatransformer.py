@@ -102,6 +102,11 @@ class DataTransformerNodeExecutor(BaseNodeExecutor):
                 # 直通
                 result_data = {"output": upstream_output}
 
+            # data 字段约定为 dict[str, Any]；内置转换器可能返回 str/list，
+            # 直接写入会被前端按 dict 渲染成"逐字符 key"。统一包一层。
+            if not isinstance(result_data, dict):
+                result_data = {"output": result_data}
+
             output_str = json.dumps(result_data, ensure_ascii=False, default=str)
 
             updates.update(self._record_done(node, state, output_str, result_data))

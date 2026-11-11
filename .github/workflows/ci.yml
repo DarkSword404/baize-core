@@ -45,12 +45,10 @@ jobs:
         run: |
           python -c "import baize; print('import OK')"
 
-      - name: Frontend type check
+      - name: Frontend build (type check + bundle)
         run: |
-          cd web && npm ci && npx tsc --noEmit
-        continue-on-error: true
+          cd web && npm ci && npm run build
 
       - name: Run tests
         run: |
-          python -m pytest tests/ -v --tb=short || true
-        continue-on-error: true
+          python -m pytest tests/ -v --tb=short

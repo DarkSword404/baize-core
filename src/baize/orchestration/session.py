@@ -165,16 +165,21 @@ class SessionSupervisor:
 
     @staticmethod
     def _resolve_receiver_id(pipeline: PipelineDefinition) -> str:
-        """解析流水线绑定的接收器 id：激活绑定 > receiver 节点 agent > 节点 id。"""
+        """解析流水线绑定的接收器 id：激活绑定 > receiver 节点 agent > 节点 id。
+
+        激活绑定优先且不依赖 receiver 节点存在：实例模型允许模板只含普通
+        节点（入站数据经 context 注入），只要绑定了接收器就应能消费。
+        此前先检查 receiver 节点，导致无 receiver 节点的模板被误判为
+        "未绑定接收器"，enable 返回成功但长驻会话从未启动。
+        """
+        binding = get_activation_store().get_binding(pipeline.id)
+        if binding:
+            return binding
         receiver_node = next(
             (n for n in pipeline.nodes if n.type == "receiver"), None
         )
         if receiver_node is None:
             return ""
-        # 激活绑定（由 activate 请求显式提供）优先
-        binding = get_activation_store().get_binding(pipeline.id)
-        if binding:
-            return binding
         return receiver_node.agent or receiver_node.id or ""
 
     # ------------------------------------------------------------------

@@ -12,7 +12,7 @@ interface DashboardStats {
 }
 
 export function Dashboard(): JSX.Element {
-  const { addToast } = useApp();
+  const { addToast, installedModules } = useApp();
   const navigate = useNavigate();
   const [stats, setStats] = useState<DashboardStats>({ modelCount: '—', sessionCount: 0, activeSessions: 0 });
   const [recentSessions, setRecentSessions] = useState<SessionSummary[]>([]);
@@ -114,7 +114,10 @@ export function Dashboard(): JSX.Element {
         <h2 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">快捷操作</h2>
         <div className="flex gap-3 flex-wrap">
           <QuickAction label="新建对话" onClick={() => navigate('/chat')} />
-          <QuickAction label="编排平台" onClick={() => navigate('/orchestration')} />
+          <QuickAction label="审计日志" onClick={() => navigate('/audit')} />
+          {installedModules?.orchestration?.installed && (
+            <QuickAction label="编排平台" onClick={() => navigate('/orchestration')} />
+          )}
           <QuickAction label="系统设置" onClick={() => navigate('/settings')} />
         </div>
       </div>

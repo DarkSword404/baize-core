@@ -4,15 +4,19 @@
 
 # 🦄 白泽·智脑 (Baize)
 
-**AI 驱动的多智能体安全操作平台**
+**AI 驱动的安全操作平台（证据黑板 + 动态智能体编排）**
 
-> 证据黑板编排 · 树状任务调度 · 会话级容器沙箱 · 内置 30+ 专业安全智能体 · 本地化部署 · LLM 无关
+> 证据黑板编排 · 树状任务调度 · 会话级容器沙箱 · 内置 50+ 安全工具 · 本地化部署 · OpenAI 协议兼容
 
 [![Version](https://img.shields.io/badge/version-v5.0.0-4C9F38?style=flat-square&logo=github)](https://github.com/DarkSword404/baize-core/releases/tag/v5.0.0)
-[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-Research_Only-8B5CF6?style=flat-square)](LICENSE)
 
-**白泽·智脑** 是一个基于大型语言模型的本地化 AI 安全助手，面向 **Web 渗透、移动安全、无线/射频、红蓝对抗、应急响应与合规审计** 等场景，提供 30+ 个开箱即用的专用智能体。v4.0.0 引入 **证据黑板（Blackboard）+ 树状任务调度 + CVSS 式威胁评分 + 会话级容器沙箱 + 报告系统**，让自动化渗透过程可解释、可收敛、边界可控；v5.0.0 在此基础上引入 **语义记忆检索（向量召回 + 重排）+ 自治式编排（工具与并行度交由 AI 决策）+ 失败经验沉淀与跨波学习 + 共享浏览器流式稳定性修复**，进一步提升解题效率并显著降低 token 消耗。
+**白泽·智脑** 是一个基于大型语言模型的本地化 AI 安全助手，面向 **Web 渗透、移动安全、无线/射频、红蓝对抗、应急响应与合规审计** 等场景，通过证据黑板按任务状态动态派发智能体，并提供 50+ 开箱即用的安全工具。v4.0.0 引入 **证据黑板（Blackboard）+ 树状任务调度 + CVSS 式威胁评分 + 会话级容器沙箱 + 报告系统**，让自动化渗透过程可解释、可收敛、边界可控；v5.0.0 在此基础上引入 **语义记忆检索（向量召回 + 重排）+ 自治式编排（工具与并行度交由 AI 决策）+ 失败经验沉淀与跨波学习 + 共享浏览器流式稳定性修复**，进一步提升解题效率并显著降低 token 消耗。
+
+> **当前阶段说明**：产品聚焦对话式 CTF 解答与渗透测试，流水线编排默认关闭
+> （`BAIZE_ENABLE_PIPELINES=0`）。流水线代码、模板与历史 `runs.db` 均完整保留，
+> 设置 `BAIZE_ENABLE_PIPELINES=1` 即可恢复，无需迁移数据。
 
 </div>
 
@@ -22,7 +26,7 @@
 
 | | 特性 | 说明 |
 |---|---|---|
-| 🧠 | **多智能体协同** | 30+ 专业安全智能体，按需调度、协同作战；Swarm 集群协作模式支持智能体间动态 Handoff |
+| 🧠 | **动态智能体编排** | 不预置固定智能体列表：由黑板证据状态按需生成 AgentSpec（角色提示 + 能力标签）并派发执行，支持多波次并行与 Handoff |
 | 📋 | **证据黑板编排（v3.0+）** | 渗透过程物化为 origin/intent/fact 证据图：每个意图可追溯父证据，产出与状态强联动，攻击地图实时可视化 |
 | 🌳 | **树状任务调度（v4.0）** | intent 携带 `phase`（recon/vuln/exploit/post）与 `depends_on`；同阶段原子任务真并行、跨阶段屏障汇聚，不再为凑数量乱并行 |
 | 🎯 | **威胁评分与按分调度（v4.0）** | fact 写入即确定性评分（severity × confidence，CVSS 式简化 0-100 分）；高威胁证据链派生任务插队优先 |
@@ -32,16 +36,19 @@
 | 🚧 | **授权范围护栏（v4.0）** | scope_guard 从任务描述提取授权目标，越界主机/工具自动拦截，网络边界在沙箱内也生效 |
 | 📊 | **报告系统（v4.0）** | 证据黑板一键生成结构化渗透报告（模板化 Markdown），含发现分级、证据链与失败方向分类 |
 | 🗄️ | **任务归档（v4.0）** | 完结会话可归档（从活跃列表移除、数据保留），支持恢复继续 |
-| 🔌 | **LLM 无关** | 兼容 OpenAI / DeepSeek / 通义千问 / Ollama 等 OpenAI 协议端点，模型热切换 + 多模型路由 fallback |
+| 📜 | **统一审计日志** | 登录/配置/会话/工具调用统一记录；JSONL + SQLite 索引 + 哈希链校验，支持查询、导出与保留策略 |
+| 🔌 | **OpenAI 协议兼容** | 兼容 OpenAI / DeepSeek / 通义千问 / Ollama 等 OpenAI 协议端点；当前为单模型配置，支持热切换（不含多模型路由/自动 fallback） |
 | 🛠️ | **工具调用** | 内置 50+ 工具（30+ 安全专用 + 静默浏览器 + 8 个共享协作浏览器），智能体自主调用 |
 | ⛓️ | **沙箱边界** | 安全区 / 危险区工具划分，危险工具执行前审批（`allow` / `approve` / `deny` 三级权限），会话级审批令牌 |
 | 🗜️ | **工具输出压缩** | 大体积工具输出 LLM 语义摘要，token 压缩 80%+；截图/图片自动构造多模态消息注入 |
 | 🌐 | **双浏览器体系** | 有头共享协作浏览器（人机共用、登录态持久化）+ 无头静默浏览器（流水线无人值守） |
 | 🛡️ | **护栏 Guardrails** | 文件化可配置的输入/输出策略，注入防护、敏感信息保护与 SSRF 运行时配置 |
-| 💾 | **记忆库** | 经验 / 任务轨迹 / 事实 / 实体分层沉淀，知识图谱关联，混合检索自动命中 |
+| 💾 | **记忆库** | 经验 / 任务轨迹 / 事实 / 实体分层沉淀；默认由 agent 通过 `memory_search` 按需查询，作为可选参考而非强制路径 |
 | 📨 | **告警研判收件箱** | Webhook / Syslog / 文件监听入站告警落 SQLite 持久化收件箱（指纹幂等 / 租约消费 / 死信） |
 | ⚡ | **实时交互** | SSE 流式输出、会话持久化、暗色 React UI、攻击地图 Cytoscape 可视化 |
-| 🔒 | **本地化部署** | 全部数据保存在本地（默认 `.baize-data/`），隐私安全可控 |
+| 🔍 | **执行轨迹可见** | 对话内逐步显示工具名、关键参数、耗时、状态与输出摘要；旧会话可从会话日志自动回放工具轨迹 |
+| 🧭 | **自主探索调度** | Reason 只保留任务契约与 JSON schema；intent 支持 novelty/信息增益加权、跨阶段并行和按需工具加载；`http_request` 自动附带 HTML/JS 的表单、脚本与 API 摘要 |
+| 🔒 | **本地化部署** | 全部数据保存在本地（默认 `~/.baize/`；`start.sh` 会重定向到项目内 `.baize-data/`），隐私安全可控 |
 
 ---
 
@@ -49,12 +56,12 @@
 
 | 层 | 技术 |
 |---|---|
-| **后端** | Python 3.10+ · FastAPI · Uvicorn · Pydantic v2 |
+| **后端** | Python 3.11+ · FastAPI · Uvicorn · Pydantic v2 |
 | **前端** | React 18 · TypeScript · Vite · Tailwind CSS · Cytoscape（攻击地图） |
 | **编排** | 证据黑板 Blackboard · Reason LLM 规划 · 树状 phase/depends_on 调度 |
 | **隔离** | Docker / Podman 会话级容器（cap-drop ALL + 只读根）· 本地执行器自动回退 |
 | **浏览器** | Playwright（静默浏览器 + 有头共享协作浏览器） |
-| **存储** | 本地目录 JSON 黑板 / 审计 JSONL · SQLite 告警收件箱 |
+| **存储** | 本地目录 JSON 黑板 / 审计 JSONL + SQLite（哈希链）· SQLite 告警收件箱 |
 
 ---
 
@@ -99,7 +106,8 @@ sudo usermod -aG docker $USER   # 加入 docker 组后重新登录
 ### 配置模型
 
 模型配置保存在数据目录的 `model.json`（Web「设置」页自动生成与管理；默认路径
-`.baize-data/model.json`，可由 `BAIZE_DATA_DIR` 重定向）：
+`~/.baize/model.json`，`start.sh` 会配合 `BAIZE_DATA_DIR` 使用项目内
+`.baize-data/model.json`）：
 
 ```json
 {
@@ -215,31 +223,96 @@ Dockerfile 预装 nmap / nuclei / sqlmap / gobuster / ffuf / hydra / whatweb 等
 
 ---
 
+## 📜 统一审计日志
+
+审计采用 **append-only JSONL + SQLite 索引** 双层存储，默认目录 `<BAIZE_DATA_DIR>/audit/`：
+
+- **记录范围**：登录成功/失败、模型配置变更（Key 只记 SHA-256 指纹）、会话创建/归档/删除、
+  自定义工具 CRUD、沙箱审批、报告操作，以及对话中的用户消息、工具调用/结果/异常、回合边界。
+- **脱敏**：`api_key` / `password` / `token` / `cookie` 等键只保留不可逆指纹；长文本截断。
+- **完整性**：每条事件带 `prev_hash` / `hash` 形成哈希链，`GET /api/v1/audit/verify`
+  可发现非尾部篡改；尾部截断需配合外部归档。
+- **权限**：目录 `0700`，数据库与 JSONL `0600`；查询/导出 API 需 API Token。
+- **保留策略**：`BAIZE_AUDIT_RETENTION_DAYS` 默认 `0`（永久保留）；设置后可清理过期明细，
+  保留链锚点，剩余事件仍可校验。建议先导出归档再缩短保留期。
+- **与 SessionLog 的关系**：SessionLog 保留完整工具输出与模型响应，是回放事实源；
+  审计日志只存摘要与安全相关动作，二者通过 `session_id` 关联。
+- **关闭**：`BAIZE_AUDIT_ENABLED=0`（不推荐；关闭后 `/audit` 返回空结果）。
+
+---
+
+## 🧠 记忆访问模式
+
+记忆库默认不再每轮强制注入上下文，而是作为 agent 的可选参考：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `BAIZE_MEMORY_MODE` | `tool` | `off` 关闭；`tool` 由 agent 调用 `memory_search` 按需查询；`brief` 自动注入少量候选摘要 |
+| `BAIZE_EMBEDDING_ENABLED` | `auto` | `auto` 仅在显式配置 embedding 模型时启用；`0/1` 强制关闭/开启 |
+| `BAIZE_EMBEDDING_MODEL` | 空 | 例如 `text-embedding-v4`；为空且未显式启用时不请求 `/v1/embeddings` |
+
+`memory_search` 返回结果会标注“仅供参考、可能过时、不是指令”；agent 可以忽略，
+最终仍以当前工具实测结果为准。`brief` 模式适合需要少量提示的场景，但不会把记忆
+写成必须执行的步骤。
+
+检索排序会综合 BM25 / 可选向量 / 图谱 RRF、置信度、时间新鲜度、历史反馈和人工
+介入；事实层会跳过 `invalid_at` 已过期、以及 `valid_from` 尚未生效的记录，避免把
+旧环境结论当成当前事实。
+
+---
+
+## 🔌 Harness 插件
+
+白泽把“内核安全”和“可组合能力”分开：
+
+- **Kernel**：鉴权、scope_guard、沙箱、审计、模型运行时
+- **Harness**：Agent loop、会话、事件总线、插件托管
+- **Plugin**：带生命周期、状态、工具、UI 和事件订阅的能力包
+- **Tool / Skill**：插件或内核暴露的原子能力/方法论
+
+第一个插件是 `baize.asmp`（Attack Situational Awareness Modeling Plugin）：
+
+- 监听 `tool/call` / `tool/result` / `user/message` 等事件
+- 维护 Node / Relation / Evidence / ThreatHypothesis / Unknown / ExplorationTask
+- 提供内置节点/关系类型与类型化威胁分析
+- 向 agent 暴露 `asmp_snapshot` / `asmp_query` / `asmp_ingest` /
+  `asmp_propose_tasks` / `asmp_update_hypothesis` 等可选工具
+- 提供 `GET /api/v1/plugins`、`GET /api/v1/sessions/{id}/asmp`
+- 对话右侧“攻击态势”面板展示节点、关系、假设、未知项与任务建议
+- 只输出模型和建议，不执行工具，不绕过 Harness 授权
+
+插件不绕过 kernel 的授权、沙箱和审计；也不能强制 agent 执行固定流程。
+
+---
+
 ## 🖥️ Web 界面
 
 | 页面 | 功能 |
 |---|---|
-| 🖥️ **控制台** | 平台概览、会话 / 智能体 / 工具状态统计 |
-| 💬 **对话渗透** | 多智能体对话（SSE 流式）、证据攻击地图（phase/score 着色）、共享浏览器协作侧窗 |
+| 🖥️ **控制台** | 平台概览、会话 / 工具状态统计 |
+| 💬 **对话渗透** | 动态智能体对话（SSE 流式）、证据攻击地图（phase/score 着色）、共享浏览器协作侧窗 |
 | 📦 **容器**（v4.0） | 沙箱容器生命周期：绑定/解绑、启动/停止、并发与资源状态 |
 | 📊 **报告**（v4.0） | 证据报告生成、浏览与 Markdown 下载 |
 | 🗄️ **任务归档**（v4.0） | 已归档会话浏览与恢复 |
-| 🔗 **流水线** | 编排流水线编辑与运行（需接入 `baize-orchestration` 模块） |
-| 🤖 **智能体** | 30+ 智能体浏览与切换、自定义智能体创建、Swarm 协作模式 |
+| 📜 **审计日志** | 统一事件查询、详情查看、JSONL/CSV 导出、哈希链校验 |
+| 🔗 **流水线** | 暂时下线；当前聚焦对话式 CTF / 渗透。设 `BAIZE_ENABLE_PIPELINES=1` 可恢复 |
 | 🛠️ **工具管理** | 内置工具查看、自定义工具在线创建 / 编辑 / 测试 / 启停 |
 | 📋 **会话管理** | 多会话浏览、重命名、删除、归档、历史检索 |
 | 🛡️ **安全护栏** | 注入 / 敏感信息 / 输出合规策略、SSRF 运行时配置、沙箱权限面板 |
 | 💾 **记忆库** | 经验 / 任务轨迹 / 混合检索 / 知识图谱四视图 |
-| ⚙️ **设置** | 模型配置（多提供商）、管理员初始化、数据目录 |
+| ⚙️ **设置** | 单模型配置（OpenAI 协议端点）、管理员初始化、数据目录 |
 
 ---
 
-## 🤖 智能体体系
+## 🤖 动态智能体体系
 
-内置 **30+** 安全智能体，覆盖 Web 渗透、移动安全、无线/射频、红队对抗、蓝队应急、
-CTF、合规报告与协同支撑（分流 / 任务选择 / 推理支撑 / 思维路由 / 经验沉淀 / 方案对抗）。
-完整列表见 Web「智能体」页。v4.0 起任务类型（pentest/ctf/forensics/general）由
-TaskContext 统一裁决执行规则——例如渗透任务不会被引导搜寻 CTF flag。
+v5.0 起不再维护固定的"内置智能体列表"：Reason 阶段读取黑板证据图，按当前目标与
+已确认事实生成 `AgentSpec`（角色提示词 + 能力标签 + 工具白名单），再实例化临时
+智能体执行，执行结果写回黑板并驱动下一波 dispatch。这样不存在"某个预置智能体
+没被调用/被覆盖"的问题，行为完全由证据状态决定。
+
+任务类型（pentest/ctf/forensics/general）由 TaskContext 统一裁决执行规则——
+例如渗透任务不会被引导搜寻 CTF flag。
 
 ---
 
@@ -247,11 +320,19 @@ TaskContext 统一裁决执行规则——例如渗透任务不会被引导搜�
 
 | 接口 | 方法 | 说明 |
 |---|---|---|
-| `/api/v1/health` | GET | 健康检查（含版本号） |
+| `/api/v1/health` | GET | 健康检查（含版本号与 `features`） |
+| 🆕 `/api/v1/audit` | GET | 统一审计日志查询（动作/主体/会话/时间/搜索） |
+| 🆕 `/api/v1/audit/export` | GET | 导出审计日志（`format=jsonl\|csv`） |
+| 🆕 `/api/v1/audit/verify` | GET | 校验审计哈希链完整性 |
+| 🆕 `/api/v1/audit/stats` | GET | 审计事件统计 |
 | `/api/v1/sessions` | GET/POST/DELETE | 会话管理 |
 | `/api/v1/sessions/{id}/messages/stream` | POST | SSE 流式对话 |
 | 🆕 `/api/v1/sessions/{id}/blackboard` | GET | 证据黑板快照（节点/边/版本） |
 | 🆕 `/api/v1/sessions/{id}/blackboard/hints` | POST | 注入人工 Hint |
+| 🆕 `/api/v1/sessions/{id}/asmp` | GET | 攻击态势模型快照与 LLM Brief |
+| 🆕 `/api/v1/sessions/{id}/asmp/tasks` | POST | 生成聚合后的探索任务建议 |
+| 🆕 `/api/v1/sessions/{id}/asmp/types` | GET | 类型注册中心 |
+| 🆕 `/api/v1/plugins` | GET | 插件清单与 UI 贡献 |
 | 🆕 `/api/v1/sessions/{id}/bind-container` | POST | 会话绑定沙箱容器 |
 | 🆕 `/api/v1/sessions/{id}/unbind-container` | POST | 解绑容器 |
 | 🆕 `/api/v1/sessions/{id}/archive` | POST | 归档会话 |
@@ -260,16 +341,15 @@ TaskContext 统一裁决执行规则——例如渗透任务不会被引导搜�
 | 🆕 `/api/v1/containers/{name}/start` `/unbind` | POST | 容器启动 / 解绑 |
 | 🆕 `/api/v1/reports` | GET/POST | 报告列表 / 生成报告 |
 | 🆕 `/api/v1/reports/{id}/download` | GET | 下载报告 Markdown |
-| 🆕 `/api/v1/reports/templates` | GET/POST | 报告模板管理 |
+| 🆕 `/api/v1/reports/templates` | GET | 报告模板列表（内置模板只读） |
 | 🆕 `/api/v1/archives` `/archives/{id}` `/restore` | GET/POST | 归档列表 / 恢复 |
 | `/api/v1/sandbox/check` `/approve` `/deny` | POST | 危险工具三级审批流 |
 | `/api/v1/guardrails` `/guardrails/sandbox` | GET/PUT | 护栏与沙箱权限策略 |
-| `/api/v1/agents` `/agents/custom` | GET/POST | 内置/自定义智能体 |
-| `/api/v1/tools` `/tools/custom` | GET/POST | 工具系统 |
-| `/api/v1/model-config` | GET/PUT | 多模型配置与 fallback |
+| `/api/v1/tools` `/tools/custom` | GET/POST | 工具系统（内置 + 自定义工具 CRUD/测试） |
+| `/api/v1/model-config` | GET/PUT/DELETE | 单模型配置（API Key 仅回显掩码） |
 | `/api/v1/memory/*` | GET/POST | 经验 / 轨迹 / 图谱 |
 | `/api/v1/shared-browser/*` | GET/POST/WS | 共享协作浏览器 |
-| `/api/v1/hook` | POST | 接收器 Webhook 入口 |
+| `/api/v1/hook` | POST | 接收器 Webhook 入口（仅 `BAIZE_ENABLE_PIPELINES=1` 时注册） |
 
 ---
 

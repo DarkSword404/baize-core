@@ -12,6 +12,7 @@ import { Containers } from './pages/Containers';
 import { Guardrails } from './pages/Guardrails';
 import { Experiences } from './pages/Experiences';
 import { Reports } from './pages/Reports';
+import { Audit } from './pages/Audit';
 import { Settings } from './pages/Settings';
 import { NotFound } from './pages/NotFound';
 import type { JSX } from 'react';
@@ -47,6 +48,7 @@ export default function App(): JSX.Element {
                   <Route path="guardrails" element={<ErrorBoundary><Guardrails /></ErrorBoundary>} />
                   <Route path="experiences" element={<ErrorBoundary><Experiences /></ErrorBoundary>} />
                   <Route path="reports" element={<ErrorBoundary><Reports /></ErrorBoundary>} />
+                  <Route path="audit" element={<ErrorBoundary><Audit /></ErrorBoundary>} />
                   <Route path="settings" element={<ErrorBoundary><Settings /></ErrorBoundary>} />
                 </Route>
                 {/* F-15: 未匹配路由的 404 兜底页，不再静默重定向 */}

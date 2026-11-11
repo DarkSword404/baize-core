@@ -63,8 +63,7 @@ export function CreateSessionModal({ open, onClose, onCreated }: Props): JSX.Ele
         model: configuredModel || null,
         stateful: true,
         browser_collab: browserCollab,
-        scope: 'TASK',
-        goal: '用户在对话中描述任务，按任务性质协作完成',
+        // 目标范围由首条用户消息解析后写入黑板，避免把 "TASK" 当成真实目标。
         task_type: taskType,
       });
       addSession(session);

@@ -25,6 +25,7 @@ from .evolve import set_status as _set_status
 from .evolve import supersede as _supersede
 from .graph import KnowledgeGraph, purge_asset_entities
 from .learn import MemoryLearner
+from .mode import memory_mode
 from .models import EpisodeRecord
 from .retrieve import MemoryRetriever
 from .store import MemoryStore
@@ -55,7 +56,14 @@ class MemoryService:
         return embedder()
 
     def stats(self) -> dict:
-        return self.store.stats()
+        data = self.store.stats()
+        em = embedder()
+        data.update({
+            "mode": memory_mode(),
+            "embedding_configured": bool(em.configured()),
+            "embedding_enabled": bool(em.enabled()),
+        })
+        return data
 
     def list_experiences(self, status: Optional[str] = None,
                          scope: Optional[str] = None,

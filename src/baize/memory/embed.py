@@ -8,9 +8,10 @@ BM25 只做字面匹配：查「RCE」召回不到「远程代码执行」——
    是零 ML 依赖——这是刻意的选择，渗透场景常在内网离线跑，不该把向量模型
    塞进运行时。服务地址与密钥默认复用已配置的 LLM 服务（通常是同一供应商、
    同一个 key），可用 BAIZE_EMBEDDING_BASE_URL / _API_KEY 覆盖；模型不跟随
-   LLM——聊天模型与向量模型是两回事，默认 text-embedding-v4（选型理由见
-   DEFAULT_EMBEDDING_MODEL 处），可用配置文件的 embedding_model 指定，
-   环境变量 BAIZE_EMBEDDING_MODEL 优先于它。
+   LLM——聊天模型与向量模型是两回事。默认 auto 模式只有在显式配置
+   embedding_model / BAIZE_EMBEDDING_MODEL 时才启用，避免供应商不支持默认
+   向量模型时每轮都请求失败；BAIZE_EMBEDDING_ENABLED=0/1 可强制关闭/开启，
+   显式开启但未给模型时才回退到 text-embedding-v4。
 2. 检索路径是同步的（Agent 与 API 都在同步上下文调 recall/search），没法
    await，所以文档向量必须**预计算落盘**，检索时只做纯 Python 余弦。
 3. 查询向量只能现算，放在后台线程的事件循环里同步等待，不阻塞主事件循环；
@@ -111,12 +112,28 @@ class Embedder:
                       or (llm.base_url if llm else ""))
         # 模型不复用 LLM 的 ``model``：那是聊天模型，向量要的是 embedding 模型。
         # 取用顺序：显式传参 > 环境变量 > 配置文件 embedding_model > 内置默认。
-        # 这样「启动时配置」能定模型，运维又可用环境变量临时覆盖而不用改文件。
-        self._model = (model or _env("BAIZE_EMBEDDING_MODEL")
-                       or (getattr(llm, "embedding_model", "") if llm else "")
-                       or DEFAULT_EMBEDDING_MODEL)
+        # 但“没有显式配置模型”时默认不发起网络请求：供应商通常不支持任意
+        # 默认向量模型，盲目使用 text-embedding-v4 会每个会话都 503。
+        explicit_model = (
+            model or _env("BAIZE_EMBEDDING_MODEL")
+            or (getattr(llm, "embedding_model", "") if llm else "")
+        ).strip()
+        self._model = explicit_model or DEFAULT_EMBEDDING_MODEL
         self._key = (api_key or _env("BAIZE_EMBEDDING_API_KEY")
                      or (llm.api_key if llm else "") or "sk-placeholder")
+
+        # BAIZE_EMBEDDING_ENABLED:
+        #   auto（默认）= 只有显式配置 embedding 模型才启用
+        #   1/true/on  = 启用；无模型时用 DEFAULT_EMBEDDING_MODEL
+        #   0/false/off= 完全关闭，不产生任何网络请求
+        enabled_env = _env("BAIZE_EMBEDDING_ENABLED").lower()
+        if enabled_env in ("0", "false", "no", "off", "disabled"):
+            self._enabled = False
+        elif enabled_env in ("1", "true", "yes", "on"):
+            self._enabled = True
+        else:
+            self._enabled = bool(explicit_model)
+
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()
@@ -125,7 +142,7 @@ class Embedder:
 
     # ---- 状态 ---------------------------------------------------------------
     def configured(self) -> bool:
-        return bool(self._base and self._model)
+        return bool(self._enabled and self._base and self._model)
 
     def enabled(self) -> bool:
         """未配置、或处于熔断期，都为 False——调用方据此决定走不走语义通道。"""
@@ -222,6 +239,17 @@ def embedder() -> Embedder:
         if _embedder is None:
             _embedder = Embedder()
         return _embedder
+
+
+def reset_embedder() -> None:
+    """丢弃进程内单例。
+
+    模型配置（base_url / api_key / embedding_model）变更后必须调用，
+    否则旧实例会继续向旧端点发请求并沿用旧缓存，直到进程重启。
+    """
+    global _embedder
+    with _embedder_lock:
+        _embedder = None
 
 
 def _needs_recompute(exp: dict) -> tuple[str, str]:

@@ -9,8 +9,8 @@ build/
 # Node
 node_modules/
 
-# 测试（本地验证用，不随发布仓库提交）
-tests/
+# 测试产物（测试源码 tests/ 需要提交，CI 依赖它）
+.pytest_cache/
 web/src/__tests__/
 
 # 运行残留

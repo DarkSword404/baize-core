@@ -9,6 +9,8 @@
 - **审计取证**：一次攻击链可完整重放（``replay``），满足安全场景的
   合规审计 / DFIR 取证需求。
 - **持久化**：可选 JSONL 落盘（append-only 写入，天然支持增量）。
+- **审计旁路**：可选 ``audit_sink`` 把摘要事件转发到统一 AuditLog；
+  完整工具输出与模型响应仍只保存在本日志中。
 
 事件 kind 约定:
 - ``session/start`` 会话开始
@@ -30,7 +32,7 @@ import os
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import Any, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional
 
 logger = logging.getLogger("baize.session_log")
 
@@ -98,11 +100,15 @@ class SessionLog:
         path: Optional[str] = None,
         origin: Optional[str] = None,
         goal: Optional[str] = None,
+        audit_sink: Optional[Callable[[str, dict[str, Any]], None]] = None,
     ) -> None:
         self.session_id = session_id or uuid.uuid4().hex
         self.path = path
         self.origin = origin
         self.goal = goal
+        # 可选审计旁路：把摘要事件转发到统一 AuditLog。
+        # SessionLog 仍是完整事实源，audit_sink 只做旁路记录，失败不影响会话。
+        self._audit_sink = audit_sink
         self._events: list[SessionEvent] = []
         self._seq = 0
         if path and os.path.exists(path):
@@ -132,6 +138,11 @@ class SessionLog:
         self._events.append(event)
         if self.path:
             self._append_to_file(event)
+        if self._audit_sink is not None:
+            try:
+                self._audit_sink(kind, dict(payload))
+            except Exception:  # noqa: BLE001
+                logger.warning("SessionLog 审计旁路写入失败 kind=%s", kind, exc_info=True)
         return event
 
     def _append_to_file(self, event: SessionEvent) -> None:

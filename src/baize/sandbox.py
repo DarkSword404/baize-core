@@ -231,7 +231,17 @@ class Sandbox:
     # ---- 异步审批等待 ---------------------------------------------------------
 
     async def request_approval(self, tool_name: str, session_id: str, timeout: float = 300.0) -> bool:
-        """等待用户审批。返回 True 表示批准，False 表示拒绝或超时。"""
+        """等待用户审批。
+
+        返回 True 表示用户批准，False 表示用户显式拒绝。
+        若在 ``timeout`` 内未收到任何决定，则抛出 ``asyncio.TimeoutError``——
+        让调用方区分"未收到决定"与"用户拒绝"，避免把超时误报成拒绝。
+        """
+        # 若审批已在此前到达（令牌已发放，例如用户响应快于本协程注册 Future），
+        # 直接视为已批准，避免错过已发生的决定而空等到超时。
+        with self._lock:
+            if tool_name in self._tokens.get(session_id, set()):
+                return True
         loop = asyncio.get_running_loop()
         fut: asyncio.Future = loop.create_future()
         with self._lock:
@@ -241,7 +251,7 @@ class Sandbox:
         except asyncio.TimeoutError:
             with self._lock:
                 self._pending_approvals.get(session_id, {}).pop(tool_name, None)
-            return False
+            raise
 
     def _resolve_approval(self, tool_name: str, session_id: str, approved: bool) -> None:
         """解析等待中的审批请求。"""

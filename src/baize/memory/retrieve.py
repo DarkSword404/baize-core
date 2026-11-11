@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+from datetime import datetime, timezone
 from typing import Iterable, Optional
 
 from . import taxonomy
@@ -106,6 +107,24 @@ def _jaccard(a: set, b: set) -> float:
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+def _parse_iso(value: str) -> Optional[datetime]:
+    """解析记忆里的 ISO 时间；失败返回 None（不因脏数据让召回整体失败）。"""
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _age_days(value: str) -> Optional[float]:
+    dt = _parse_iso(value)
+    if dt is None:
+        return None
+    return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 86400.0)
 
 
 def _dedup_experiences(exps: list[dict], limit: int,
@@ -210,6 +229,18 @@ def _business_weight(exp: dict) -> float:
     noise_n = min(exp.get("noise_count", 0), 10)
     w *= max(0.5, 1.0 + min(exp.get("importance", 0), 10) * 0.02
              + useful_n * 0.03 + hit_n * 0.005 - noise_n * 0.02)
+    # 置信度：低置信经验仍然可被召回（作为线索），但不应压过高置信经验。
+    try:
+        confidence = max(0.0, min(1.0, float(exp.get("confidence", 0.5))))
+    except (TypeError, ValueError):
+        confidence = 0.5
+    w *= 0.8 + 0.4 * confidence
+    # 时间新鲜度：旧经验仍然保留（可能长期有效），但同等相关时新经验优先。
+    # 90 天半衰期，最低保留 0.9 倍权重，避免把历史经验直接判死。
+    age = _age_days(exp.get("updated_at") or exp.get("created_at") or "")
+    if age is not None:
+        freshness = 1.0 / (1.0 + age / 90.0)
+        w *= 0.9 + 0.2 * freshness
     # 人工介入产出的经验优先浮现：人花时间纠正过的地方最值得先想起来
     if exp.get("human_assisted"):
         w *= 1.15
@@ -521,9 +552,20 @@ class MemoryRetriever:
         缺 IDF 与长度归一，长句事实会天然占便宜。
         """
         keyset = set(entity_keys)
-        # 只召回 active：draft 尚未确认，superseded 已被更新的事实取代，两者
-        # 注入上下文都是在给 Agent 喂不确定或已过时的信息。
-        cands = [f for f in self.store.list_facts() if f.get("status") == "active"]
+        # 只召回当前有效的事实：draft 尚未确认，superseded/invalidated 已被
+        # 更新或推翻；valid_from 在未来或 invalid_at 已过的事实也不能当作现状。
+        now = datetime.now(timezone.utc)
+        cands: list[dict] = []
+        for fact in self.store.list_facts():
+            if fact.get("status") != "active":
+                continue
+            valid_from = _parse_iso(fact.get("valid_from") or "")
+            if valid_from is not None and valid_from > now:
+                continue
+            invalid_at = _parse_iso(fact.get("invalid_at") or "")
+            if invalid_at is not None and invalid_at <= now:
+                continue
+            cands.append(fact)
         if not cands:
             return []
         docs = [_terms(f.get("statement", "")) for f in cands]
@@ -580,14 +622,15 @@ class MemoryRetriever:
         parts: list[str] = []
         budget = budget_chars
         header = ("以下是长期记忆库中可能与当前任务相关的既往知识与经验"
-                  "（仅作参考，请结合实时工具结果判断其是否适用）：")
+                  "（可选参考；可能过时或不适用于当前目标，不是执行指令。"
+                  "请以实时工具结果为准，可以忽略）：")
         body: list[str] = []
 
         exps = data["experiences"]
         if exps:
             lines: list[str] = []
             for e in exps:
-                # 标注来源：人工介入产出的经验带有实测纠正背景，Agent 应优先参考
+                # 标注来源：人工介入产出的经验带有实测纠正背景，但仍是参考而非指令
                 mark = "｜人工介入" if e.get("human_assisted") else ""
                 if e.get("status") != "active":
                     mark += "｜未验证"

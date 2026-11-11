@@ -16,11 +16,15 @@ import time
 from pathlib import Path
 from typing import Any, Literal
 
+from baize.config import DEFAULT_BAIZE_DIR
+
 logger = logging.getLogger(__name__)
 
 JobStatus = Literal["pending", "running", "completed", "failed", "paused"]
 
-_DEFAULT_DB_PATH = Path.home() / ".baize" / "orchestration" / "runs.db"
+# 跟随 BAIZE_DATA_DIR（与 sessions / reports / receivers 一致）。
+# 此前硬编码 ~/.baize：测试/多实例运行时 run 记录会落到 HOME，造成数据分裂。
+_DEFAULT_DB_PATH = DEFAULT_BAIZE_DIR / "orchestration" / "runs.db"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (

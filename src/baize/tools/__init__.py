@@ -40,6 +40,9 @@ from baize.tools import security_tools as _security_tools  # noqa: F401
 # 注册扩展安全工具（信息收集/漏洞/爆破/无线/取证，通过 register_tool 装饰器）
 from baize.tools import security_tools_extra as _security_tools_extra  # noqa: F401
 
+# 注册有状态 HTTP 会话工具（Cookie/鉴权跨调用复用，登录态复用）
+from baize.tools import session_tools as _session_tools  # noqa: F401
+
 # 注册浏览器自动化工具（页面侦察/链接提取/表单分析/截图）
 from baize.tools import browser_tools as _browser_tools  # noqa: F401
 

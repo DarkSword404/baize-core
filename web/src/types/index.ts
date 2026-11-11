@@ -3,6 +3,8 @@
 export interface HealthResponse {
   status: string;
   version: string;
+  checks?: Record<string, boolean>;
+  features?: Record<string, boolean>;
 }
 
 export interface ModelPricing {
@@ -216,6 +218,16 @@ export interface IntermediateData {
   itemType: IntermediateItemType;
   label: string;     // 折叠时显示摘要标题，如 "bash cat /flag"
   detail: string;    // 展开时显示完整内容
+  /** 工具内部名称（function_call / function_call_output 用） */
+  toolName?: string;
+  /** 工具调用 ID：用于把调用与输出配对成一条执行轨迹 */
+  callId?: string;
+  /** 执行该工具的子 agent / 泳道 */
+  agent?: string;
+  /** 工具耗时（秒），仅输出事件可能带 */
+  duration?: number;
+  /** 工具输出状态（由前端按输出内容推断） */
+  status?: 'running' | 'ok' | 'error' | 'denied';
 }
 
 export interface ChatMessage {
@@ -237,7 +249,47 @@ export interface Toast {
   message?: string;
 }
 
-export type ViewPage = 'dashboard' | 'chat' | 'agents' | 'tools' | 'sessions' | 'guardrails' | 'settings' | 'orchestration' | 'experiences' | 'browser' | 'reports' | 'containers' | 'archives';
+export type ViewPage = 'dashboard' | 'chat' | 'agents' | 'tools' | 'sessions' | 'guardrails' | 'settings' | 'orchestration' | 'experiences' | 'browser' | 'reports' | 'containers' | 'archives' | 'audit';
+
+// ===== 统一审计日志 =====
+export interface AuditEvent {
+  event_id: string;
+  ts: number;
+  actor_type: string;
+  actor_id: string;
+  ip: string;
+  ua: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  status: string;
+  status_code: number;
+  session_id: string;
+  run_id: string;
+  detail: Record<string, unknown>;
+  prev_hash: string;
+  hash: string;
+}
+
+export interface AuditListResponse {
+  events: AuditEvent[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface AuditVerifyResponse {
+  ok: boolean;
+  total: number;
+  broken_at: string | null;
+  index?: number;
+}
+
+export interface AuditStats {
+  total: number;
+  by_action: Array<{ action: string; count: number }>;
+  by_status: Array<{ status: string; count: number }>;
+}
 
 // ===== 任务-容器解耦：容器管理 + 任务记录 =====
 export interface ContainerInfo {
@@ -484,9 +536,14 @@ export interface MemoryStats {
   experiences: number;
   experiences_active: number;
   experiences_draft: number;
+  experiences_superseded?: number;
   facts: number;
+  facts_active?: number;
   entities: number;
   relations: number;
+  mode?: 'off' | 'tool' | 'brief' | 'auto';
+  embedding_configured?: boolean;
+  embedding_enabled?: boolean;
 }
 
 export interface MemoryGraphNode {
@@ -589,6 +646,137 @@ export interface GuardrailRule {
 export interface GuardrailConfig {
   settings: GuardrailSettings;
   rules: GuardrailRule[];
+}
+
+// ===== Situation Plugin =====
+export interface SituationObject {
+  id: string;
+  type: string;
+  subtype?: string;
+  label: string;
+  detail?: string;
+  status: string;
+  confidence?: number;
+  attributes?: Record<string, unknown>;
+  links?: Array<Record<string, unknown>>;
+  evidence_ids?: string[];
+  created_by?: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface SituationAction {
+  id: string;
+  tool: string;
+  target?: string;
+  status: string;
+  call_id?: string;
+  arguments?: string;
+  result_summary?: string;
+  started_at?: string;
+  ended_at?: string;
+}
+
+export interface SituationSnapshot {
+  session_id: string;
+  mission: string;
+  constraints: string[];
+  status: string;
+  version: number;
+  updated_at: string;
+  objects: SituationObject[];
+  actions: SituationAction[];
+  coverage: Array<Record<string, unknown>>;
+}
+
+export interface SituationResponse {
+  situation: SituationSnapshot;
+  brief: string;
+}
+
+export interface PluginInfo {
+  id: string;
+  name: string;
+  version: string;
+  kind: string;
+  description: string;
+  permissions: string[];
+}
+
+export interface PluginsResponse {
+  plugins: PluginInfo[];
+  ui: Array<Record<string, unknown>>;
+}
+
+// ===== ASMP (Attack Situational Awareness Modeling Plugin) =====
+export interface ASMPNode {
+  id: string;
+  engagement_id: string;
+  type_id: string;
+  name: string;
+  summary?: string;
+  attributes?: Record<string, unknown>;
+  evidence_refs?: string[];
+  status: string;
+  version?: number;
+}
+
+export interface ASMPRelation {
+  id: string;
+  source_id: string;
+  target_id: string;
+  type_id: string;
+  status: string;
+  confidence?: number;
+}
+
+export interface ASMPHypothesis {
+  id: string;
+  title: string;
+  category: string;
+  claim?: string;
+  target_refs?: string[];
+  confidence?: number;
+  status: string;
+  impact?: Record<string, unknown>;
+}
+
+export interface ASMPUnknown {
+  id: string;
+  attribute: string;
+  reason: string;
+  target_refs?: string[];
+  priority?: number;
+  status: string;
+}
+
+export interface ASMPTask {
+  id: string;
+  objective: string;
+  status: string;
+  priority?: number;
+  target_refs?: string[];
+  hypothesis_refs?: string[];
+  required_evidence?: string[];
+  preconditions?: string[];
+}
+
+export interface ASMPSnapshot {
+  engagement_id: string;
+  nodes: ASMPNode[];
+  relations: ASMPRelation[];
+  evidence: Array<Record<string, unknown>>;
+  hypotheses: ASMPHypothesis[];
+  unknowns: ASMPUnknown[];
+  tasks: ASMPTask[];
+  changes?: Array<Record<string, unknown>>;
+  summary?: Record<string, number>;
+}
+
+export interface ASMPResponse {
+  asmp: ASMPSnapshot;
+  situation?: ASMPSnapshot;
+  brief: string;
 }
 
 export interface GuardrailTestResult {

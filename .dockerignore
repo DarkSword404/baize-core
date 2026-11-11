@@ -1,0 +1,26 @@
+# 构建上下文排除项
+# Dockerfile 不 COPY 任何宿主文件，这里仅用于把构建上下文从 ~2.3GB 降到几十 MB，
+# 避免每次 build 都传输 .venv / node_modules / .git 等大目录。
+
+.venv/
+venv/
+env/
+node_modules/
+web/node_modules/
+.git/
+.gitignore
+.baize-data/
+.baize-data
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+*.log
+*.tmp
+.DS_Store

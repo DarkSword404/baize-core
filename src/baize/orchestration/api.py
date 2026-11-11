@@ -399,7 +399,20 @@ def register(app: FastAPI) -> None:
         inst_store.update(instance_id, receiver_id=effective_receiver)
         inst = inst_store.set_enabled(instance_id, True)
         get_activation_store().activate(instance_id, receiver_id=effective_receiver)
-        get_session_manager().ensure(definition)
+        # ensure() 可能因模板/绑定不满足而返回 False。此前忽略返回值，
+        # 前端显示"已启用"但长驻会话从未启动、队列永不消费。
+        started = get_session_manager().ensure(definition)
+        if not started:
+            get_activation_store().deactivate(instance_id)
+            get_session_manager().stop(instance_id)
+            inst_store.set_enabled(instance_id, False)
+            return {
+                "ok": False,
+                "instance_id": instance_id,
+                "active": False,
+                "error": "长驻会话启动失败：流水线无法消费入站数据，"
+                         "请检查模板是否包含可执行入口节点及接收器绑定",
+            }
         return {
             "ok": True,
             "instance_id": instance_id,
@@ -705,7 +718,16 @@ def register(app: FastAPI) -> None:
                 return {"error": f"接收器 '{receiver_id}' 不存在", "ok": False}
 
         activation.activate(pipeline_id, receiver_id=effective_receiver)
-        get_session_manager().ensure(pipeline_def)
+        if not get_session_manager().ensure(pipeline_def):
+            activation.deactivate(pipeline_id)
+            get_session_manager().stop(pipeline_id)
+            return {
+                "ok": False,
+                "pipeline_id": pipeline_id,
+                "active": False,
+                "error": "长驻会话启动失败：流水线无法消费入站数据，"
+                         "请检查模板入口节点与接收器绑定",
+            }
         return {
             "ok": True,
             "pipeline_id": pipeline_id,

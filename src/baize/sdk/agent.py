@@ -67,6 +67,11 @@ _TRIM_DEBOUNCE_MSGS = 4
 # 要求模型先给出阶段性结论，防止陷入无限工具探索导致 30 轮空转、无文本输出。
 _CONCLUDE_HINT_TOOL_TURNS = 5
 
+# "接近上限"收敛提示的收尾余量（按本轮预算缩放，最多 4）。原实现用绝对阈值
+# max_tool_calls-3 / -8：当 AI 给定的预算较小（如 max_steps≤8）时阈值退化为 ≤0，
+# 第一轮就会触发"立即停止探索"，把实际动作预算饿死在只读 deliberation 里。
+_CONCLUDE_RESERVE_MAX = 4
+
 # LLM 调用重试：临时性故障（网络抖动/超时/限流/5xx）做指数退避重试；
 # 配置类错误（404/401/400 等）不重试，直接抛出交由上层诊断，
 # 避免配置损坏时反复无效请求、拖垮整轮对话。
@@ -171,6 +176,39 @@ def _missing_required_params(handler: Callable[..., Any], args: dict[str, Any]) 
     return missing
 
 
+def _declared_param_names(handler: Callable[..., Any]) -> list[str]:
+    """返回 handler 显式声明的参数名（排除 *args / **kwargs）；无法内省时返回空列表。"""
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return []
+    return [
+        name for name, param in sig.parameters.items()
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_ONLY,
+        )
+    ]
+
+
+def _unknown_params(handler: Callable[..., Any], args: dict[str, Any]) -> list[str]:
+    """返回 args 中 handler 未声明的参数名（handler 含 **kwargs 时不检查）。
+
+    LLM 有时会按自己臆想的参数名调用工具（如把 ``target`` 写成 ``url``），
+    直接调用会抛 TypeError 并穿透到工具异常隔离层、白费一轮。这里提前给出
+    "未知参数 + 合法参数名"提示，让模型当轮自我纠正。
+    """
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return []
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return []
+    declared = set(_declared_param_names(handler))
+    return [key for key in args if key not in declared]
+
+
 def _handler_accepts_param(handler: Callable[..., Any], name: str) -> bool:
     """handler 是否显式声明了指定参数名（或通过 **kwargs 接受任意参数）。"""
     try:
@@ -180,6 +218,66 @@ def _handler_accepts_param(handler: Callable[..., Any], name: str) -> bool:
     if name in sig.parameters:
         return True
     return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+
+
+# 参数名同义映射：规范参数名 → 常见别名。
+# 仅在「别名未声明、规范名已声明且当前缺失」时把别名改写为规范名，
+# 且同一别名能匹配到多个缺失规范名时不做任何改写（歧义即放弃）。
+# 这是接口兼容层，目的是让模型少因臆造参数名白费一轮，
+# 不涉及对 AI 判断/能力的任何限制（是否调用、调用什么仍由 AI 决定）。
+_PARAM_ALIASES: dict[str, tuple[str, ...]] = {
+    "target": ("url", "uri", "target_url", "address", "endpoint", "host", "hostname"),
+    "domain": ("host", "hostname", "domain_name", "fqdn"),
+    "url": ("target", "uri", "link"),
+    "query": ("q", "keyword", "keywords", "search", "term", "query_string"),
+    "command": ("cmd", "shell", "shell_command"),
+    "path": ("file", "filepath", "filename", "dir"),
+    "content": ("text", "body", "data"),
+    "code": ("script", "source"),
+    "message": ("msg", "input", "text"),
+    "input": ("message",),
+    "ports": ("port",),
+    "port": ("ports",),
+    "username": ("user", "user_name", "login"),
+    "password": ("passwd", "pass", "pwd"),
+    "timeout": ("time_out", "timeout_seconds"),
+}
+
+
+def _normalize_tool_args(handler: Callable[..., Any], args: dict[str, Any]) -> dict[str, Any]:
+    """把模型臆造的参数别名改写为 handler 实际声明的规范参数名。
+
+    例：``http_probe(target=...)`` 被写成 ``http_probe(url=...)`` 时，
+    若 handler 只声明了 ``target`` 而没声明 ``url``，就把 ``url`` 改名为
+    ``target``，避免因参数名不符抛错、白费一轮。改动仅在无歧义时发生：
+    只有当别名恰好对应「唯一一个、已声明且当前缺失」的规范名时才改写。
+    """
+    try:
+        sig = inspect.signature(handler)
+    except (TypeError, ValueError):
+        return args
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        # handler 接受 **kwargs，本来就不会因未知参数报错，无需改写
+        return args
+    declared = [
+        n for n, p in sig.parameters.items()
+        if p.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+            inspect.Parameter.POSITIONAL_ONLY,
+        )
+    ]
+    declared_set = set(declared)
+    missing = [d for d in declared if d not in args]
+    for key in list(args.keys()):
+        if key in declared_set:
+            continue
+        candidates = [d for d in missing if key in _PARAM_ALIASES.get(d, ())]
+        if len(candidates) == 1:
+            canonical = candidates[0]
+            args[canonical] = args.pop(key)
+            missing.remove(canonical)
+    return args
 
 
 def _tool_missing_hint(name: str, exc: Exception) -> str:
@@ -199,15 +297,30 @@ def _extract_missing_binary(name: str, exc: Exception) -> Optional[str]:
     """从工具执行异常中提取缺失的系统二进制名。
 
     匹配常见报错形态:
+    - ``command not found: nmap``
     - ``nmap: command not found``
     - ``/bin/bash: nmap: command not found``
     - ``[Errno 2] No such file or directory: 'nmap'``
     """
+    import re as _re
+
     msg = str(exc)
     lower = msg.lower()
     if "command not found" not in lower and "no such file or directory" not in lower:
         return None
-    # 优先用工具函数名本身（nmap_scan → nmap）
+    # 优先从报错文本解析真实二进制名（比从工具名推导更准，例如
+    # dns_lookup→dig、waf_detect→wafw00f 这类名称不一致的场景）。
+    for pattern in (
+        r"command not found:?\s*['\"]?([A-Za-z0-9_.\-/]+)",
+        r"['\"]?([A-Za-z0-9_.\-/]+)['\"]?:\s*command not found",
+        r"no such file or directory:?\s*['\"]?([A-Za-z0-9_.\-/]+)",
+    ):
+        m = _re.search(pattern, msg, _re.IGNORECASE)
+        if m:
+            cand = m.group(1).rsplit("/", 1)[-1].strip()
+            if cand and cand.lower() not in ("command", "found"):
+                return cand
+    # 回退：用工具函数名推导（nmap_scan → nmap）
     # 安全工具函数名通常含 _scan/_check/_enum 等后缀，二进制名是前缀
     candidate = name
     for suffix in ("_scan", "_check", "_enum", "_audit", "_analyze",
@@ -353,6 +466,39 @@ class Tool(Protocol):
     async def run(self, **kwargs: Any) -> str: ...
 
 
+# 同波并行 agent 共享的"工具结果记忆"只覆盖确定性只读侦察工具：
+# 同工具同参数在不同分支里结果必然相同，重复执行纯属浪费预算。
+# 有副作用/会改变状态的工具（write_fact、generic_linux_command、execute_code 等）
+# 不在此列，不做缓存。
+# 注意：http_request / http_session_request 不在此列 —— 它们会携带 Cookie /
+# CSRF / 一次性 token，重复请求可能改变服务端状态或与"重放"语义冲突。
+_MEMOIZABLE_TOOLS = frozenset({
+    "http_probe",
+    "dns_lookup", "whois_lookup", "ssl_cert_info",
+    "whatweb_fingerprint", "waf_detect", "crt_sh_lookup",
+    "nmap_scan", "port_scan", "cve_lookup",
+})
+
+# 只读/元工具不消耗“实际动作预算”。否则 agent 在 read_blackboard/load_tool
+# 上多读几次就会把真正的探测预算吃完，表现为“16 次工具调用后预算耗尽”。
+_NON_ACTION_TOOL_NAMES = frozenset({
+    "read_blackboard", "load_tool", "think", "Todo_list",
+    "list_attachments", "memory_search", "search_worker_traces",
+    "record_coverage", "load_skill", "read_skill",
+})
+
+
+def _memo_key(tool_name: str, arguments: str) -> str:
+    """构造工具结果记忆的键：同工具同参数（键序归一化）视为同一次调用。"""
+    try:
+        payload = json.loads(arguments) if arguments else {}
+    except json.JSONDecodeError:
+        return f"{tool_name}|{arguments}"
+    if not isinstance(payload, dict):
+        payload = {"_": payload}
+    return f"{tool_name}|{json.dumps(payload, sort_keys=True, ensure_ascii=False)}"
+
+
 @dataclass
 class AgentTool:
     """可调用的工具封装。"""
@@ -389,6 +535,10 @@ class AgentTool:
                 f"工具 `{self.name}` 的参数必须是 JSON 对象，收到: {arguments!r}。"
                 "请按 JSON Schema 重新生成参数后调用。"
             )
+        # 参数别名归一化：模型臆造的参数名（如把 target 写成 url、把 domain
+        # 写成 host）在无歧义时改写为 handler 声明的规范名，避免因参数名不符
+        # 白费一轮。属接口兼容层，不改动任何 AI 判断。
+        args = _normalize_tool_args(self.handler, args)
         # 防御：handler 必填参数缺失时返回友好错误而非抛 TypeError，
         # 避免 LLM 省略参数导致整个对话流 500 中断。
         missing = _missing_required_params(self.handler, args)
@@ -396,6 +546,16 @@ class AgentTool:
             return (
                 f"工具 `{self.name}` 调用缺少必填参数: "
                 f"{', '.join(missing)}。请补全后重新调用。"
+            )
+        # 防御：LLM 可能臆造参数名（如把 target 写成 url），直接调用会抛
+        # TypeError。提前给出"未知参数 + 合法参数名"，让模型当轮自我纠正。
+        unknown = _unknown_params(self.handler, args)
+        if unknown:
+            valid = _declared_param_names(self.handler)
+            return (
+                f"工具 `{self.name}` 收到未知参数: {', '.join(unknown)}。"
+                + (f"合法参数: {', '.join(valid)}。" if valid else "")
+                + "请按 JSON Schema 重新生成参数后调用。"
             )
         # 区分同步/异步 handler：
         # - 异步 handler（如编排智能体的 run_specialist 等）：直接在事件循环中
@@ -626,6 +786,31 @@ class Agent:
     这是"把抉择交付给 AI"的落地：AI 决定每个 agent 的上下文预算，
     简单任务用小预算省 token，复杂分析用大预算防裁剪。
     """
+    tool_result_memo: Optional[dict] = None
+    """同波共享的工具结果记忆（dict: 记忆键 → 输出）。由编排器按波次注入：
+    同一波内并行的多个 intent agent 共享同一 dict，同工具同参数的只读侦察
+    调用只真正执行一次（见 ``_exec_tool_memoized`` 与 ``_MEMOIZABLE_TOOLS``）。
+    None = 不做记忆。
+    """
+
+    async def _exec_tool_memoized(
+        self, name: str, arguments: str, tool: "AgentTool"
+    ) -> str:
+        """执行工具；命中同波共享的工具结果记忆时直接复用，避免并行分支重复执行。
+
+        记忆仅覆盖 ``_MEMOIZABLE_TOOLS`` 中的确定性只读侦察工具；同工具同参数
+        在只读工具上结果必然相同，重复跑一遍只是白烧预算。未命中则执行并写入。
+        """
+        memo = self.tool_result_memo
+        if memo is None or name not in _MEMOIZABLE_TOOLS:
+            return await tool.execute(arguments)
+        key = _memo_key(name, arguments)
+        if key in memo:
+            logger.info("工具 %s 命中同波结果记忆，复用缓存输出", name)
+            return memo[key]
+        result = await tool.execute(arguments)
+        memo[key] = result
+        return result
 
     def mount_dynamic_tool(self, tool: "AgentTool") -> bool:
         """挂载一个运行时加载的工具。已存在（核心层/已加载）则返回 False。"""
@@ -1443,9 +1628,18 @@ class Agent:
                     tool = tool_by_name.get(name)
                     self._log_event("tool/call", name=name, arguments=arguments)
                     if tool is None:
-                        output = f"(工具 {name} 不存在)"
+                        # 同一轮内 load_tool 刚挂载的工具：立即再合并并重新解析，
+                        # 使其满足"加载后立即可用"的语义，同时刷新 schema 供后续请求使用。
+                        if self._merge_dynamic_tools(all_tools, tool_by_name):
+                            tool = tool_by_name.get(name)
+                            tool_schemas = [t.to_schema() for t in all_tools]
+                    if tool is None:
+                        output = (
+                            f"(工具 {name} 尚未加载或不存在：请先用 load_tool 加载该工具，"
+                            f"并在下一轮再发起调用)"
+                        )
                         self._log_event("tool/result", name=name, output=output, denied=False, reason="工具未注册")
-                    else:
+                    if tool is not None:
                         # 瀑布式策略链：审计/权限/危险命令拦截可叠加，可短路
                         allowed, final_args, deny_reason, approval_sid = await self._tool_call_chain(name, arguments)
                         if not allowed:
@@ -1453,12 +1647,17 @@ class Agent:
                                 # 沙箱要求审批：等待用户决定
                                 sandbox = _svc_get("sandbox")
                                 if sandbox is not None:
-                                    approved = await sandbox.request_approval(name, approval_sid)
+                                    try:
+                                        approved = await sandbox.request_approval(name, approval_sid)
+                                        approval_timed_out = False
+                                    except asyncio.TimeoutError:
+                                        approved = False
+                                        approval_timed_out = True
                                     if approved:
                                         # 用户批准：执行工具
                                         started_at = asyncio.get_running_loop().time()
                                         try:
-                                            output = await tool.execute(final_args)
+                                            output = await self._exec_tool_memoized(name, final_args, tool)
                                         except Exception as exc:  # noqa: BLE001
                                             output = _tool_missing_hint(name, exc)
                                             self._log_event("tool/error", name=name, error=str(exc))
@@ -1466,6 +1665,9 @@ class Agent:
                                         duration = asyncio.get_running_loop().time() - started_at
                                         self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
                                         sandbox.record_execution(name, approval_sid, True)
+                                    elif approval_timed_out:
+                                        output = "(工具调用审批超时：未收到用户决定，已按未批准处理)"
+                                        self._log_event("tool/result", name=name, output=output, denied=True, reason="审批超时")
                                     else:
                                         output = f"(工具调用已被用户拒绝: {deny_reason or '未说明'})"
                                         self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
@@ -1478,7 +1680,7 @@ class Agent:
                         else:
                             started_at = asyncio.get_running_loop().time()
                             try:
-                                output = await tool.execute(final_args)
+                                output = await self._exec_tool_memoized(name, final_args, tool)
                             except Exception as exc:  # noqa: BLE001
                                 # 工具异常隔离：工具自身抛出的异常不中断整轮对话，
                                 # 转为 tool 结果消息返回给模型，由模型决定重试或改道。
@@ -1508,7 +1710,7 @@ class Agent:
                                     if install_ok:
                                         # 安装成功：重试原工具调用一次
                                         try:
-                                            output = await tool.execute(final_args)
+                                            output = await self._exec_tool_memoized(name, final_args, tool)
                                         except Exception as exc2:  # noqa: BLE001
                                             output = _tool_missing_hint(name, exc2)
                                             self._log_event("tool/error", name=name, error=str(exc2))
@@ -1720,6 +1922,7 @@ class Agent:
         experience_block: Optional[str] = None,
         suppress_session_end: bool = False,
         audit_user_message: Optional[str] = None,
+        log_user_message: bool = True,
     ) -> RunResult:
         """执行一次完整对话。
 
@@ -1729,13 +1932,17 @@ class Agent:
             （编排器调用的临时 agent 不应写，由编排器统一管理）。
         audit_user_message: 审计日志记录的用户原始输入（编排器模式下
             user_message 可能是改写后的 task，此参数保留原始输入用于审计）。
+        log_user_message: 为 False 时不写 user/message 审计事件。编排器按波次
+            并行 spawn 多个 intent agent、每个都带同一份用户输入，若每个都记一次
+            会导致同一条用户消息在审计里重复十几次——此时由编排器统一记一次。
         """
         ctx = self._merged_context(context_variables)
         await self._emit("on_start", self, user_message, ctx)
         # 新一轮开始：重置沙箱的单轮危险工具配额
         self._reset_sandbox_turn()
         self._ensure_session_started()
-        self._log_event("user/message", content=audit_user_message or user_message)
+        if log_user_message:
+            self._log_event("user/message", content=audit_user_message or user_message)
         try:
             client = self._resolve_client()
             history = self._build_history(user_message, ctx)
@@ -1773,6 +1980,7 @@ class Agent:
         experience_block: Optional[str] = None,
         suppress_session_end: bool = False,
         audit_user_message: Optional[str] = None,
+        log_user_message: bool = True,
     ) -> AsyncIterator[AgentEvent]:
         """流式执行对话，逐步产出事件（支持实时思考、工具调用与上下文延续）。
 
@@ -1795,13 +2003,16 @@ class Agent:
             子任务 task，但审计日志的 user/message 事件应记录用户真实输入，
             否则攻击图时间线会显示"用户发了工具指令"而非原始需求。
             未提供时回退到 user_message。
+        log_user_message: 为 False 时不写 user/message 审计事件（同 run，供编排器
+            按波次并行 spawn 的场景去重，由编排器统一记一次）。
         """
         ctx = self._merged_context(context_variables)
         await self._emit("on_start", self, user_message, ctx)
         # 新一轮开始：重置沙箱的单轮危险工具配额
         self._reset_sandbox_turn()
         self._ensure_session_started()
-        self._log_event("user/message", content=audit_user_message or user_message)
+        if log_user_message:
+            self._log_event("user/message", content=audit_user_message or user_message)
         try:
             client = self._resolve_client()
             if user_chat_message is not None:
@@ -1836,7 +2047,8 @@ class Agent:
             _, max_message_chars, _ = self._context_budget()
             final_text = ""
             tool_call_seq: dict = {}  # 工具调用 ID 序号（模型未给 id 时兜底生成）
-            tool_calls_executed = 0  # 本轮已执行的工具调用数（用于空回复兜底判断）
+            tool_calls_executed = 0  # 本轮所有工具调用数（含只读/元工具）
+            action_tool_calls_executed = 0  # 实际动作工具数（预算只算这些）
             forced_conclusion = False  # 是否已强制要求模型继续任务（避免无限追加）
             tool_turns_since_conclusion = 0  # 连续纯工具调用轮数（用于阶段性结论提示）
             conclusion_hint_added = False     # 是否已追加阶段性结论提示（避免重复）
@@ -1845,8 +2057,16 @@ class Agent:
             # B-07: 工具调用循环检测（流式版）
             _seen_calls: dict[str, int] = {}
             _LOOP_THRESHOLD = 3
+            # "接近上限"提示的收尾余量：随本轮预算缩放，且至少留 2 步给行动，
+            # 避免小预算下第一轮就被要求停止探索。
+            _conclude_reserve = max(2, min(_CONCLUDE_RESERVE_MAX, self.max_tool_calls // 3))
+            # 只读/元工具仍会消耗 LLM 轮次；给它们额外的轮次余量，
+            # 避免 read_blackboard/load_tool 把真正的动作预算挤掉。
+            _effective_action_budget = self.max_tool_calls
+            _budget_extended = False
+            _turn_limit = max(self.max_tool_calls * 2, self.max_tool_calls + 8)
 
-            for _ in range(self.max_tool_calls):
+            for _ in range(_turn_limit):
                 # 动态工具合并：本轮 load_tool 挂载的工具，下一次 LLM 请求生效
                 if self._merge_dynamic_tools(tools, tool_by_name):
                     tool_schemas = [t.to_schema() for t in tools]
@@ -1914,6 +2134,12 @@ class Agent:
                 if tool_calls:
                     # 模型请求调用工具
                     tool_calls_executed += len(tool_calls)
+                    action_tool_calls_executed += sum(
+                        1
+                        for tc in tool_calls
+                        if str(tc.get("function", {}).get("name", ""))
+                        not in _NON_ACTION_TOOL_NAMES
+                    )
                     tool_turns_since_conclusion += 1
                     history.append(
                         ChatMessage(
@@ -1972,12 +2198,17 @@ class Agent:
                                 )
                                 sandbox = _svc_get("sandbox")
                                 if sandbox is not None:
-                                    approved = await sandbox.request_approval(name, approval_sid)
+                                    try:
+                                        approved = await sandbox.request_approval(name, approval_sid)
+                                        approval_timed_out = False
+                                    except asyncio.TimeoutError:
+                                        approved = False
+                                        approval_timed_out = True
                                     if approved:
                                         # 用户批准：执行工具
                                         started_at = asyncio.get_running_loop().time()
                                         try:
-                                            output = await tool.execute(final_args)
+                                            output = await self._exec_tool_memoized(name, final_args, tool)
                                         except Exception as exc:  # noqa: BLE001
                                             output = _tool_missing_hint(name, exc)
                                             self._log_event("tool/error", name=name, error=str(exc))
@@ -1985,6 +2216,9 @@ class Agent:
                                         duration = asyncio.get_running_loop().time() - started_at
                                         self._log_event("tool/result", name=name, output=output, denied=False, duration=round(duration, 4))
                                         sandbox.record_execution(name, approval_sid, True)
+                                    elif approval_timed_out:
+                                        output = "(工具调用审批超时：未收到用户决定，已按未批准处理)"
+                                        self._log_event("tool/result", name=name, output=output, denied=True, reason="审批超时")
                                     else:
                                         output = f"(工具调用已被用户拒绝: {deny_reason or '未说明'})"
                                         self._log_event("tool/result", name=name, output=output, denied=True, reason=deny_reason)
@@ -2000,7 +2234,7 @@ class Agent:
                         else:
                             started_at = asyncio.get_running_loop().time()
                             try:
-                                output = await tool.execute(final_args)
+                                output = await self._exec_tool_memoized(name, final_args, tool)
                             except Exception as exc:  # noqa: BLE001
                                 # 工具异常隔离：工具自身抛出的异常不中断整轮对话，
                                 # 转为 tool 结果消息返回给模型，由模型决定重试或改道。
@@ -2018,10 +2252,27 @@ class Agent:
                                         tool_args=f'{{"binary": "{missing_bin}"}}',
                                         tool_call_id=f"install_{tc_id}",
                                     )
+                                    # 自动安装属危险区工具（generic_linux_command）：若沙箱要求审批，
+                                    # 先把审批卡片推给前端。否则审批事件不会被消费，用户看不到请求，
+                                    # request_approval 空等超时后被误判为"用户拒绝"。
+                                    _install_sid = str(sid) if sid else ""
+                                    if sandbox is not None and _install_sid:
+                                        try:
+                                            _chk = sandbox.check("generic_linux_command", _install_sid)
+                                        except Exception:  # noqa: BLE001
+                                            _chk = {}
+                                        if _chk.get("level") == "approve":
+                                            yield AgentEvent(
+                                                type="sandbox_approval",
+                                                tool_name="generic_linux_command",
+                                                tool_args=f'{{"binary": "{missing_bin}"}}',
+                                                sandbox_reason=f"自动安装缺失工具 {missing_bin} 需要审批",
+                                                sandbox_session_id=_install_sid,
+                                            )
                                     install_ok, install_msg = await _import_try_auto_install()(
                                         missing_bin,
                                         sandbox=sandbox,
-                                        session_id=str(sid) if sid else "",
+                                        session_id=_install_sid,
                                     )
                                     self._log_event(
                                         "tool/result", name="auto_install",
@@ -2037,7 +2288,7 @@ class Agent:
                                     if install_ok:
                                         # 安装成功：重试原工具调用一次
                                         try:
-                                            output = await tool.execute(final_args)
+                                            output = await self._exec_tool_memoized(name, final_args, tool)
                                         except Exception as exc2:  # noqa: BLE001
                                             output = _tool_missing_hint(name, exc2)
                                             self._log_event("tool/error", name=name, error=str(exc2))
@@ -2102,10 +2353,7 @@ class Agent:
                             )
                         )
                     elif (
-                        (
-                            turn_index >= self.max_tool_calls - 3
-                            or tool_calls_executed >= self.max_tool_calls - 8
-                        )
+                        _effective_action_budget - action_tool_calls_executed <= _conclude_reserve
                         and not conclusion_hint_added
                     ):
                         # 接近上限（按 LLM 轮数或实际工具调用数，二者先到为准）：
@@ -2115,9 +2363,10 @@ class Agent:
                             ChatMessage(
                                 role="user",
                                 content=(
-                                    "（注意：即将达到工具调用次数上限。"
-                                    "请立即停止调用新工具，基于已有结果给出最终结论与建议，"
-                                    "不要继续探索。）"
+                                    "（注意：本轮剩余工具调用预算已不多。"
+                                    "请把剩余步骤优先用于推进任务的**实际动作**"
+                                    "（如发起请求/验证假设），不要再以只读汇总类操作占用预算；"
+                                    "若确无待验证动作，再基于已有结果给出最终结论与建议。）"
                                 ),
                             )
                         )
@@ -2155,10 +2404,28 @@ class Agent:
                         yield AgentEvent(type="text", content=final_text)
                         break
                     # ── 实际工具调用预算（一个 LLM 轮次可含多个并发调用）──
-                    if tool_calls_executed >= self.max_tool_calls:
+                    if action_tool_calls_executed >= _effective_action_budget:
+                        # 动态续期：只对“已经产出黑板事实”的 agent 延长一次，
+                        # 避免把正在收敛的高价值探索一刀切停掉；空转 agent 不续。
+                        _facts_written = int(
+                            getattr(self.progress_guard, "facts_written", 0) or 0
+                        )
+                        if not _budget_extended and _facts_written > 0:
+                            _extension = max(4, self.max_tool_calls // 2)
+                            _effective_action_budget += _extension
+                            _budget_extended = True
+                            yield AgentEvent(
+                                type="reasoning",
+                                content=(
+                                    f"[预算] 已产出 {_facts_written} 条事实，"
+                                    f"动作预算自动延长 {_extension} 次，继续验证。"
+                                ),
+                            )
+                            continue
                         final_text = (
-                            f"（已达工具调用次数上限 {self.max_tool_calls} 轮，本轮未产出最终文本。"
-                            "以上为已完成的工具调用过程，如需继续请重新提问或调整策略。）"
+                            f"（已达有效动作工具调用上限 {_effective_action_budget} 次，"
+                            "本轮未产出最终文本。以上为已完成的工具调用过程，"
+                            "如需继续请重新提问或调整策略。）"
                         )
                         yield AgentEvent(type="text", content=final_text)
                         break
@@ -2195,10 +2462,16 @@ class Agent:
 
                 break
 
-            # 循环正常结束（未 break，即 max_tool_calls 耗尽）：附加上限说明
+            # 循环正常结束（未 break，即轮次/动作预算耗尽）：附加上限说明
             if not final_text and tool_calls_executed > 0:
+                if action_tool_calls_executed >= _effective_action_budget:
+                    _limit_text = (
+                        f"已达有效动作工具调用上限 {_effective_action_budget} 次"
+                    )
+                else:
+                    _limit_text = "本轮工具轮次已耗尽"
                 final_text = (
-                    f"（已达工具调用次数上限 {self.max_tool_calls} 轮，本轮未产出最终文本。"
+                    f"（{_limit_text}，本轮未产出最终文本。"
                     "以上为已完成的工具调用过程，如需继续请重新提问或调整策略。）"
                 )
                 yield AgentEvent(type="text", content=final_text)
